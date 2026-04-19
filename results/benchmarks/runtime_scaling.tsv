@@ -1,0 +1,5 @@
+tool	n_traits	n_tests	runtime_seconds	provenance
+fastGWA	2048	204800	204800	historical_notebook_compare_with_plink.ipynb
+torchGWAS_prototype	2048	204800	940	historical_notebook_compare_with_plink.ipynb
+fastGWA	20480	2048000	2048000	historical_notebook_compare_with_plink.ipynb
+torchGWAS_prototype	20480	2048000	1108	historical_notebook_compare_with_plink.ipynb

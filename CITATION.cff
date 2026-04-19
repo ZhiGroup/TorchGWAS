@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: TorchGWAS
+message: "If you use TorchGWAS, please cite the software release and accompanying application note."
+type: software
+authors:
+  - family-names: Zhao
+    given-names: Xizhao
+repository-code: "https://github.com/Soulnature/TorchGWAS1.0"
+license: MIT
+version: 1.0.0
