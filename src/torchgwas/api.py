@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import csv
+import gzip
 from pathlib import Path
 
 import numpy as np
 
-from .io import align_table_to_samples, load_array, load_genotype, load_vector, write_table
-from .linear import linear_scan
+from .io import DiskBackedGenotype, align_table_to_samples, load_array, load_genotype, load_vector, write_table
+from .linear import linear_scan, linear_scan_streaming, linear_scan_streaming_chunks
 from .multivariate import multivariate_scan
-from .preprocess import prepare_inputs
+from .preprocess import prepare_inputs, prepare_inputs_for_prep
 from .types import GWASResult, MultiGWASResult
 from .utils import choose_device, elapsed, mkdir, timestamp, upper_tail_log10, write_json
 
@@ -30,6 +32,55 @@ def _coerce_vector_or_path(value):
 
 def _prefer_vector(primary, fallback):
     return primary if primary is not None else fallback
+
+
+def _linear_result_fieldnames(return_beta: bool, return_se: bool, return_t: bool) -> list[str]:
+    fieldnames = ["marker_id", "trait", "n", "p_value", "-log10_p"]
+    if return_beta:
+        fieldnames.append("beta")
+    if return_t:
+        fieldnames.append("t_stat")
+    if return_se:
+        fieldnames.append("se")
+    return fieldnames
+
+
+def _write_linear_table_streaming(
+    path: str | Path,
+    marker_names: list[str],
+    trait_names: list[str],
+    n_samples: int,
+    chunk_iterator,
+    return_beta: bool,
+    return_se: bool,
+    return_t: bool,
+) -> int:
+    fieldnames = _linear_result_fieldnames(return_beta, return_se, return_t)
+    written = 0
+    with gzip.open(path, "wt", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for start, end, beta_chunk, t_chunk, p_chunk in chunk_iterator:
+            logp_chunk = upper_tail_log10(p_chunk)
+            for marker_offset, marker_name in enumerate(marker_names[start:end]):
+                for trait_index, trait_name in enumerate(trait_names):
+                    row = {
+                        "marker_id": marker_name,
+                        "trait": trait_name,
+                        "n": int(n_samples),
+                        "p_value": float(p_chunk[marker_offset, trait_index]),
+                        "-log10_p": float(logp_chunk[marker_offset, trait_index]),
+                    }
+                    if return_beta:
+                        row["beta"] = float(beta_chunk[marker_offset, trait_index])
+                    if return_t:
+                        row["t_stat"] = float(t_chunk[marker_offset, trait_index])
+                    if return_se:
+                        denom = abs(t_chunk[marker_offset, trait_index])
+                        row["se"] = float(abs(beta_chunk[marker_offset, trait_index]) / denom) if denom > 0 else float("nan")
+                    writer.writerow(row)
+                    written += 1
+    return written
 
 
 def run_linear_gwas(
@@ -69,6 +120,8 @@ def run_linear_gwas(
             genotype_cache_dir=genotype_cache_dir,
             plink2_binary=plink2_binary,
         )
+    elif isinstance(genotype, DiskBackedGenotype):
+        geno_sample_ids, geno_marker_ids = genotype.sample_ids, genotype.marker_ids
     else:
         genotype = np.asarray(genotype)
         geno_sample_ids, geno_marker_ids = None, None
@@ -90,43 +143,101 @@ def run_linear_gwas(
         )
     else:
         covariates = _coerce_array_or_path(covariates)
-    genotype, phenotype, covariates, qc = prepare_inputs(genotype, phenotype, covariates)
-    beta, t_stat, p_value, q_matrix = linear_scan(
-        genotype,
-        phenotype,
-        covariates,
-        chunk_size=chunk_size,
-        device=str(resolved_device),
-    )
-    logp = upper_tail_log10(p_value)
-
-    marker_names = [f"marker_{i}" for i in range(beta.shape[0])] if marker_ids is None else [str(v) for v in marker_ids[: beta.shape[0]]]
-    trait_names = trait_columns or [f"trait_{i}" for i in range(beta.shape[1])]
-    table = []
-    for marker_index, marker_name in enumerate(marker_names):
-        for trait_index, trait_name in enumerate(trait_names):
-            row = {
-                "marker_id": marker_name,
-                "trait": trait_name,
-                "n": int(genotype.shape[0]),
-                "p_value": float(p_value[marker_index, trait_index]),
-                "-log10_p": float(logp[marker_index, trait_index]),
-            }
-            if return_beta:
-                row["beta"] = float(beta[marker_index, trait_index])
-            if return_t:
-                row["t_stat"] = float(t_stat[marker_index, trait_index])
-            if return_se:
-                denom = abs(t_stat[marker_index, trait_index])
-                row["se"] = float(abs(beta[marker_index, trait_index]) / denom) if denom > 0 else float("nan")
-            table.append(row)
+    if isinstance(genotype, DiskBackedGenotype):
+        phenotype, covariates, qc = prepare_inputs_for_prep(genotype.genotype, phenotype, covariates)
+        marker_names = [f"marker_{i}" for i in range(genotype.shape[1])] if marker_ids is None else [str(v) for v in marker_ids[: genotype.shape[1]]]
+        trait_names = trait_columns or [f"trait_{i}" for i in range(phenotype.shape[1])]
+        genotype_shape = list(genotype.shape)
+        if output_dir is not None:
+            chunk_iterator, q_matrix = linear_scan_streaming_chunks(
+                genotype,
+                phenotype,
+                covariates,
+                chunk_size=chunk_size,
+                device=str(resolved_device),
+            )
+            out = mkdir(output_dir)
+            n_rows = _write_linear_table_streaming(
+                out / "results.tsv.gz",
+                marker_names=marker_names,
+                trait_names=trait_names,
+                n_samples=genotype_shape[0],
+                chunk_iterator=chunk_iterator,
+                return_beta=return_beta,
+                return_se=return_se,
+                return_t=return_t,
+            )
+            table: list[dict] = []
+            p_value = None
+            beta = None
+            t_stat = None
+        else:
+            beta, t_stat, p_value, q_matrix = linear_scan_streaming(
+                genotype,
+                phenotype,
+                covariates,
+                chunk_size=chunk_size,
+                device=str(resolved_device),
+            )
+            logp = upper_tail_log10(p_value)
+            table = []
+            for marker_index, marker_name in enumerate(marker_names):
+                for trait_index, trait_name in enumerate(trait_names):
+                    row = {
+                        "marker_id": marker_name,
+                        "trait": trait_name,
+                        "n": int(genotype_shape[0]),
+                        "p_value": float(p_value[marker_index, trait_index]),
+                        "-log10_p": float(logp[marker_index, trait_index]),
+                    }
+                    if return_beta:
+                        row["beta"] = float(beta[marker_index, trait_index])
+                    if return_t:
+                        row["t_stat"] = float(t_stat[marker_index, trait_index])
+                    if return_se:
+                        denom = abs(t_stat[marker_index, trait_index])
+                        row["se"] = float(abs(beta[marker_index, trait_index]) / denom) if denom > 0 else float("nan")
+                    table.append(row)
+            n_rows = int(beta.shape[0] * beta.shape[1])
+    else:
+        genotype, phenotype, covariates, qc = prepare_inputs(genotype, phenotype, covariates)
+        beta, t_stat, p_value, q_matrix = linear_scan(
+            genotype,
+            phenotype,
+            covariates,
+            chunk_size=chunk_size,
+            device=str(resolved_device),
+        )
+        genotype_shape = list(genotype.shape)
+        logp = upper_tail_log10(p_value)
+        marker_names = [f"marker_{i}" for i in range(beta.shape[0])] if marker_ids is None else [str(v) for v in marker_ids[: beta.shape[0]]]
+        trait_names = trait_columns or [f"trait_{i}" for i in range(beta.shape[1])]
+        table = []
+        for marker_index, marker_name in enumerate(marker_names):
+            for trait_index, trait_name in enumerate(trait_names):
+                row = {
+                    "marker_id": marker_name,
+                    "trait": trait_name,
+                    "n": int(genotype_shape[0]),
+                    "p_value": float(p_value[marker_index, trait_index]),
+                    "-log10_p": float(logp[marker_index, trait_index]),
+                }
+                if return_beta:
+                    row["beta"] = float(beta[marker_index, trait_index])
+                if return_t:
+                    row["t_stat"] = float(t_stat[marker_index, trait_index])
+                if return_se:
+                    denom = abs(t_stat[marker_index, trait_index])
+                    row["se"] = float(abs(beta[marker_index, trait_index]) / denom) if denom > 0 else float("nan")
+                table.append(row)
+        n_rows = len(table)
 
     run_metadata = {
         "analysis": "linear",
-        "chunk_size": int(chunk_size or min(beta.shape[0], 4096)),
+        "chunk_size": int(chunk_size or min(genotype_shape[1], 4096)),
         "device_requested": device,
         "device_used": str(resolved_device),
-        "genotype_shape": list(genotype.shape),
+        "genotype_shape": genotype_shape,
         "phenotype_shape": list(phenotype.shape),
         "covariate_shape": None if covariates is None else list(covariates.shape),
         "has_sample_ids": bool(sample_ids is not None),
@@ -135,6 +246,8 @@ def run_linear_gwas(
         "trait_columns": trait_names,
         "covariate_columns": covariate_columns,
         "q_matrix_shape": None if q_matrix is None else list(q_matrix.shape),
+        "results_streamed": bool(isinstance(genotype, DiskBackedGenotype) and output_dir is not None),
+        "n_result_rows": int(n_rows),
         "runtime_seconds": elapsed(start),
         "version": "0.1.0",
     }
@@ -142,7 +255,8 @@ def run_linear_gwas(
     result = GWASResult(table=table, run_metadata=run_metadata, qc_summary=qc)
     if output_dir is not None:
         out = mkdir(output_dir)
-        write_table(table, out / "results.tsv.gz")
+        if not (isinstance(genotype, DiskBackedGenotype) and run_metadata["results_streamed"]):
+            write_table(table, out / "results.tsv.gz")
         write_json(run_metadata, out / "run.json")
         write_json(qc, out / "qc.json")
     return result
@@ -182,6 +296,17 @@ def run_multivariate_gwas(
             sample_file=sample_file,
             genotype_cache_dir=genotype_cache_dir,
             plink2_binary=plink2_binary,
+        )
+        if isinstance(genotype, DiskBackedGenotype):
+            raise NotImplementedError(
+                "multivariate GWAS does not yet support disk-backed genotype streaming; "
+                "use linear GWAS for large out-of-core runs"
+            )
+    elif isinstance(genotype, DiskBackedGenotype):
+        geno_sample_ids, geno_marker_ids = genotype.sample_ids, genotype.marker_ids
+        raise NotImplementedError(
+            "multivariate GWAS does not yet support disk-backed genotype streaming; "
+            "use linear GWAS for large out-of-core runs"
         )
     else:
         genotype = np.asarray(genotype)

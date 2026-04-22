@@ -29,6 +29,8 @@ One of the following formats may be used:
 - `PLINK 1` files: `.bed/.bim/.fam`
 - `BGEN` genotype file with accompanying `.sample`
 
+For large `BGEN` inputs, TorchGWAS converts the genotype resource through `plink2` into a disk-backed `memmap` cache and then reads the genotype matrix in marker batches during linear GWAS.
+
 ### Phenotype and covariate input
 
 Phenotype and covariate data may be provided either as matrices or as tabular files.
@@ -116,6 +118,25 @@ torchgwas linear \
 
 The same interface applies to `BGEN` input, with the addition of `--sample-file`.
 
+For large `BGEN` cohorts, it is recommended to keep a persistent cache directory:
+
+```bash
+torchgwas linear \
+  --genotype /path/to/study.bgen \
+  --genotype-format bgen \
+  --sample-file /path/to/study.sample \
+  --genotype-cache-dir /path/to/torchgwas_cache \
+  --phenotype-table /path/to/pheno.tsv \
+  --covariates-table /path/to/covar.tsv \
+  --sample-id-column IID \
+  --trait-columns trait1,trait2,trait3 \
+  --covariate-columns SEX,AGE,PC1,PC2,PC3 \
+  --output-dir linear_out
+```
+
+When a disk-backed genotype is used together with `--output-dir`, TorchGWAS streams genotype chunks from disk and writes `results.tsv.gz` incrementally.
+This avoids constructing the full marker-by-trait results table in memory before writing.
+
 ## Tracked Toy Paths
 
 The tracked toy dataset is the preferred validation target for this tutorial.
@@ -171,6 +192,11 @@ The script writes:
 - filtered phenotype and covariate TSV files
 - a keep file listing retained samples
 - the final TorchGWAS linear results under `linear/`
+
+## Current Large-Scale Scope
+
+The out-of-core path is currently implemented for `linear` GWAS.
+The experimental `multi` workflow does not yet support disk-backed genotype streaming and should not be treated as the large-cohort path.
 
 ## Notes for Reporting
 

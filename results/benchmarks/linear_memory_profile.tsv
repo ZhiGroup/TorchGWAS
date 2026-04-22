@@ -1,0 +1,7 @@
+analysis	device	n_samples	n_markers	n_traits	n_covariates	chunk_size	cpu_peak_rss_mb	gpu_peak_allocated_mb	gpu_peak_reserved_mb	runtime_seconds	n_result_rows	provenance
+linear	cpu	1024	4096	8	8	1024	595.836	0.0	0.0	0.337398	32768	simulated_profile_linear_memory
+linear	cuda	1024	4096	8	8	1024	899.848	112.196	166.0	0.980079	32768	simulated_profile_linear_memory
+linear	cpu	2048	8192	8	8	1024	800.891	0.0	0.0	0.72692	65536	simulated_profile_linear_memory
+linear	cuda	2048	8192	8	8	1024	1022.129	192.258	306.0	1.089599	65536	simulated_profile_linear_memory
+linear	cpu	4096	16384	16	8	1024	1665.492	0.0	0.0	2.157916	262144	simulated_profile_linear_memory
+linear	cuda	4096	16384	16	8	1024	1682.008	352.758	354.0	1.877989	262144	simulated_profile_linear_memory

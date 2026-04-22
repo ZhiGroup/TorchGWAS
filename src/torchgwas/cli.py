@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .api import run_linear_gwas, run_multivariate_gwas
 from .datasets import get_toy_dataset_paths
-from .io import align_table_to_samples, load_array, load_genotype
+from .io import DiskBackedGenotype, align_table_to_samples, load_array, load_genotype
 from .preprocess import prepare_inputs_for_prep, residualize_and_standardize
 from .utils import mkdir, write_json
 
@@ -109,7 +109,8 @@ def _run_prep(args) -> int:
         )
     else:
         covariates = None if args.covariates is None else load_array(args.covariates)
-    phenotype, covariates, qc = prepare_inputs_for_prep(genotype, phenotype, covariates)
+    genotype_array = genotype.genotype if isinstance(genotype, DiskBackedGenotype) else genotype
+    phenotype, covariates, qc = prepare_inputs_for_prep(genotype_array, phenotype, covariates)
     pheno_proc, q_matrix = residualize_and_standardize(phenotype, covariates)
     out = mkdir(args.output_dir)
     import numpy as np

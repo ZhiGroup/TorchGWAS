@@ -3,10 +3,13 @@ from __future__ import annotations
 import csv
 import gzip
 import hashlib
+import queue
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import pandas as pd
@@ -14,6 +17,71 @@ from numpy.lib.format import open_memmap
 from pandas_plink import Chunk, read_plink1_bin
 
 from .utils import mkdir
+
+
+class GenotypeChunkLoader:
+    def __init__(
+        self,
+        genotype: np.ndarray,
+        chunk_size: int,
+        dtype: np.dtype = np.float64,
+        prefetch_chunks: int = 2,
+    ) -> None:
+        self.genotype = genotype
+        self.chunk_size = int(chunk_size)
+        self.dtype = dtype
+        self.prefetch_chunks = max(int(prefetch_chunks), 1)
+        self.queue: queue.Queue[tuple[int, int, np.ndarray] | None] = queue.Queue(maxsize=self.prefetch_chunks)
+        self._thread: threading.Thread | None = None
+
+    def _producer(self) -> None:
+        n_markers = self.genotype.shape[1]
+        try:
+            for start in range(0, n_markers, self.chunk_size):
+                end = min(n_markers, start + self.chunk_size)
+                chunk = np.asarray(self.genotype[:, start:end], dtype=self.dtype).copy()
+                self.queue.put((start, end, chunk))
+        finally:
+            self.queue.put(None)
+
+    def __iter__(self) -> Iterator[tuple[int, int, np.ndarray]]:
+        self._thread = threading.Thread(target=self._producer, daemon=True)
+        self._thread.start()
+        return self
+
+    def __next__(self) -> tuple[int, int, np.ndarray]:
+        item = self.queue.get()
+        if item is None:
+            if self._thread is not None:
+                self._thread.join()
+            raise StopIteration
+        return item
+
+
+class DiskBackedGenotype:
+    def __init__(
+        self,
+        memmap_path: str | Path,
+        sample_ids: np.ndarray,
+        marker_ids: np.ndarray,
+        dtype: np.dtype = np.float32,
+    ) -> None:
+        self.memmap_path = Path(memmap_path)
+        self.sample_ids = np.asarray(sample_ids, dtype=object)
+        self.marker_ids = np.asarray(marker_ids, dtype=object)
+        self.dtype = dtype
+        self._genotype = np.load(self.memmap_path, mmap_mode="r")
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return tuple(self._genotype.shape)
+
+    @property
+    def genotype(self) -> np.ndarray:
+        return self._genotype
+
+    def iter_chunks(self, chunk_size: int, dtype: np.dtype = np.float64, prefetch_chunks: int = 2) -> GenotypeChunkLoader:
+        return GenotypeChunkLoader(self._genotype, chunk_size=chunk_size, dtype=dtype, prefetch_chunks=prefetch_chunks)
 
 
 def load_array(path: str | Path) -> np.ndarray:
@@ -94,7 +162,7 @@ def _load_bgen_via_plink2(
     sample_file: str | Path,
     plink2_binary: str | Path | None = None,
     cache_dir: str | Path | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[DiskBackedGenotype, np.ndarray, np.ndarray]:
     plink2 = _find_plink2_binary(plink2_binary)
     genotype_path = Path(genotype_path)
     sample_file = Path(sample_file)
@@ -103,9 +171,9 @@ def _load_bgen_via_plink2(
     sample_ids_path = cache_prefix.with_name(f"{cache_prefix.name}.sample_ids.txt")
     marker_ids_path = cache_prefix.with_name(f"{cache_prefix.name}.marker_ids.txt")
     if cache_array.exists() and sample_ids_path.exists() and marker_ids_path.exists():
-        genotype = np.load(cache_array, mmap_mode="r")
         sample_ids = load_vector(sample_ids_path)
         marker_ids = load_vector(marker_ids_path)
+        genotype = DiskBackedGenotype(cache_array, sample_ids=sample_ids, marker_ids=marker_ids, dtype=np.float32)
         return genotype, sample_ids, marker_ids
     with tempfile.TemporaryDirectory(prefix="torchgwas_bgen_") as tmpdir:
         out_prefix = Path(tmpdir) / "decoded"
@@ -136,7 +204,7 @@ def load_bgen_genotype(
     sample_file: str | Path,
     plink2_binary: str | Path | None = None,
     cache_dir: str | Path | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[DiskBackedGenotype, np.ndarray, np.ndarray]:
     try:
         return _load_bgen_via_plink2(
             genotype_path,
@@ -144,17 +212,12 @@ def load_bgen_genotype(
             plink2_binary=plink2_binary,
             cache_dir=cache_dir,
         )
-    except Exception:
-        from bgen_reader import open_bgen  # type: ignore
-
-        bgen = open_bgen(str(genotype_path), samples_filepath=str(sample_file))
-        dosage = np.asarray(bgen.read(), dtype=np.float64)
-        if dosage.ndim == 3:
-            dosage = dosage[:, :, 1]
-        genotype = dosage.T
-        sample_ids = np.asarray([str(item) for item in bgen.samples], dtype=object)
-        marker_ids = np.asarray([str(item) for item in bgen.rsids], dtype=object)
-        return genotype, sample_ids, marker_ids
+    except Exception as exc:
+        raise RuntimeError(
+            "failed to prepare a disk-backed BGEN cache via plink2; "
+            "TorchGWAS does not fall back to in-memory BGEN decoding because "
+            "that path is unsafe for large cohorts"
+        ) from exc
 
 
 def infer_genotype_format(genotype_path: str | Path, genotype_format: str = "auto") -> str:
@@ -181,7 +244,7 @@ def load_genotype(
     sample_file: str | Path | None = None,
     genotype_cache_dir: str | Path | None = None,
     plink2_binary: str | Path | None = None,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, dict]:
+) -> tuple[np.ndarray | DiskBackedGenotype, np.ndarray | None, np.ndarray | None, dict]:
     resolved_format = infer_genotype_format(genotype_path, genotype_format=genotype_format)
     if resolved_format == "npy":
         genotype = load_array(genotype_path)
@@ -198,7 +261,7 @@ def load_genotype(
             plink2_binary=plink2_binary,
             cache_dir=genotype_cache_dir,
         )
-        meta = {"genotype_format": "bgen"}
+        meta = {"genotype_format": "bgen", "genotype_backend": "disk_backed"}
         if genotype_cache_dir is not None:
             meta["genotype_cache_dir"] = str(genotype_cache_dir)
         return genotype, sample_ids, marker_ids, meta
@@ -234,18 +297,18 @@ def _convert_plink2_raw_to_memmap(
     header = pd.read_table(raw_path, sep=r"\s+", nrows=0)
     marker_ids = np.asarray(list(header.columns[6:]), dtype=object)
     n_samples = _count_text_rows(raw_path)
-    genotype = open_memmap(cache_array, mode="w+", dtype=np.float64, shape=(n_samples, marker_ids.shape[0]))
+    genotype = open_memmap(cache_array, mode="w+", dtype=np.float32, shape=(n_samples, marker_ids.shape[0]))
     sample_ids = np.empty(n_samples, dtype=object)
     row_offset = 0
     for chunk in pd.read_table(raw_path, sep=r"\s+", chunksize=2048):
         current = len(chunk)
         sample_ids[row_offset : row_offset + current] = chunk["IID"].astype(str).to_numpy(dtype=object)
-        genotype[row_offset : row_offset + current, :] = chunk.iloc[:, 6:].to_numpy(dtype=np.float64, copy=False)
+        genotype[row_offset : row_offset + current, :] = chunk.iloc[:, 6:].to_numpy(dtype=np.float32, copy=False)
         row_offset += current
     genotype.flush()
     _write_lines(sample_ids_path, sample_ids)
     _write_lines(marker_ids_path, marker_ids)
-    return np.load(cache_array, mmap_mode="r"), sample_ids, marker_ids
+    return DiskBackedGenotype(cache_array, sample_ids=sample_ids, marker_ids=marker_ids, dtype=np.float32), sample_ids, marker_ids
 
 
 def align_table_to_samples(

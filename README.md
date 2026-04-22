@@ -56,6 +56,9 @@ TorchGWAS accepts the following genotype sources:
 - `PLINK 1` `.bed/.bim/.fam`
 - `BGEN` genotype files with an accompanying `.sample` file
 
+For cohort-scale `BGEN` analyses, TorchGWAS uses a disk-backed cache path rather than full in-memory decoding.
+The input is converted through `plink2` into a `memmap`-backed genotype matrix and then consumed in marker chunks during linear GWAS.
+
 Phenotype and covariate information may be supplied as:
 
 - aligned matrices in `.npy`, `.csv`, or `.tsv` form
@@ -92,6 +95,21 @@ torchgwas linear \
   --covariates-table /path/to/covar.tsv \
   --output-dir linear_out
 ```
+
+For large `BGEN` workloads, include the sample file and optionally provide a persistent cache directory:
+
+```bash
+torchgwas linear \
+  --genotype /path/to/study.bgen \
+  --genotype-format bgen \
+  --sample-file /path/to/study.sample \
+  --genotype-cache-dir /path/to/torchgwas_cache \
+  --phenotype-table /path/to/pheno.tsv \
+  --covariates-table /path/to/covar.tsv \
+  --output-dir linear_out
+```
+
+When the linear workflow uses a disk-backed genotype together with `--output-dir`, TorchGWAS streams genotype chunks from disk and writes `results.tsv.gz` incrementally instead of materializing the full result table in memory.
 
 ## Documentation
 
@@ -170,8 +188,24 @@ Benchmark summaries and manuscript-facing assets are stored in:
 - `results/benchmarks/`
 - `results/figures/`
 
+See the [benchmark summary figure](results/figures/linear_benchmark_summary.png) and the [full benchmark report](results/benchmarks/BENCHMARK_REPORT.md) for the current simulated CPU/GPU memory and runtime profiles.
+
 These assets include PLINK concordance summaries, runtime tables, multivariate case summaries, and figure-generation scripts.
 The benchmark and figure materials are primarily reported around the linear workflow; multivariate summaries are retained as exploratory assets.
+
+## Large-Cohort Notes
+
+The intended large-scale linear path is:
+
+1. `BGEN -> plink2 export -> disk-backed memmap cache`
+2. threaded chunk prefetch from the memmap cache
+3. chunked linear GWAS on CPU or GPU
+4. streaming write of `results.tsv.gz` when `--output-dir` is provided
+
+This reduces peak host-memory pressure relative to full in-memory `BGEN` decoding.
+
+The current out-of-core implementation applies to `linear` GWAS only.
+`multi` remains experimental and does not yet support disk-backed genotype streaming.
 
 ## Repository Layout
 
