@@ -139,11 +139,6 @@ This benchmark intentionally does **not** materialize the complete output table 
 - They do not characterize BGEN decoding overhead, phenotype-table alignment overhead, or relatedness filtering overhead.
 - They do not yet include repeated trials, confidence intervals, or cross-GPU reproducibility analysis.
 
-## Recommended Citation In Repository Narratives
-
-If this benchmark report is referenced in repository documentation or a manuscript supplement, the safest summary is:
-
-> TorchGWAS was profiled on simulated linear GWAS workloads in both fully materialized and large-scale streaming settings. On an NVIDIA H100 80GB GPU, the CUDA path showed modest GPU memory requirements at the tested chunk sizes and improved estimated runtime for larger workloads, while host-side memory remained a substantial component of total footprint.
 
 ## Reproduction Commands
 
