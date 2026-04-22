@@ -11,7 +11,6 @@ TorchGWAS provides:
 - support for `NumPy`, `PLINK`, and `BGEN` genotype sources
 - an optional unrelated-sample linear workflow built on `KING/plink2` filtering
 - bundled toy examples and reproducible smoke-test workflows
-- an experimental multivariate mode for future phenotype-panel extensions
 - benchmark summaries and manuscript-facing figure assets
 
 The public interface is intentionally centered on raw analysis inputs.
