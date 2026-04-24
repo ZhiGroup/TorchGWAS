@@ -1,10 +1,43 @@
 cff-version: 1.2.0
-title: TorchGWAS
+title: "TorchGWAS: GPU-accelerated GWAS for thousands of quantitative phenotypes"
 message: "If you use TorchGWAS, please cite the software release and accompanying application note."
 type: software
+
 authors:
   - family-names: Zhao
-    given-names: Xizhao
+    given-names: Xingzhong
+  - family-names: Xie
+    given-names: Ziqian
+  - family-names: Islam
+    given-names: Sheikh Muhammad Saiful
+  - family-names: Xia
+    given-names: Tian
+  - family-names: Chen
+    given-names: Cheng
+  - family-names: Zhi
+    given-names: Degui
+
 repository-code: "https://github.com/Soulnature/TorchGWAS1.0"
 license: MIT
 version: 1.0.0
+date-released: 2026-04-23
+
+preferred-citation:
+  type: article
+  title: "TorchGWAS: GPU-accelerated GWAS for thousands of quantitative phenotypes"
+  authors:
+    - family-names: Zhao
+      given-names: Xingzhong
+    - family-names: Xie
+      given-names: Ziqian
+    - family-names: Islam
+      given-names: Sheikh Muhammad Saiful
+    - family-names: Xia
+      given-names: Tian
+    - family-names: Chen
+      given-names: Cheng
+    - family-names: Zhi
+      given-names: Degui
+  year: 2026
+  doi: "10.48550/arXiv.2604.21095"
+  url: "https://arxiv.org/abs/2604.21095"
