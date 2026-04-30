@@ -52,7 +52,7 @@ The `demo` command also emits a multivariate result directory for exploratory co
 TorchGWAS accepts the following genotype sources:
 
 - `.npy` genotype matrices
-- `PLINK 1` `.bed/.bim/.fam`
+- `PLINK` `.bed/.bim/.fam`
 - `BGEN` genotype files with an accompanying `.sample` file
 
 For cohort-scale `BGEN` analyses, TorchGWAS uses a disk-backed cache path rather than full in-memory decoding.
@@ -103,12 +103,14 @@ torchgwas linear \
   --genotype-format bgen \
   --sample-file /path/to/study.sample \
   --genotype-cache-dir /path/to/torchgwas_cache \
+  --compute-dtype float32 \
   --phenotype-table /path/to/pheno.tsv \
   --covariates-table /path/to/covar.tsv \
   --output-dir linear_out
 ```
 
 When the linear workflow uses a disk-backed genotype together with `--output-dir`, TorchGWAS streams genotype chunks from disk and writes `results.tsv.gz` incrementally instead of materializing the full result table in memory.
+For this large-scale path, `compute-dtype=auto` resolves to `float32` by default.
 
 ## Documentation
 
@@ -198,10 +200,31 @@ The intended large-scale linear path is:
 
 1. `BGEN -> plink2 export -> disk-backed memmap cache`
 2. threaded chunk prefetch from the memmap cache
-3. chunked linear GWAS on CPU or GPU
-4. streaming write of `results.tsv.gz` when `--output-dir` is provided
+3. chunked linear GWAS on CPU or GPU, with `float32` compute as the recommended large-scale setting
+4. filtered or compact result export for large runs, instead of writing the complete marker-by-trait long table by default
 
 This reduces peak host-memory pressure relative to full in-memory `BGEN` decoding.
+
+For large cohort runs, the recommended `linear` options are:
+
+- `--compute-dtype float32`
+- `--topk-per-trait K` to retain only the strongest associations per phenotype
+- or `--p-value-threshold X` to export only associations passing a reporting threshold
+
+Illustrative large-scale command pattern:
+
+```bash
+torchgwas linear \
+  --genotype /path/to/study.bgen \
+  --genotype-format bgen \
+  --sample-file /path/to/study.sample \
+  --genotype-cache-dir /path/to/torchgwas_cache \
+  --phenotype-table /path/to/pheno.tsv \
+  --covariates-table /path/to/covar.tsv \
+  --compute-dtype float32 \
+  --topk-per-trait 100 \
+  --output-dir linear_out
+```
 
 The current out-of-core implementation applies to `linear` GWAS only.
 `multi` remains experimental and does not yet support disk-backed genotype streaming.

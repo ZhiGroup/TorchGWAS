@@ -63,12 +63,12 @@ All runs used:
 
 | device | n_samples | n_markers | n_traits | cpu_peak_rss_mb | gpu_peak_allocated_mb | gpu_peak_reserved_mb | runtime_seconds |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| cpu | 1024 | 4096 | 8 | 595.836 | 0.0 | 0.0 | 0.337398 |
-| cuda | 1024 | 4096 | 8 | 899.848 | 112.196 | 166.0 | 0.980079 |
-| cpu | 2048 | 8192 | 8 | 800.891 | 0.0 | 0.0 | 0.726920 |
-| cuda | 2048 | 8192 | 8 | 1022.129 | 192.258 | 306.0 | 1.089599 |
-| cpu | 4096 | 16384 | 16 | 1665.492 | 0.0 | 0.0 | 2.157916 |
-| cuda | 4096 | 16384 | 16 | 1682.008 | 352.758 | 354.0 | 1.877989 |
+| cpu | 1024 | 4096 | 8 | 601.398 | 0.0 | 0.0 | 0.603605 |
+| cuda | 1024 | 4096 | 8 | 898.043 | 112.196 | 166.0 | 1.228984 |
+| cpu | 2048 | 8192 | 8 | 799.746 | 0.0 | 0.0 | 1.262558 |
+| cuda | 2048 | 8192 | 8 | 1021.559 | 192.258 | 306.0 | 1.553763 |
+| cpu | 4096 | 16384 | 16 | 1664.797 | 0.0 | 0.0 | 2.186701 |
+| cuda | 4096 | 16384 | 16 | 1682.273 | 352.758 | 354.0 | 2.457663 |
 
 ### Interpretation
 
@@ -77,7 +77,7 @@ All runs used:
 - `gpu_peak_reserved_mb` is the peak PyTorch-reserved GPU memory.
 - The CUDA runs still show substantial CPU RSS because host-side arrays remain resident even when the compute kernel executes on GPU.
 - For the two smaller configurations, CUDA is slower than CPU. This is consistent with transfer and launch overhead dominating when the problem is not large enough.
-- For the largest configuration in this benchmark table, CUDA becomes faster than CPU while using a relatively modest amount of H100 memory.
+- In this rerun, CPU remained faster than CUDA for all three tested fully materialized shapes, which indicates that these in-memory problem sizes are still below the point where GPU launch and transfer overhead is amortized.
 
 ## Large-Scale Streaming Profile
 
@@ -91,6 +91,7 @@ To answer this, the streaming benchmark:
 
 - simulates a workload with `20,000` samples, `1,000,000` SNPs, and `2,000` traits
 - processes repeated genotype chunks of size `4096`
+- uses the current large-scale `float32` compute path
 - measures peak CPU and GPU memory during steady-state chunk execution
 - estimates the full runtime by extrapolating from the mean chunk time
 
@@ -103,6 +104,7 @@ This benchmark intentionally does **not** materialize the complete output table 
 - `n_traits = 2,000`
 - `n_covariates = 8`
 - `chunk_size = 4096`
+- `compute_dtype = float32`
 - `warmup_chunks = 1`
 - `profile_chunks = 2`
 
@@ -110,17 +112,17 @@ This benchmark intentionally does **not** materialize the complete output table 
 
 | device | n_samples | n_markers_total | n_traits | chunk_size | cpu_peak_rss_mb | gpu_peak_allocated_mb | gpu_peak_reserved_mb | avg_chunk_seconds | estimated_full_runtime_seconds |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| cpu | 20000 | 1000000 | 2000 | 4096 | 4428.297 | 0.0 | 0.0 | 2.073389 | 507.980265 |
-| cuda | 20000 | 1000000 | 2000 | 4096 | 3470.035 | 2771.032 | 3936.0 | 1.515059 | 371.189553 |
+| cpu | 20000 | 1000000 | 2000 | 4096 | 2767.645 | 0.0 | 0.0 | 1.539444 | 377.163868 |
+| cuda | 20000 | 1000000 | 2000 | 4096 | 2546.039 | 1400.104 | 1972.0 | 1.244163 | 304.820029 |
 
 ### Interpretation
 
-- Under this streaming benchmark, the CUDA path reduced the estimated full runtime from about `508 s` to about `371 s`.
+- Under this streaming benchmark, the CUDA path reduced the estimated full runtime from about `377 s` to about `305 s`.
 - The observed GPU memory footprint remained small relative to H100 capacity:
-  - about `2.77 GB` allocated
-  - about `3.94 GB` reserved
+  - about `1.40 GB` allocated
+  - about `1.97 GB` reserved
 - CPU RSS remained in the multi-gigabyte range even on the CUDA path, which indicates that current scaling is not purely GPU-memory bound.
-- The CUDA path also reduced host-side peak RSS relative to the CPU path in this larger streaming setting, but the reduction is limited because the phenotype matrix and chunk staging buffers are still maintained on CPU.
+- The float32 large-scale path substantially reduced both host and device memory relative to the earlier float64-style benchmark, while also improving the estimated CPU and CUDA runtimes.
 
 ## What These Benchmarks Do And Do Not Show
 
@@ -139,6 +141,11 @@ This benchmark intentionally does **not** materialize the complete output table 
 - They do not characterize BGEN decoding overhead, phenotype-table alignment overhead, or relatedness filtering overhead.
 - They do not yet include repeated trials, confidence intervals, or cross-GPU reproducibility analysis.
 
+## Recommended Citation In Repository Narratives
+
+If this benchmark report is referenced in repository documentation or a manuscript supplement, the safest summary is:
+
+> TorchGWAS was profiled on simulated linear GWAS workloads in both fully materialized and large-scale streaming settings. On an NVIDIA H100 80GB GPU, the large-scale float32 streaming path showed modest GPU memory requirements at the tested chunk size and improved estimated runtime relative to CPU, while smaller fully materialized workloads remained CPU-competitive and host-side memory remained a substantial component of total footprint.
 
 ## Reproduction Commands
 
@@ -160,6 +167,7 @@ CUDA_VISIBLE_DEVICES=5 PYTHONPATH=src python benchmarks/profile_linear_streaming
   --n-markers-total 1000000 \
   --n-traits 2000 \
   --chunk-size 4096 \
+  --dtype float32 \
   --devices cpu cuda \
   --output results/benchmarks/linear_streaming_profile_large.tsv
 ```

@@ -56,7 +56,7 @@ def main() -> int:
         ax.bar([x + (offset - 1) * width for x in xpos], vals, width=width, label=label)
     ax.set_xticks(xpos)
     ax.set_xticklabels(["CPU run", "CUDA run"])
-    ax.set_title("Large Streaming Profile Peak Memory")
+    ax.set_title("Peak Memory (20k samples, 1M SNPs, 2k traits)")
     ax.set_ylabel("Memory (MB)")
     ax.legend(frameon=False)
 
@@ -69,7 +69,7 @@ def main() -> int:
         ax.bar([x + (offset - 0.5) * width for x in xpos], vals, width=width, label=label)
     ax.set_xticks(xpos)
     ax.set_xticklabels(["CPU run", "CUDA run"])
-    ax.set_title("Large Streaming Profile Runtime")
+    ax.set_title("Runtime (20k samples, 1M SNPs, 2k traits)")
     ax.set_ylabel("Seconds")
     ax.legend(frameon=False)
 

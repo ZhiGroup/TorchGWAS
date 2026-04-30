@@ -13,10 +13,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from scipy import stats
+from scipy import special
 
 from torchgwas.kernels import linear_chunk_kernel
 from torchgwas.preprocess import residualize_and_standardize
+
+
+def _two_sided_t_pvalue(t_stat: np.ndarray, df: int) -> np.ndarray:
+    return 2.0 * special.stdtr(df, -np.abs(t_stat))
 
 
 def _rss_mb() -> float:
@@ -26,8 +30,10 @@ def _rss_mb() -> float:
 
 def _run_worker(args: argparse.Namespace) -> int:
     rng = np.random.default_rng(args.seed)
-    phenotype = rng.normal(size=(args.n_samples, args.n_traits)).astype(np.float64)
-    covariates = rng.normal(size=(args.n_samples, args.n_covariates)).astype(np.float64)
+    np_dtype = np.float32 if args.dtype == "float32" else np.float64
+    torch_dtype = torch.float32 if args.dtype == "float32" else torch.float64
+    phenotype = rng.normal(size=(args.n_samples, args.n_traits)).astype(np_dtype)
+    covariates = rng.normal(size=(args.n_samples, args.n_covariates)).astype(np_dtype)
     pheno_proc, _ = residualize_and_standardize(phenotype, covariates)
 
     if args.device == "cuda":
@@ -37,7 +43,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         torch.cuda.reset_peak_memory_stats()
 
     torch_device = torch.device(args.device)
-    pheno_t = torch.as_tensor(pheno_proc, dtype=torch.float64, device=torch_device)
+    pheno_t = torch.as_tensor(pheno_proc, dtype=torch_dtype, device=torch_device)
     total_chunks = math.ceil(args.n_markers_total / args.chunk_size)
     timed_chunks = 0
     timed_seconds = 0.0
@@ -45,15 +51,15 @@ def _run_worker(args: argparse.Namespace) -> int:
 
     for chunk_index in range(args.warmup_chunks + args.profile_chunks):
         current_chunk = min(args.chunk_size, args.n_markers_total)
-        genotype_chunk = rng.normal(size=(args.n_samples, current_chunk)).astype(np.float64)
-        geno_t = torch.as_tensor(genotype_chunk, dtype=torch.float64, device=torch_device)
+        genotype_chunk = rng.normal(size=(args.n_samples, current_chunk)).astype(np_dtype)
+        geno_t = torch.as_tensor(genotype_chunk, dtype=torch_dtype, device=torch_device)
 
         start = time.perf_counter()
         corr_t, t_stat_t = linear_chunk_kernel(geno_t, pheno_t)
         if args.device == "cuda":
             torch.cuda.synchronize()
         t_stat = t_stat_t.detach().cpu().numpy()
-        _ = 2.0 * stats.t.sf(np.abs(t_stat), df=args.n_samples - 2)
+        _ = _two_sided_t_pvalue(t_stat, df=args.n_samples - 2)
         elapsed = time.perf_counter() - start
 
         max_cpu_rss = max(max_cpu_rss, _rss_mb())
@@ -77,6 +83,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         "n_traits": args.n_traits,
         "n_covariates": args.n_covariates,
         "chunk_size": args.chunk_size,
+        "dtype": args.dtype,
         "warmup_chunks": args.warmup_chunks,
         "profile_chunks": args.profile_chunks,
         "cpu_peak_rss_mb": round(max_cpu_rss, 3),
@@ -99,6 +106,7 @@ def main() -> int:
     parser.add_argument("--n-traits", type=int, default=2000)
     parser.add_argument("--n-covariates", type=int, default=8)
     parser.add_argument("--chunk-size", type=int, default=4096)
+    parser.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     parser.add_argument("--warmup-chunks", type=int, default=1)
     parser.add_argument("--profile-chunks", type=int, default=2)
     parser.add_argument("--seed", type=int, default=11)
@@ -130,6 +138,8 @@ def main() -> int:
             str(args.n_covariates),
             "--chunk-size",
             str(args.chunk_size),
+            "--dtype",
+            args.dtype,
             "--warmup-chunks",
             str(args.warmup_chunks),
             "--profile-chunks",

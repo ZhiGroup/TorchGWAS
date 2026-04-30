@@ -131,11 +131,43 @@ torchgwas linear \
   --sample-id-column IID \
   --trait-columns trait1,trait2,trait3 \
   --covariate-columns SEX,AGE,PC1,PC2,PC3 \
+  --compute-dtype float32 \
   --output-dir linear_out
 ```
 
 When a disk-backed genotype is used together with `--output-dir`, TorchGWAS streams genotype chunks from disk and writes `results.tsv.gz` incrementally.
 This avoids constructing the full marker-by-trait results table in memory before writing.
+For this large-scale path, `compute-dtype=auto` resolves to `float32` by default.
+
+## Large-Scale Output Control
+
+For very large GWAS runs, writing the complete marker-by-trait long table can become a major bottleneck.
+TorchGWAS therefore supports two output-control options for the streaming linear path:
+
+- `--topk-per-trait K`
+  retain only the strongest `K` associations for each phenotype
+- `--p-value-threshold X`
+  retain only associations with `p <= X`
+
+These options are intended for large cohort runs in which the primary goal is to report top signals or thresholded findings rather than to materialize the entire result matrix as a TSV long table.
+
+Example:
+
+```bash
+torchgwas linear \
+  --genotype /path/to/study.bgen \
+  --genotype-format bgen \
+  --sample-file /path/to/study.sample \
+  --genotype-cache-dir /path/to/torchgwas_cache \
+  --phenotype-table /path/to/pheno.tsv \
+  --covariates-table /path/to/covar.tsv \
+  --sample-id-column IID \
+  --trait-columns trait1,trait2,trait3 \
+  --covariate-columns SEX,AGE,PC1,PC2,PC3 \
+  --compute-dtype float32 \
+  --topk-per-trait 100 \
+  --output-dir linear_out
+```
 
 ## Tracked Toy Paths
 

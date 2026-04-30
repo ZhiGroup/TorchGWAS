@@ -50,7 +50,10 @@ def _build_parser() -> argparse.ArgumentParser:
     linear.add_argument("--bim", default=None)
     linear.add_argument("--fam", default=None)
     linear.add_argument("--plink2-binary", default=None)
+    linear.add_argument("--compute-dtype", default="auto", choices=["auto", "float32", "float64"])
     linear.add_argument("--chunk-size", type=int, default=None)
+    linear.add_argument("--topk-per-trait", type=int, default=None)
+    linear.add_argument("--p-value-threshold", type=float, default=None)
     linear.add_argument("--output-dir", required=True)
 
     multi = subparsers.add_parser("multi", help="Run multivariate GWAS")
@@ -155,7 +158,10 @@ def _run_linear(args) -> int:
         sample_id_column=args.sample_id_column,
         marker_ids=args.marker_ids,
         sample_ids=args.sample_ids,
+        compute_dtype=args.compute_dtype,
         chunk_size=args.chunk_size,
+        topk_per_trait=args.topk_per_trait,
+        p_value_threshold=args.p_value_threshold,
         output_dir=args.output_dir,
     )
     return 0

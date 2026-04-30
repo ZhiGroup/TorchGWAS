@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import heapq
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +35,12 @@ def _prefer_vector(primary, fallback):
     return primary if primary is not None else fallback
 
 
+def _resolve_linear_compute_dtype(genotype, compute_dtype: str) -> str:
+    if compute_dtype != "auto":
+        return compute_dtype
+    return "float32" if isinstance(genotype, DiskBackedGenotype) else "float64"
+
+
 def _linear_result_fieldnames(return_beta: bool, return_se: bool, return_t: bool) -> list[str]:
     fieldnames = ["marker_id", "trait", "n", "p_value", "-log10_p"]
     if return_beta:
@@ -45,6 +52,35 @@ def _linear_result_fieldnames(return_beta: bool, return_se: bool, return_t: bool
     return fieldnames
 
 
+def _make_linear_row(
+    marker_name: str,
+    trait_name: str,
+    n_samples: int,
+    beta_value: float,
+    t_value: float,
+    p_value: float,
+    log10_p: float,
+    return_beta: bool,
+    return_se: bool,
+    return_t: bool,
+) -> dict:
+    row = {
+        "marker_id": marker_name,
+        "trait": trait_name,
+        "n": int(n_samples),
+        "p_value": float(p_value),
+        "-log10_p": float(log10_p),
+    }
+    if return_beta:
+        row["beta"] = float(beta_value)
+    if return_t:
+        row["t_stat"] = float(t_value)
+    if return_se:
+        denom = abs(t_value)
+        row["se"] = float(abs(beta_value) / denom) if denom > 0 else float("nan")
+    return row
+
+
 def _write_linear_table_streaming(
     path: str | Path,
     marker_names: list[str],
@@ -54,30 +90,57 @@ def _write_linear_table_streaming(
     return_beta: bool,
     return_se: bool,
     return_t: bool,
+    topk_per_trait: int | None = None,
+    p_value_threshold: float | None = None,
 ) -> int:
     fieldnames = _linear_result_fieldnames(return_beta, return_se, return_t)
     written = 0
+    trait_heaps: list[list[tuple[float, dict]]] | None = None
+    if topk_per_trait is not None:
+        trait_heaps = [[] for _ in trait_names]
     with gzip.open(path, "wt", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t")
         writer.writeheader()
         for start, end, beta_chunk, t_chunk, p_chunk in chunk_iterator:
             logp_chunk = upper_tail_log10(p_chunk)
-            for marker_offset, marker_name in enumerate(marker_names[start:end]):
-                for trait_index, trait_name in enumerate(trait_names):
-                    row = {
-                        "marker_id": marker_name,
-                        "trait": trait_name,
-                        "n": int(n_samples),
-                        "p_value": float(p_chunk[marker_offset, trait_index]),
-                        "-log10_p": float(logp_chunk[marker_offset, trait_index]),
-                    }
-                    if return_beta:
-                        row["beta"] = float(beta_chunk[marker_offset, trait_index])
-                    if return_t:
-                        row["t_stat"] = float(t_chunk[marker_offset, trait_index])
-                    if return_se:
-                        denom = abs(t_chunk[marker_offset, trait_index])
-                        row["se"] = float(abs(beta_chunk[marker_offset, trait_index]) / denom) if denom > 0 else float("nan")
+            for trait_index, trait_name in enumerate(trait_names):
+                p_col = p_chunk[:, trait_index]
+                if p_value_threshold is not None:
+                    candidate_offsets = np.flatnonzero(p_col <= p_value_threshold)
+                    if candidate_offsets.size == 0:
+                        continue
+                else:
+                    candidate_offsets = np.arange(p_col.shape[0])
+                if topk_per_trait is not None and candidate_offsets.size > topk_per_trait:
+                    candidate_scores = logp_chunk[candidate_offsets, trait_index]
+                    keep_local = np.argpartition(candidate_scores, -topk_per_trait)[-topk_per_trait:]
+                    candidate_offsets = candidate_offsets[keep_local]
+                for marker_offset in candidate_offsets.tolist():
+                    row = _make_linear_row(
+                        marker_name=marker_names[start + marker_offset],
+                        trait_name=trait_name,
+                        n_samples=n_samples,
+                        beta_value=float(beta_chunk[marker_offset, trait_index]),
+                        t_value=float(t_chunk[marker_offset, trait_index]),
+                        p_value=float(p_col[marker_offset]),
+                        log10_p=float(logp_chunk[marker_offset, trait_index]),
+                        return_beta=return_beta,
+                        return_se=return_se,
+                        return_t=return_t,
+                    )
+                    if trait_heaps is None:
+                        writer.writerow(row)
+                        written += 1
+                    else:
+                        score = row["-log10_p"]
+                        heap = trait_heaps[trait_index]
+                        if len(heap) < topk_per_trait:
+                            heapq.heappush(heap, (score, row))
+                        elif score > heap[0][0]:
+                            heapq.heapreplace(heap, (score, row))
+        if trait_heaps is not None:
+            for heap in trait_heaps:
+                for _, row in sorted(heap, key=lambda item: item[0], reverse=True):
                     writer.writerow(row)
                     written += 1
     return written
@@ -101,7 +164,10 @@ def run_linear_gwas(
     sample_ids=None,
     marker_ids=None,
     device: str = "auto",
+    compute_dtype: str = "auto",
     chunk_size: int | None = None,
+    topk_per_trait: int | None = None,
+    p_value_threshold: float | None = None,
     return_beta: bool = True,
     return_se: bool = True,
     return_t: bool = True,
@@ -143,6 +209,11 @@ def run_linear_gwas(
         )
     else:
         covariates = _coerce_array_or_path(covariates)
+    resolved_compute_dtype = _resolve_linear_compute_dtype(genotype, compute_dtype)
+    if topk_per_trait is not None and topk_per_trait <= 0:
+        raise ValueError("topk_per_trait must be positive")
+    if p_value_threshold is not None and not (0.0 < p_value_threshold <= 1.0):
+        raise ValueError("p_value_threshold must be in (0, 1]")
     if isinstance(genotype, DiskBackedGenotype):
         phenotype, covariates, qc = prepare_inputs_for_prep(genotype.genotype, phenotype, covariates)
         marker_names = [f"marker_{i}" for i in range(genotype.shape[1])] if marker_ids is None else [str(v) for v in marker_ids[: genotype.shape[1]]]
@@ -155,6 +226,7 @@ def run_linear_gwas(
                 covariates,
                 chunk_size=chunk_size,
                 device=str(resolved_device),
+                compute_dtype=resolved_compute_dtype,
             )
             out = mkdir(output_dir)
             n_rows = _write_linear_table_streaming(
@@ -166,6 +238,8 @@ def run_linear_gwas(
                 return_beta=return_beta,
                 return_se=return_se,
                 return_t=return_t,
+                topk_per_trait=topk_per_trait,
+                p_value_threshold=p_value_threshold,
             )
             table: list[dict] = []
             p_value = None
@@ -178,6 +252,7 @@ def run_linear_gwas(
                 covariates,
                 chunk_size=chunk_size,
                 device=str(resolved_device),
+                compute_dtype=resolved_compute_dtype,
             )
             logp = upper_tail_log10(p_value)
             table = []
@@ -207,6 +282,7 @@ def run_linear_gwas(
             covariates,
             chunk_size=chunk_size,
             device=str(resolved_device),
+            compute_dtype=resolved_compute_dtype,
         )
         genotype_shape = list(genotype.shape)
         logp = upper_tail_log10(p_value)
@@ -237,6 +313,10 @@ def run_linear_gwas(
         "chunk_size": int(chunk_size or min(genotype_shape[1], 4096)),
         "device_requested": device,
         "device_used": str(resolved_device),
+        "compute_dtype_requested": compute_dtype,
+        "compute_dtype_used": resolved_compute_dtype,
+        "topk_per_trait": topk_per_trait,
+        "p_value_threshold": p_value_threshold,
         "genotype_shape": genotype_shape,
         "phenotype_shape": list(phenotype.shape),
         "covariate_shape": None if covariates is None else list(covariates.shape),
