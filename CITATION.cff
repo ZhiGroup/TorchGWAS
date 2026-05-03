@@ -17,7 +17,7 @@ authors:
   - family-names: Zhi
     given-names: Degui
 
-repository-code: "https://github.com/Soulnature/TorchGWAS1.0"
+repository-code: "https://github.com/ZhiGroup/TorchGWAS"
 license: MIT
 version: 1.0.0
 date-released: 2026-04-23
