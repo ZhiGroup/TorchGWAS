@@ -22,6 +22,44 @@ python benchmarks/materialize_runtime_table.py \
   --output results/benchmarks/runtime_scaling.tsv
 ```
 
+## Native BED reader scaling
+
+This benchmark creates a temporary variant-major BED file, reads every variant, and reports wall time, process CPU time, throughput, and peak RSS for each worker count:
+
+```bash
+PYTHONPATH=src python benchmarks/benchmark_bed_reader.py \
+  --n-samples 35365 \
+  --n-variants 12000 \
+  --chunk-size 1000 \
+  --workers 1,2,4,8
+```
+
+The A100 lab-host measurements and the corresponding public-main `pandas-plink` baseline are recorded in `results/benchmarks/bed_reader_parallel_remote_20260910.tsv`.
+
+## Calibrated stage runtime predictor
+
+The predictor separates compressed disk read, CPU Zstandard decode, host-to-device transfer, and GPU compute. The hardware model uses measured FP32 throughput, CPU frequency, decode thread count, and H2D bandwidth; `--pipeline-contention-factor` comes from a short joint-stage calibration and captures NUMA/PCIe contention.
+
+The following values reproduce the measured torchGWAS1.1 A100 host ceiling (about 6.7 seconds for the scan itself):
+
+```bash
+PYTHONPATH=src python benchmarks/predict_runtime.py \
+  --model hardware \
+  --n-variants 8086101 \
+  --n-samples 22250 \
+  --n-traits 128 \
+  --covariate-rank 27 \
+  --gpu-fp32-tflops 19.1 \
+  --gpu-count 2 \
+  --cpu-frequency-ghz 2.3 \
+  --decode-threads 40 \
+  --disk-gbps 100 \
+  --h2d-gbps 42.5 \
+  --pipeline-contention-factor 1.584
+```
+
+Use measured sustained values for a new system. Peak vendor specifications alone do not capture filesystem cache state, PCIe topology, NUMA placement, or decode/H2D contention.
+
 ## Toy multivariate case summary
 
 This benchmark is kept as an exploratory extension rather than the main reported workflow.

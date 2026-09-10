@@ -6,8 +6,9 @@ from pathlib import Path
 
 from .api import run_linear_gwas, run_multivariate_gwas
 from .datasets import get_toy_dataset_paths
-from .io import DiskBackedGenotype, align_table_to_samples, load_array, load_genotype
+from .io import align_table_to_samples, load_array, load_genotype
 from .preprocess import prepare_inputs_for_prep, residualize_and_standardize
+from .streaming import ChunkedGenotype
 from .utils import mkdir, write_json
 
 
@@ -30,7 +31,8 @@ def _build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--genotype-cache-dir", default=None)
     prep.add_argument("--bim", default=None)
     prep.add_argument("--fam", default=None)
-    prep.add_argument("--plink2-binary", default=None)
+    prep.add_argument("--reader-workers", type=int, default=4)
+    prep.add_argument("--prefetch-chunks", type=int, default=4)
     prep.add_argument("--output-dir", required=True)
 
     linear = subparsers.add_parser("linear", help="Run linear GWAS")
@@ -49,7 +51,8 @@ def _build_parser() -> argparse.ArgumentParser:
     linear.add_argument("--genotype-cache-dir", default=None)
     linear.add_argument("--bim", default=None)
     linear.add_argument("--fam", default=None)
-    linear.add_argument("--plink2-binary", default=None)
+    linear.add_argument("--reader-workers", type=int, default=4)
+    linear.add_argument("--prefetch-chunks", type=int, default=4)
     linear.add_argument("--compute-dtype", default="auto", choices=["auto", "float32", "float64"])
     linear.add_argument("--chunk-size", type=int, default=None)
     linear.add_argument("--topk-per-trait", type=int, default=None)
@@ -72,7 +75,8 @@ def _build_parser() -> argparse.ArgumentParser:
     multi.add_argument("--genotype-cache-dir", default=None)
     multi.add_argument("--bim", default=None)
     multi.add_argument("--fam", default=None)
-    multi.add_argument("--plink2-binary", default=None)
+    multi.add_argument("--reader-workers", type=int, default=4)
+    multi.add_argument("--prefetch-chunks", type=int, default=4)
     multi.add_argument("--chunk-size", type=int, default=None)
     multi.add_argument("--ridge", type=float, default=1e-6)
     multi.add_argument("--output-dir", required=True)
@@ -90,7 +94,8 @@ def _run_prep(args) -> int:
         fam=args.fam,
         sample_file=args.sample_file,
         genotype_cache_dir=args.genotype_cache_dir,
-        plink2_binary=args.plink2_binary,
+        reader_workers=args.reader_workers,
+        prefetch_chunks=args.prefetch_chunks,
     )
     if sample_ids is None and args.sample_ids is not None:
         sample_ids = load_array(args.sample_ids) if str(args.sample_ids).endswith(".npy") else None
@@ -112,8 +117,13 @@ def _run_prep(args) -> int:
         )
     else:
         covariates = None if args.covariates is None else load_array(args.covariates)
-    genotype_array = genotype.genotype if isinstance(genotype, DiskBackedGenotype) else genotype
-    phenotype, covariates, qc = prepare_inputs_for_prep(genotype_array, phenotype, covariates)
+    genotype_array = genotype.genotype if isinstance(genotype, ChunkedGenotype) else genotype
+    phenotype, covariates, qc = prepare_inputs_for_prep(
+        genotype_array,
+        phenotype,
+        covariates,
+        genotype_chunk_size=getattr(genotype_array, "preferred_chunk_size", None),
+    )
     pheno_proc, q_matrix = residualize_and_standardize(phenotype, covariates)
     out = mkdir(args.output_dir)
     import numpy as np
@@ -154,7 +164,8 @@ def _run_linear(args) -> int:
         genotype_cache_dir=args.genotype_cache_dir,
         bim=args.bim,
         fam=args.fam,
-        plink2_binary=args.plink2_binary,
+        reader_workers=args.reader_workers,
+        prefetch_chunks=args.prefetch_chunks,
         sample_id_column=args.sample_id_column,
         marker_ids=args.marker_ids,
         sample_ids=args.sample_ids,
@@ -183,7 +194,8 @@ def _run_multi(args) -> int:
         genotype_cache_dir=args.genotype_cache_dir,
         bim=args.bim,
         fam=args.fam,
-        plink2_binary=args.plink2_binary,
+        reader_workers=args.reader_workers,
+        prefetch_chunks=args.prefetch_chunks,
         sample_id_column=args.sample_id_column,
         marker_ids=args.marker_ids,
         sample_ids=args.sample_ids,

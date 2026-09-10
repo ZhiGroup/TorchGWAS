@@ -54,12 +54,13 @@ def prepare_inputs(
 
 
 def prepare_inputs_for_prep(
-    genotype: np.ndarray,
+    genotype,
     phenotype: np.ndarray,
     covariates: np.ndarray | None = None,
     genotype_chunk_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, dict]:
-    genotype = ensure_2d(np.asarray(genotype), "genotype")
+    if not hasattr(genotype, "shape") or len(genotype.shape) != 2:
+        raise ValueError(f"genotype must be 2D, got {getattr(genotype, 'shape', None)}")
     phenotype = ensure_2d(np.asarray(phenotype, dtype=np.float64), "phenotype")
     covariates = None if covariates is None else ensure_2d(np.asarray(covariates, dtype=np.float64), "covariates")
 
@@ -70,7 +71,18 @@ def prepare_inputs_for_prep(
     else:
         check_aligned_rows(("genotype", genotype), ("phenotype", phenotype))
 
-    geno_mask = _chunked_genotype_std_mask(genotype, chunk_size=genotype_chunk_size)
+    effective_chunk_size = (
+        genotype_chunk_size
+        or getattr(genotype, "preferred_chunk_size", None)
+        or min(genotype.shape[1], 4096)
+        or 1
+    )
+    geno_mask = _chunked_genotype_std_mask(genotype, chunk_size=effective_chunk_size)
+    if not geno_mask.all():
+        raise ValueError(
+            f"out-of-core genotype contains {(~geno_mask).sum()} zero-variance variants; "
+            "filter invariant variants before running TorchGWAS"
+        )
     pheno_mask = column_std_mask(phenotype)
     if covariates is not None:
         covar_mask = column_std_mask(covariates)
@@ -90,7 +102,7 @@ def prepare_inputs_for_prep(
         "dropped_covariate_columns": int(0 if covariates is None else (~covar_mask).sum()),
         "n_samples": int(genotype.shape[0]),
         "genotype_qc_mode": "chunked",
-        "genotype_qc_chunk_size": int(genotype_chunk_size or min(genotype.shape[1], 4096) or 1),
+        "genotype_qc_chunk_size": int(effective_chunk_size),
     }
 
     if not pheno_mask.all():
@@ -103,10 +115,17 @@ def prepare_inputs_for_prep(
 def _chunked_genotype_std_mask(genotype: np.ndarray, chunk_size: int | None = None) -> np.ndarray:
     n_markers = genotype.shape[1]
     mask = np.ones(n_markers, dtype=bool)
-    for start, end in chunk_bounds(n_markers, chunk_size):
-        geno_chunk = np.asarray(genotype[:, start:end], dtype=np.float64)
-        if np.isnan(geno_chunk).any():
-            raise ValueError("genotype contains missing values; v0.1 requires complete matrices")
+    chunk = chunk_size or getattr(genotype, "preferred_chunk_size", None) or min(n_markers, 4096) or 1
+    if hasattr(genotype, "iter_chunks"):
+        iterator = genotype.iter_chunks(chunk_size=chunk, dtype=np.float64)
+    else:
+        iterator = (
+            (start, end, np.asarray(genotype[:, start:end], dtype=np.float64))
+            for start, end in chunk_bounds(n_markers, chunk)
+        )
+    for start, end, geno_chunk in iterator:
+        if not np.isfinite(geno_chunk).all():
+            raise ValueError("genotype contains missing/non-finite values; v0.1 requires complete matrices")
         mask[start:end] = np.nanstd(geno_chunk, axis=0) > 0
     return mask
 
@@ -119,8 +138,15 @@ def residualize_and_standardize(phenotype: np.ndarray, covariates: np.ndarray | 
         cov_std = covariates.std(axis=0, keepdims=True)
         cov_std[cov_std == 0] = 1.0
         cov_scaled = cov_centered / cov_std
-        q_matrix, _ = np.linalg.qr(cov_scaled, mode="reduced")
-        phenotype = phenotype - q_matrix @ (q_matrix.T @ phenotype)
+        u, singular_values, _ = np.linalg.svd(cov_scaled, full_matrices=False)
+        if singular_values.size:
+            tolerance = max(cov_scaled.shape) * np.finfo(cov_scaled.dtype).eps * singular_values[0]
+            rank = int(np.sum(singular_values > tolerance))
+        else:
+            rank = 0
+        q_matrix = u[:, :rank] if rank else None
+        if q_matrix is not None:
+            phenotype = phenotype - q_matrix @ (q_matrix.T @ phenotype)
     std = phenotype.std(axis=0, keepdims=True)
     std[std == 0] = 1.0
     phenotype = phenotype / std

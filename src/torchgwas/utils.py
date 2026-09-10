@@ -24,8 +24,8 @@ def ensure_2d(array: np.ndarray, name: str) -> np.ndarray:
 
 
 def validate_no_missing(array: np.ndarray, name: str) -> None:
-    if np.isnan(array).any():
-        raise ValueError(f"{name} contains missing values; v0.1 requires complete matrices")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} contains missing/non-finite values; v0.1 requires complete matrices")
 
 
 def check_aligned_rows(*arrays: tuple[str, np.ndarray]) -> int:

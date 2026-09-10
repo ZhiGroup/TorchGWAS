@@ -10,7 +10,7 @@ TorchGWAS performs the following steps internally:
 1. determine genotype sample order from the input genotype resource
 2. align phenotype and covariate records to that sample order by `IID`
 3. remove zero-variance columns and report these decisions in `qc.json`
-4. compute the covariate QR basis internally
+4. compute a rank-revealing covariate basis internally
 5. residualize and standardize the phenotype matrix
 6. perform marker-wise linear association testing
 
@@ -27,9 +27,9 @@ One of the following formats may be used:
 
 - `NumPy` matrix: `.npy`, shape `(n_samples, n_markers)`
 - `PLINK 1` files: `.bed/.bim/.fam`
-- `BGEN` genotype file with accompanying `.sample`
+- `BGEN` genotype file with embedded sample IDs or an accompanying `.sample`
 
-For large `BGEN` inputs, TorchGWAS converts the genotype resource through `plink2` into a disk-backed `memmap` cache and then reads the genotype matrix in marker batches during linear GWAS.
+For large `BGEN` inputs, TorchGWAS directly decodes expected allele-2 dosage, quantizes it as `round(dosage × 127.5)`, and creates a disk-backed level-15 Zstandard cache with one independent frame per 2,500 retained variants. Multiallelic, phased, non-diploid, incomplete, and invalid-probability sites are skipped during conversion and reported in the cache manifest; conversion continues with the next site. MAF, HLA/MHC, chromosome, marker-ID, and allele-alphabet filters are left to the user. No PLINK2 conversion is used for this path.
 
 ### Phenotype and covariate input
 
@@ -116,7 +116,7 @@ torchgwas linear \
   --output-dir linear_out
 ```
 
-The same interface applies to `BGEN` input, with the addition of `--sample-file`.
+The same interface applies to `BGEN` input. Add `--sample-file` when sample IDs are not embedded in the BGEN.
 
 For large `BGEN` cohorts, it is recommended to keep a persistent cache directory:
 

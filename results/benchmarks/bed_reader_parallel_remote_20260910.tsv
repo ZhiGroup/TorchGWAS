@@ -1,0 +1,7 @@
+implementation	reader_workers	prefetch_chunks	wall_seconds	cpu_over_wall	max_rss_mib	bed_mib_per_second	n_samples	n_variants	bed_bytes	chunk_size
+public_main_pandas_plink_hot	1	NA	123.9282	0.885	3499.8	0.816	35365	12000	106104003	NA
+public_main_pandas_plink_hot	2	NA	119.7761	1.086	4499.8	0.844	35365	12000	106104003	NA
+native_bed_pread	1	2	8.887035	0.9664	880.7	11.386	35365	12000	106104003	1000
+native_bed_pread	2	2	5.876107	1.9562	1149.1	17.220	35365	12000	106104003	1000
+native_bed_pread	4	4	2.415037	3.4412	1613.5	41.899	35365	12000	106104003	1000
+native_bed_pread	8	8	2.174571	5.0987	2449.8	46.533	35365	12000	106104003	1000

@@ -26,6 +26,11 @@ def multivariate_scan(
     torch_device = choose_device(device)
     pheno_t = torch.as_tensor(pheno_proc, dtype=torch.float64, device=torch_device)
     corr_inv_t = torch.as_tensor(corr_inv, dtype=torch.float64, device=torch_device)
+    q_t = None if q_matrix is None else torch.as_tensor(q_matrix, dtype=torch.float64, device=torch_device)
+    covariate_rank = 0 if q_matrix is None else q_matrix.shape[1]
+    df = n_samples - covariate_rank - 2
+    if df <= 0:
+        raise ValueError(f"non-positive residual degrees of freedom: N={n_samples}, covariate_rank={covariate_rank}")
 
     n_markers = genotype.shape[1]
     chi2 = np.empty(n_markers, dtype=np.float64)
@@ -34,7 +39,7 @@ def multivariate_scan(
     for start, end in chunk_bounds(n_markers, chunk_size):
         geno_chunk = np.asarray(genotype[:, start:end], dtype=np.float64)
         geno_t = torch.as_tensor(geno_chunk, dtype=torch.float64, device=torch_device)
-        chi2_chunk = multivariate_chunk_kernel(geno_t, pheno_t, corr_inv_t).cpu().numpy()
+        chi2_chunk = multivariate_chunk_kernel(geno_t, pheno_t, corr_inv_t, q_t, df).cpu().numpy()
         chi2[start:end] = chi2_chunk
         p_value[start:end] = stats.chi2.sf(chi2_chunk, df=n_traits)
     return chi2, p_value, corr, corr_inv, q_matrix

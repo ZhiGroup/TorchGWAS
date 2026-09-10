@@ -24,6 +24,12 @@ cd TorchGWAS
 python -m pip install -e .
 ```
 
+Install the BGEN extra when BGEN is an input format:
+
+```bash
+python -m pip install -e '.[bgen]'
+```
+
 If editable installation is restricted by the local environment, the command-line interface can be invoked directly:
 
 ```bash
@@ -53,10 +59,13 @@ TorchGWAS accepts the following genotype sources:
 
 - `.npy` genotype matrices
 - `PLINK` `.bed/.bim/.fam`
-- `BGEN` genotype files with an accompanying `.sample` file
+- `BGEN` genotype files, with an optional external `.sample` file
 
 For cohort-scale `BGEN` analyses, TorchGWAS uses a disk-backed cache path rather than full in-memory decoding.
-The input is converted through `plink2` into a `memmap`-backed genotype matrix and then consumed in marker chunks during linear GWAS.
+It decodes expected allele-2 dosage directly from the BGEN probabilities, stores `round(dosage × 127.5)` as `uint8`, and writes level-15 Zstandard frames containing 2,500 retained variants each.
+Multiallelic, phased, non-diploid, incomplete, and invalid-probability variants are skipped during conversion and counted in the cache manifest; the conversion itself continues.
+No cohort-level MAF, HLA/MHC, chromosome, marker-ID, or allele-alphabet filter is imposed by the converter.
+The cache uses the `torchGWAS1.1` zstore index contract and is reused when the BGEN and sample-file identities are unchanged.
 
 Phenotype and covariate information may be supplied as:
 
@@ -198,12 +207,12 @@ The benchmark and figure materials are primarily reported around the linear work
 
 The intended large-scale linear path is:
 
-1. `BGEN -> plink2 export -> disk-backed memmap cache`
-2. threaded chunk prefetch from the memmap cache
+1. `BGEN probabilities -> uint8 expected dosage -> level-15 zstd cache`
+2. positional reads and ordered multi-worker decompression of independent 2,500-variant frames
 3. chunked linear GWAS on CPU or GPU, with `float32` compute as the recommended large-scale setting
 4. filtered or compact result export for large runs, instead of writing the complete marker-by-trait long table by default
 
-This reduces peak host-memory pressure relative to full in-memory `BGEN` decoding.
+This removes the temporary text/BED conversion and reduces both host-memory pressure and persistent storage relative to full in-memory or float dosage materialization.
 
 For large cohort runs, the recommended `linear` options are:
 

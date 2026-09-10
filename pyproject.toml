@@ -17,10 +17,12 @@ dependencies = [
   "pandas>=2.0",
   "matplotlib>=3.8",
   "scipy>=1.10",
-  "torch>=2.0"
+  "torch>=2.0",
+  "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]
+bgen = ["bgen-reader>=4.0,<5"]
 dev = []
 
 [project.scripts]

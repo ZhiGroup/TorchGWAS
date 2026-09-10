@@ -7,10 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
-from .io import DiskBackedGenotype, align_table_to_samples, load_array, load_genotype, load_vector, write_table
+from .io import align_table_to_samples, load_array, load_genotype, load_vector, write_table
 from .linear import linear_scan, linear_scan_streaming, linear_scan_streaming_chunks
 from .multivariate import multivariate_scan
 from .preprocess import prepare_inputs, prepare_inputs_for_prep
+from .streaming import ChunkedGenotype
 from .types import GWASResult, MultiGWASResult
 from .utils import choose_device, elapsed, mkdir, timestamp, upper_tail_log10, write_json
 
@@ -38,11 +39,18 @@ def _prefer_vector(primary, fallback):
 def _resolve_linear_compute_dtype(genotype, compute_dtype: str) -> str:
     if compute_dtype != "auto":
         return compute_dtype
-    return "float32" if isinstance(genotype, DiskBackedGenotype) else "float64"
+    return "float32" if isinstance(genotype, ChunkedGenotype) else "float64"
 
 
-def _linear_result_fieldnames(return_beta: bool, return_se: bool, return_t: bool) -> list[str]:
+def _linear_result_fieldnames(
+    return_beta: bool,
+    return_se: bool,
+    return_t: bool,
+    include_variant_metadata: bool = False,
+) -> list[str]:
     fieldnames = ["marker_id", "trait", "n", "p_value", "-log10_p"]
+    if include_variant_metadata:
+        fieldnames[1:1] = ["chromosome", "position", "effect_allele", "other_allele"]
     if return_beta:
         fieldnames.append("beta")
     if return_t:
@@ -63,6 +71,8 @@ def _make_linear_row(
     return_beta: bool,
     return_se: bool,
     return_t: bool,
+    marker_index: int | None = None,
+    variant_metadata: dict[str, np.ndarray] | None = None,
 ) -> dict:
     row = {
         "marker_id": marker_name,
@@ -71,6 +81,10 @@ def _make_linear_row(
         "p_value": float(p_value),
         "-log10_p": float(log10_p),
     }
+    if variant_metadata is not None and marker_index is not None:
+        for field in ("chromosome", "position", "effect_allele", "other_allele"):
+            value = variant_metadata[field][marker_index]
+            row[field] = int(value) if field == "position" else str(value)
     if return_beta:
         row["beta"] = float(beta_value)
     if return_t:
@@ -92,10 +106,16 @@ def _write_linear_table_streaming(
     return_t: bool,
     topk_per_trait: int | None = None,
     p_value_threshold: float | None = None,
+    variant_metadata: dict[str, np.ndarray] | None = None,
 ) -> int:
-    fieldnames = _linear_result_fieldnames(return_beta, return_se, return_t)
+    fieldnames = _linear_result_fieldnames(
+        return_beta,
+        return_se,
+        return_t,
+        include_variant_metadata=variant_metadata is not None,
+    )
     written = 0
-    trait_heaps: list[list[tuple[float, dict]]] | None = None
+    trait_heaps: list[list[tuple[float, int, dict]]] | None = None
     if topk_per_trait is not None:
         trait_heaps = [[] for _ in trait_names]
     with gzip.open(path, "wt", newline="") as handle:
@@ -103,6 +123,7 @@ def _write_linear_table_streaming(
         writer.writeheader()
         for start, end, beta_chunk, t_chunk, p_chunk in chunk_iterator:
             logp_chunk = upper_tail_log10(p_chunk)
+            chunk_rows: list[dict] = []
             for trait_index, trait_name in enumerate(trait_names):
                 p_col = p_chunk[:, trait_index]
                 if p_value_threshold is not None:
@@ -127,20 +148,24 @@ def _write_linear_table_streaming(
                         return_beta=return_beta,
                         return_se=return_se,
                         return_t=return_t,
+                        marker_index=start + marker_offset,
+                        variant_metadata=variant_metadata,
                     )
                     if trait_heaps is None:
-                        writer.writerow(row)
+                        chunk_rows.append(row)
                         written += 1
                     else:
                         score = row["-log10_p"]
                         heap = trait_heaps[trait_index]
                         if len(heap) < topk_per_trait:
-                            heapq.heappush(heap, (score, row))
+                            heapq.heappush(heap, (score, start + marker_offset, row))
                         elif score > heap[0][0]:
-                            heapq.heapreplace(heap, (score, row))
+                            heapq.heapreplace(heap, (score, start + marker_offset, row))
+            if chunk_rows:
+                writer.writerows(chunk_rows)
         if trait_heaps is not None:
             for heap in trait_heaps:
-                for _, row in sorted(heap, key=lambda item: item[0], reverse=True):
+                for _, _, row in sorted(heap, key=lambda item: (item[0], item[1]), reverse=True):
                     writer.writerow(row)
                     written += 1
     return written
@@ -160,6 +185,8 @@ def run_linear_gwas(
     bim: str | Path | None = None,
     fam: str | Path | None = None,
     plink2_binary: str | Path | None = None,
+    reader_workers: int = 4,
+    prefetch_chunks: int = 4,
     sample_id_column: str = "IID",
     sample_ids=None,
     marker_ids=None,
@@ -185,14 +212,17 @@ def run_linear_gwas(
             sample_file=sample_file,
             genotype_cache_dir=genotype_cache_dir,
             plink2_binary=plink2_binary,
+            reader_workers=reader_workers,
+            prefetch_chunks=prefetch_chunks,
         )
-    elif isinstance(genotype, DiskBackedGenotype):
+    elif isinstance(genotype, ChunkedGenotype):
         geno_sample_ids, geno_marker_ids = genotype.sample_ids, genotype.marker_ids
     else:
         genotype = np.asarray(genotype)
         geno_sample_ids, geno_marker_ids = None, None
     marker_ids = _prefer_vector(_coerce_vector_or_path(marker_ids), geno_marker_ids)
     sample_ids = _prefer_vector(_coerce_vector_or_path(sample_ids), geno_sample_ids)
+    variant_metadata = getattr(genotype, "variant_metadata", None)
     if phenotype_table is not None:
         if sample_ids is None:
             raise ValueError("tabular phenotype input requires genotype sample IDs")
@@ -214,8 +244,19 @@ def run_linear_gwas(
         raise ValueError("topk_per_trait must be positive")
     if p_value_threshold is not None and not (0.0 < p_value_threshold <= 1.0):
         raise ValueError("p_value_threshold must be in (0, 1]")
-    if isinstance(genotype, DiskBackedGenotype):
-        phenotype, covariates, qc = prepare_inputs_for_prep(genotype.genotype, phenotype, covariates)
+    if isinstance(genotype, ChunkedGenotype):
+        effective_chunk_size = (
+            chunk_size
+            or getattr(genotype, "preferred_chunk_size", None)
+            or min(genotype.shape[1], 4096)
+            or 1
+        )
+        phenotype, covariates, qc = prepare_inputs_for_prep(
+            genotype.genotype,
+            phenotype,
+            covariates,
+            genotype_chunk_size=effective_chunk_size,
+        )
         marker_names = [f"marker_{i}" for i in range(genotype.shape[1])] if marker_ids is None else [str(v) for v in marker_ids[: genotype.shape[1]]]
         trait_names = trait_columns or [f"trait_{i}" for i in range(phenotype.shape[1])]
         genotype_shape = list(genotype.shape)
@@ -227,6 +268,8 @@ def run_linear_gwas(
                 chunk_size=chunk_size,
                 device=str(resolved_device),
                 compute_dtype=resolved_compute_dtype,
+                reader_workers=reader_workers,
+                prefetch_chunks=prefetch_chunks,
             )
             out = mkdir(output_dir)
             n_rows = _write_linear_table_streaming(
@@ -240,6 +283,7 @@ def run_linear_gwas(
                 return_t=return_t,
                 topk_per_trait=topk_per_trait,
                 p_value_threshold=p_value_threshold,
+                variant_metadata=variant_metadata,
             )
             table: list[dict] = []
             p_value = None
@@ -253,6 +297,8 @@ def run_linear_gwas(
                 chunk_size=chunk_size,
                 device=str(resolved_device),
                 compute_dtype=resolved_compute_dtype,
+                reader_workers=reader_workers,
+                prefetch_chunks=prefetch_chunks,
             )
             logp = upper_tail_log10(p_value)
             table = []
@@ -272,6 +318,10 @@ def run_linear_gwas(
                     if return_se:
                         denom = abs(t_stat[marker_index, trait_index])
                         row["se"] = float(abs(beta[marker_index, trait_index]) / denom) if denom > 0 else float("nan")
+                    if variant_metadata is not None:
+                        for field in ("chromosome", "position", "effect_allele", "other_allele"):
+                            value = variant_metadata[field][marker_index]
+                            row[field] = int(value) if field == "position" else str(value)
                     table.append(row)
             n_rows = int(beta.shape[0] * beta.shape[1])
     else:
@@ -310,7 +360,11 @@ def run_linear_gwas(
 
     run_metadata = {
         "analysis": "linear",
-        "chunk_size": int(chunk_size or min(genotype_shape[1], 4096)),
+        "chunk_size": int(
+            chunk_size
+            or getattr(genotype, "preferred_chunk_size", None)
+            or min(genotype_shape[1], 4096)
+        ),
         "device_requested": device,
         "device_used": str(resolved_device),
         "compute_dtype_requested": compute_dtype,
@@ -326,7 +380,9 @@ def run_linear_gwas(
         "trait_columns": trait_names,
         "covariate_columns": covariate_columns,
         "q_matrix_shape": None if q_matrix is None else list(q_matrix.shape),
-        "results_streamed": bool(isinstance(genotype, DiskBackedGenotype) and output_dir is not None),
+        "results_streamed": bool(isinstance(genotype, ChunkedGenotype) and output_dir is not None),
+        "reader_workers": int(reader_workers) if isinstance(genotype, ChunkedGenotype) else None,
+        "prefetch_chunks": int(prefetch_chunks) if isinstance(genotype, ChunkedGenotype) else None,
         "n_result_rows": int(n_rows),
         "runtime_seconds": elapsed(start),
         "version": "0.1.0",
@@ -335,7 +391,7 @@ def run_linear_gwas(
     result = GWASResult(table=table, run_metadata=run_metadata, qc_summary=qc)
     if output_dir is not None:
         out = mkdir(output_dir)
-        if not (isinstance(genotype, DiskBackedGenotype) and run_metadata["results_streamed"]):
+        if not (isinstance(genotype, ChunkedGenotype) and run_metadata["results_streamed"]):
             write_table(table, out / "results.tsv.gz")
         write_json(run_metadata, out / "run.json")
         write_json(qc, out / "qc.json")
@@ -356,6 +412,8 @@ def run_multivariate_gwas(
     bim: str | Path | None = None,
     fam: str | Path | None = None,
     plink2_binary: str | Path | None = None,
+    reader_workers: int = 4,
+    prefetch_chunks: int = 4,
     sample_id_column: str = "IID",
     sample_ids=None,
     marker_ids=None,
@@ -376,13 +434,15 @@ def run_multivariate_gwas(
             sample_file=sample_file,
             genotype_cache_dir=genotype_cache_dir,
             plink2_binary=plink2_binary,
+            reader_workers=reader_workers,
+            prefetch_chunks=prefetch_chunks,
         )
-        if isinstance(genotype, DiskBackedGenotype):
+        if isinstance(genotype, ChunkedGenotype):
             raise NotImplementedError(
                 "multivariate GWAS does not yet support disk-backed genotype streaming; "
                 "use linear GWAS for large out-of-core runs"
             )
-    elif isinstance(genotype, DiskBackedGenotype):
+    elif isinstance(genotype, ChunkedGenotype):
         geno_sample_ids, geno_marker_ids = genotype.sample_ids, genotype.marker_ids
         raise NotImplementedError(
             "multivariate GWAS does not yet support disk-backed genotype streaming; "
