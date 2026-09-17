@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import csv
+import gzip
+import hashlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+from numpy.lib.format import open_memmap
+
+import torchgwas.api as api_module
+from torchgwas.api import run_linear_gwas
+from binary_helpers import binary_rows
+from torchgwas.datasets import get_toy_dataset_paths
+from torchgwas.io import DiskBackedGenotype
+from torchgwas.preprocess import prepare_inputs_for_prep
+
+
+class APITestCase(unittest.TestCase):
+    def test_tabular_inputs_align_to_sample_ids(self):
+        toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
+        linear = run_linear_gwas(
+            genotype=toy["genotype"],
+            phenotype=None,
+            covariates=None,
+            phenotype_table=toy["phenotype_table"],
+            covariates_table=toy["covariates_table"],
+            sample_ids=toy["sample_ids"],
+            marker_ids=toy["marker_ids"],
+            trait_columns=["trait_0", "trait_1", "trait_2"],
+            covariate_columns=["covar_0", "covar_1", "covar_2", "covar_3"],
+            chunk_size=4,
+        )
+        self.assertEqual(len(linear.table), 36)
+        self.assertEqual(linear.run_metadata["trait_columns"], ["trait_0", "trait_1", "trait_2"])
+
+    def test_output_dir_writes_expected_files(self):
+        toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_linear_gwas(
+                genotype=toy["genotype"],
+                phenotype=toy["phenotype"],
+                covariates=toy["covariates"],
+                marker_ids=toy["marker_ids"],
+                sample_ids=toy["sample_ids"],
+                output_dir=tmpdir,
+                chunk_size=5,
+            )
+            base = Path(tmpdir)
+            self.assertTrue((base / "sumstats/manifest.json").exists())
+            self.assertFalse(list(base.glob("*.tsv*")))
+            self.assertTrue((base / "run.json").exists())
+            self.assertTrue((base / "qc.json").exists())
+            self.assertIn("marker_id", binary_rows(base)[0])
+            metadata = json.loads((base / "run.json").read_text())
+            self.assertEqual(metadata["analysis"], "linear")
+
+    def test_prep_path_supports_chunked_genotype_qc(self):
+        toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
+        genotype = np.load(toy["genotype"], mmap_mode="r")
+        phenotype = np.load(toy["phenotype"])
+        covariates = np.load(toy["covariates"])
+        phenotype, covariates, qc = prepare_inputs_for_prep(
+            genotype,
+            phenotype,
+            covariates,
+            genotype_chunk_size=5,
+        )
+        self.assertEqual(phenotype.shape[0], genotype.shape[0])
+        self.assertEqual(covariates.shape[0], genotype.shape[0])
+        self.assertEqual(qc["genotype_qc_mode"], "chunked")
+        self.assertEqual(qc["genotype_qc_chunk_size"], 5)
+
+    def test_linear_supports_disk_backed_genotype(self):
+        toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
+        genotype = np.load(toy["genotype"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memmap_path = Path(tmpdir) / "genotype.npy"
+            mmap = open_memmap(memmap_path, mode="w+", dtype=np.float32, shape=genotype.shape)
+            mmap[:] = genotype.astype(np.float32)
+            mmap.flush()
+            disk_genotype = DiskBackedGenotype(
+                memmap_path,
+                sample_ids=np.loadtxt(toy["sample_ids"], dtype=str),
+                marker_ids=np.loadtxt(toy["marker_ids"], dtype=str),
+                dtype=np.float32,
+            )
+            linear = run_linear_gwas(
+                genotype=disk_genotype,
+                phenotype=toy["phenotype"],
+                covariates=toy["covariates"],
+                marker_ids=toy["marker_ids"],
+                sample_ids=toy["sample_ids"],
+                chunk_size=4,
+            )
+        self.assertEqual(len(linear.table), 36)
+
+    def test_linear_streams_results_for_disk_backed_genotype(self):
+        toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
+        genotype = np.load(toy["genotype"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memmap_path = Path(tmpdir) / "genotype.npy"
+            outdir = Path(tmpdir) / "linear"
+            mmap = open_memmap(memmap_path, mode="w+", dtype=np.float32, shape=genotype.shape)
+            mmap[:] = genotype.astype(np.float32)
+            mmap.flush()
+            disk_genotype = DiskBackedGenotype(
+                memmap_path,
+                sample_ids=np.loadtxt(toy["sample_ids"], dtype=str),
+                marker_ids=np.loadtxt(toy["marker_ids"], dtype=str),
+                dtype=np.float32,
+            )
+            linear = run_linear_gwas(
+                genotype=disk_genotype,
+                phenotype=toy["phenotype"],
+                covariates=toy["covariates"],
+                marker_ids=toy["marker_ids"],
+                sample_ids=toy["sample_ids"],
+                output_dir=outdir,
+                chunk_size=4,
+            )
+            metadata = json.loads((outdir / "run.json").read_text())
+            lines = binary_rows(outdir)
+        self.assertEqual(linear.table, [])
+        self.assertTrue(metadata["results_streamed"])
+        self.assertEqual(metadata["n_result_rows"], 36)
+        self.assertEqual(metadata["compute_dtype_used"], "float32")
+        self.assertEqual(len(lines), 36)
+
+    def test_linear_allows_explicit_compute_dtype_override(self):
+        toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
+        genotype = np.load(toy["genotype"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memmap_path = Path(tmpdir) / "genotype.npy"
+            mmap = open_memmap(memmap_path, mode="w+", dtype=np.float32, shape=genotype.shape)
+            mmap[:] = genotype.astype(np.float32)
+            mmap.flush()
+            disk_genotype = DiskBackedGenotype(
+                memmap_path,
+                sample_ids=np.loadtxt(toy["sample_ids"], dtype=str),
+                marker_ids=np.loadtxt(toy["marker_ids"], dtype=str),
+                dtype=np.float32,
+            )
+            linear = run_linear_gwas(
+                genotype=disk_genotype,
+                phenotype=toy["phenotype"],
+                covariates=toy["covariates"],
+                marker_ids=toy["marker_ids"],
+                sample_ids=toy["sample_ids"],
+                compute_dtype="float64",
+                chunk_size=4,
+            )
+        self.assertEqual(len(linear.table), 36)
+        self.assertEqual(linear.run_metadata["compute_dtype_used"], "float64")
+
+    def test_linear_streaming_topk_per_trait_limits_output(self):
+        toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
+        genotype = np.load(toy["genotype"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memmap_path = Path(tmpdir) / "genotype.npy"
+            outdir = Path(tmpdir) / "linear"
+            mmap = open_memmap(memmap_path, mode="w+", dtype=np.float32, shape=genotype.shape)
+            mmap[:] = genotype.astype(np.float32)
+            mmap.flush()
+            disk_genotype = DiskBackedGenotype(
+                memmap_path,
+                sample_ids=np.loadtxt(toy["sample_ids"], dtype=str),
+                marker_ids=np.loadtxt(toy["marker_ids"], dtype=str),
+                dtype=np.float32,
+            )
+            run_linear_gwas(
+                genotype=disk_genotype,
+                phenotype=toy["phenotype"],
+                covariates=toy["covariates"],
+                marker_ids=toy["marker_ids"],
+                sample_ids=toy["sample_ids"],
+                output_dir=outdir,
+                topk_per_trait=1,
+                chunk_size=4,
+            )
+            metadata = json.loads((outdir / "run.json").read_text())
+            rows = binary_rows(outdir)
+        self.assertEqual(metadata["topk_per_trait"], 1)
+        self.assertEqual(metadata["n_result_rows"], 3)
+        self.assertEqual(len(rows), 3)
+
+    def test_linear_streaming_p_value_threshold_filters_output(self):
+        toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
+        genotype = np.load(toy["genotype"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memmap_path = Path(tmpdir) / "genotype.npy"
+            outdir = Path(tmpdir) / "linear"
+            mmap = open_memmap(memmap_path, mode="w+", dtype=np.float32, shape=genotype.shape)
+            mmap[:] = genotype.astype(np.float32)
+            mmap.flush()
+            disk_genotype = DiskBackedGenotype(
+                memmap_path,
+                sample_ids=np.loadtxt(toy["sample_ids"], dtype=str),
+                marker_ids=np.loadtxt(toy["marker_ids"], dtype=str),
+                dtype=np.float32,
+            )
+            run_linear_gwas(
+                genotype=disk_genotype,
+                phenotype=toy["phenotype"],
+                covariates=toy["covariates"],
+                marker_ids=toy["marker_ids"],
+                sample_ids=toy["sample_ids"],
+                output_dir=outdir,
+                p_value_threshold=1e-4,
+                chunk_size=4,
+            )
+            metadata = json.loads((outdir / "run.json").read_text())
+            rows = binary_rows(outdir)
+        self.assertEqual(metadata["p_value_threshold"], 1e-4)
+        self.assertLessEqual(metadata["n_result_rows"], 36)
+        self.assertEqual(len(rows), metadata["n_result_rows"])
+
+
+if __name__ == "__main__":
+    unittest.main()

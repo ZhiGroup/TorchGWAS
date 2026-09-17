@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.so
+*.o
+*.a
+.build-libs/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Local analysis outputs and server configuration
+results/
+paper/
+benchmarks/
+.bench_snapshots/
+_scratch/
+competitor_grid/
+.proj/
+.remote
+.rsyncignore
+AGENTS.md
+
+# Common TorchGWAS run outputs
+demo_run/
+linear_out/
+prep_out/
+run.json
+qc.json
+sumstats/

@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+title: "TorchGWAS: GPU-accelerated GWAS at scale"
+message: "If you use TorchGWAS, please cite the software release and accompanying application note."
+type: software
+
+authors:
+  - family-names: Xie
+    given-names: Ziqian
+
+repository-code: "https://github.com/ZhiGroup/TorchGWAS"
+license: MIT
+version: 1.1.0
+date-released: 2026-09-17
+
+preferred-citation:
+  type: article
+  title: "TorchGWAS: GPU-accelerated GWAS at scale"
+  authors:
+    - family-names: Zhao
+      given-names: Xingzhong
+    - family-names: Xie
+      given-names: Ziqian
+    - family-names: Islam
+      given-names: Sheikh Muhammad Saiful
+    - family-names: Xia
+      given-names: Tian
+    - family-names: Chen
+      given-names: Cheng
+    - family-names: Zhi
+      given-names: Degui
+  year: 2026
+  doi: "10.48550/arXiv.2604.21095"
+  url: "https://arxiv.org/abs/2604.21095"

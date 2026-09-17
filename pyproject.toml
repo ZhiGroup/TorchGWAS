@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchgwas"
+version = "1.1.0"
+description = "GPU-accelerated linear association testing for quantitative phenotypes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "TorchGWAS Authors"}
+]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scipy>=1.10",
+  "torch>=2.0",
+  "zstandard>=0.22",
+]
+
+[project.optional-dependencies]
+bgen = ["bgen-reader>=4.0,<5"]
+pgen = ["pgenlib"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+torchgwas = "torchgwas.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+torchgwas = ["native/*.c", "native/*.cu"]
