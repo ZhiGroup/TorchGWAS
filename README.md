@@ -4,6 +4,13 @@ TorchGWAS is a GPU-accelerated framework for covariate-adjusted linear
 association testing across quantitative phenotypes. It streams genotype data
 in bounded chunks and batches association calculations on the GPU.
 
+## Statistical scope
+
+TorchGWAS implements a fixed-effect linear association model and is intended
+for unrelated or appropriately relatedness-filtered individuals. When related
+individuals are retained, a mixed-model association method should be used
+instead.
+
 ## Features
 
 - Linear association testing for one or more quantitative phenotypes.
