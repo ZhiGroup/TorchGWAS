@@ -94,7 +94,6 @@ def _build_parser() -> argparse.ArgumentParser:
     linear.add_argument("--chunk-size", type=int, default=None)
     linear.add_argument("--pipeline-profile", default=None,
                         help="JSON with explicit hardware and input costs for the shared calculator")
-    linear.add_argument("--topk-per-trait", type=int, default=None)
     linear.add_argument("--p-value-threshold", type=float, default=None)
     # TWO MODES, and the CLI previously offered NEITHER of them: it exposed
     # only the internal top-k spellings, so the reduction a user actually wants
@@ -411,7 +410,6 @@ def _run_linear(args) -> int:
         compute_dtype=args.compute_dtype,
         device=args.device,
         chunk_size=args.chunk_size,
-        topk_per_trait=args.topk_per_trait,
         pipeline_profile=args.pipeline_profile,
         p_value_threshold=args.p_value_threshold,
         reduce=args.reduce,

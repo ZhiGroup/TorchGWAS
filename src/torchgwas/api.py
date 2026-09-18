@@ -518,7 +518,6 @@ def run_linear_gwas(
     device: str = "auto",
     compute_dtype: str = "auto",
     chunk_size: int | None = None,
-    topk_per_trait: int | None = None,
     p_value_threshold: float | None = None,
     reduce: str | None = None,
     significance_threshold: float | None = None,
@@ -622,10 +621,8 @@ def run_linear_gwas(
         raise ValueError(
             "sumstats_fields='t' applies only to sumstats_format='binary'"
         )
-    if sumstats_format == "none" and (topk_per_trait is not None or p_value_threshold is not None):
+    if sumstats_format == "none" and p_value_threshold is not None:
         raise ValueError("row selection requires binary output")
-    if topk_per_trait is not None and topk_per_trait <= 0:
-        raise ValueError("topk_per_trait must be positive")
     if p_value_threshold is not None and not (0.0 < p_value_threshold <= 1.0):
         raise ValueError("p_value_threshold must be in (0, 1]")
     # A reduction changes what the scan produces, not merely which rows are
@@ -993,7 +990,6 @@ def run_linear_gwas(
                 and significance is None
                 and jagwas is None
                 and reduction is None
-                and topk_per_trait is None
                 and p_value_threshold is None
             )
 
@@ -1112,7 +1108,7 @@ def run_linear_gwas(
             if sumstats_format == "none":
                 n_rows, sumstats_summary = _drain_linear_chunks(chunk_iterator)
             elif (significance is not None or jagwas is not None or reduction is not None
-                  or topk_per_trait is not None or p_value_threshold is not None):
+                  or p_value_threshold is not None):
                 from .sumstats_indexed import write_indexed_sumstats
                 kind = ("significant" if significance is not None else "jagwas" if jagwas is not None
                         else "reduced" if reduction is not None else "filtered")
@@ -1120,7 +1116,7 @@ def run_linear_gwas(
                     out / "sumstats", marker_names, trait_names, genotype_shape[0], chunk_iterator,
                     kind=kind, df=residual_df,
                     chi2_df=jagwas.degrees_of_freedom if jagwas is not None else None,
-                    topk_per_trait=topk_per_trait,p_value_threshold=p_value_threshold,
+                    p_value_threshold=p_value_threshold,
                     variant_metadata=variant_metadata,fsync=sumstats_fsync,
                     store_beta=sumstats_fields != "t")
             else:
@@ -1281,7 +1277,6 @@ def run_linear_gwas(
         ),
         "compute_dtype_requested": compute_dtype,
         "compute_dtype_used": resolved_compute_dtype,
-        "topk_per_trait": topk_per_trait,
         "p_value_threshold": p_value_threshold,
         "reduce": ("jagwas" if jagwas is not None
                    else "significant" if significance is not None
@@ -1344,13 +1339,13 @@ def run_linear_gwas(
         out = mkdir(output_dir)
         streamed = isinstance(genotype, ChunkedGenotype) and run_metadata["results_streamed"]
         if not streamed:
-            if sumstats_format == "binary" and (topk_per_trait is not None or p_value_threshold is not None):
+            if sumstats_format == "binary" and p_value_threshold is not None:
                 from .sumstats_indexed import write_indexed_sumstats
                 written, sumstats_summary = write_indexed_sumstats(
                     out / "sumstats", marker_names, trait_names, genotype_shape[0],
                     iter([(0, len(marker_names), beta, t_stat, None)]), kind="filtered",
                     df=genotype_shape[0] - covariate_rank_used - 2,
-                    topk_per_trait=topk_per_trait,p_value_threshold=p_value_threshold,
+                    p_value_threshold=p_value_threshold,
                     variant_metadata=variant_metadata,fsync=sumstats_fsync,
                     store_beta=sumstats_fields != "t")
                 run_metadata["n_result_rows"] = written

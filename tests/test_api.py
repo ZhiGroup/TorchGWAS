@@ -156,36 +156,12 @@ class APITestCase(unittest.TestCase):
         self.assertEqual(len(linear.table), 36)
         self.assertEqual(linear.run_metadata["compute_dtype_used"], "float64")
 
-    def test_linear_streaming_topk_per_trait_limits_output(self):
-        toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
-        genotype = np.load(toy["genotype"])
-        with tempfile.TemporaryDirectory() as tmpdir:
-            memmap_path = Path(tmpdir) / "genotype.npy"
-            outdir = Path(tmpdir) / "linear"
-            mmap = open_memmap(memmap_path, mode="w+", dtype=np.float32, shape=genotype.shape)
-            mmap[:] = genotype.astype(np.float32)
-            mmap.flush()
-            disk_genotype = DiskBackedGenotype(
-                memmap_path,
-                sample_ids=np.loadtxt(toy["sample_ids"], dtype=str),
-                marker_ids=np.loadtxt(toy["marker_ids"], dtype=str),
-                dtype=np.float32,
-            )
-            run_linear_gwas(
-                genotype=disk_genotype,
-                phenotype=toy["phenotype"],
-                covariates=toy["covariates"],
-                marker_ids=toy["marker_ids"],
-                sample_ids=toy["sample_ids"],
-                output_dir=outdir,
-                topk_per_trait=1,
-                chunk_size=4,
-            )
-            metadata = json.loads((outdir / "run.json").read_text())
-            rows = binary_rows(outdir)
-        self.assertEqual(metadata["topk_per_trait"], 1)
-        self.assertEqual(metadata["n_result_rows"], 3)
-        self.assertEqual(len(rows), 3)
+    def test_topk_per_trait_is_not_public_api(self):
+        import inspect
+
+        self.assertNotIn(
+            "topk_per_trait", inspect.signature(run_linear_gwas).parameters
+        )
 
     def test_linear_streaming_p_value_threshold_filters_output(self):
         toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")

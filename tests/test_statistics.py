@@ -166,7 +166,7 @@ class ExactLinearStatisticsTestCase(unittest.TestCase):
                 reader_workers=2,
                 return_log10_p=True,
             )
-            output_dir = Path(tmpdir) / "topk"
+            output_dir = Path(tmpdir) / "binary"
             streamed = run_linear_gwas(
                 genotype=bed,
                 phenotype=phenotype,
@@ -176,10 +176,9 @@ class ExactLinearStatisticsTestCase(unittest.TestCase):
                 device="cuda:0",
                 compute_dtype="float32",
                 reader_workers=2,
-                topk_per_trait=2,
                 output_dir=output_dir,
             )
-            top_rows = binary_rows(output_dir)
+            output_rows = binary_rows(output_dir)
         np.testing.assert_allclose(beta, beta_ref, rtol=2e-4, atol=2e-5)
         np.testing.assert_allclose(t_stat, t_ref, rtol=2e-4, atol=2e-5)
         np.testing.assert_allclose(
@@ -187,18 +186,7 @@ class ExactLinearStatisticsTestCase(unittest.TestCase):
                 t_stat, n_samples - np.linalg.matrix_rank(covariates) - 2),
             rtol=1e-10, atol=1e-10)
         self.assertEqual(streamed.qc_summary["genotype_qc_mode"], "fused_gpu_scan")
-        self.assertEqual(len(top_rows), 4)
-        for trait_index in range(2):
-            observed = {
-                row["marker_id"]
-                for row in top_rows
-                if row["trait"] == f"trait_{trait_index}"
-            }
-            expected = {
-                f"rs{index}"
-                for index in np.argsort(np.abs(t_ref[:, trait_index]))[-2:]
-            }
-            self.assertEqual(observed, expected)
+        self.assertEqual(len(output_rows), genotype.shape[1] * phenotype.shape[1])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the packed BED scan")
     def test_packed_bed_cuda_subset_matches_float64_reference(self):
@@ -1182,8 +1170,6 @@ class StreamingReductionTestCase(unittest.TestCase):
             for kwargs in (
                 {"reduce": "max-abs-t"},                             # no output_dir
                 {"reduce": "top-k", "output_dir": str(root / "a")},  # no k
-                {"reduce": "max-abs-t", "output_dir": str(root / "b"),
-                 "topk_per_trait": 2},
                 {"reduce": "max-abs-t", "output_dir": str(root / "c"),
                  "sumstats_format": "binary"},
                 {"reduce_top_k": 3, "output_dir": str(root / "d")},  # k without mode
