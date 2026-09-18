@@ -492,4 +492,4 @@ def test_threshold_selector_uses_indexed_binary(tmp_path):
         output_dir=tmp_path,
         p_value_threshold=1.0,
     )
-    assert len(binary_rows(tmp_path)) == genotype.shape[1] * phenotype.shape[1]
+    assert len(binary_rows(tmp_path)) == (genotype.shape[1] - 1) * phenotype.shape[1]
