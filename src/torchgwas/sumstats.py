@@ -3,9 +3,8 @@
 Text summary statistics do not scale to whole-cohort multi-trait scans. One
 marker-by-trait row costs roughly eighty ASCII bytes plus a Python csv round
 trip, so 8.1M variants by 128 traits is about 88 GB of text and over a billion
-formatted rows. The association result itself is two float32 values per cell,
-which is 8 bytes: the same information at a tenth of the bytes and none of the
-formatting work.
+formatted rows. The default association result is three float32 values per
+cell: effect size, t statistic and an underflow-safe significance measure.
 
 This module writes that native representation directly:
 
@@ -13,14 +12,16 @@ This module writes that native representation directly:
     ``(n_variants, n_traits)`` little-endian float32, C order.
 ``tstat.f32``
     ``(n_variants, n_traits)`` little-endian float32, C order.
+``neglog10p.f32``
+    ``(n_variants, n_traits)`` little-endian float32 ``-log10(P)``, C order.
 ``manifest.json``
     shape, dtype, byte order, trait names, sample count, residual degrees of
     freedom, and the exclusion convention.
 
-Excluded variants (missing or invariant) carry NaN in both arrays, matching the
-scan contract; per-category counts stay in ``qc.json``. P-values are not stored
-because they are an exact function of ``t_stat`` and ``df``; recomputing them
-costs far less than writing them.
+Excluded variants (missing or invariant) carry NaN in every array, matching
+the scan contract; per-category counts stay in ``qc.json``. Raw P values are
+not stored because they are redundant with ``-log10(P)`` and underflow for
+strong associations.
 
 Writes are decoupled from scan chunking. Chunks are appended into a staging
 block and handed to the operating system only once a full block is ready, so
@@ -45,7 +46,8 @@ import numpy as np
 MANIFEST_NAME = "manifest.json"
 BETA_NAME = "beta.f32"
 TSTAT_NAME = "tstat.f32"
-FORMAT_VERSION = 1
+LOGP_NAME = "neglog10p.f32"
+FORMAT_VERSION = 2
 DEFAULT_BLOCK_BYTES = 16 << 20
 MIN_AUTO_BLOCK_BYTES = 1 << 20
 MAX_AUTO_BLOCK_BYTES = 16 << 20
@@ -286,7 +288,7 @@ class _BlockStream:
 
 @dataclass
 class BinarySumstatsWriter:
-    """Write beta and t_stat tiles into a binary sumstats directory.
+    """Write beta, t_stat and -log10(P) tiles into a binary directory.
 
     Chunks must arrive in variant order and must together cover exactly
     ``n_variants`` rows; ``close`` verifies that.
@@ -322,8 +324,7 @@ class BinarySumstatsWriter:
     store_beta: bool = True
     """Write the effect-size array alongside the statistic.
 
-    Dropping it halves the output to 4 bytes per cell, which on storage where
-    the write does not hide is a direct halving of the write cost. It is a
+    Dropping it reduces the output from 12 to 8 bytes per cell. It is a
     screening-only choice: without beta there is no effect size and no standard
     error, so results cannot be meta-analysed or expressed on any effect scale.
     Keep the default unless the output is only ever used to rank or threshold.
@@ -341,6 +342,7 @@ class BinarySumstatsWriter:
         self._summary: dict = {}
         self._beta = None
         self._tstat = None
+        self._logp = None
         # Distinct from "_beta is None", which is also the steady state of a
         # t-only store; block sizing keys off whether streams exist yet.
         self._streams_open = False
@@ -366,10 +368,20 @@ class BinarySumstatsWriter:
                 self.writeback_bytes,
                 self.inflight_bytes,
             )
+            self._logp = _BlockStream(
+                self.directory / LOGP_NAME,
+                block_bytes,
+                self.queue_depth,
+                self.writeback_bytes,
+                self.inflight_bytes,
+            )
         except BaseException:
             if self._beta is not None:
                 self._beta.abort()
                 self._beta = None
+            if self._tstat is not None:
+                self._tstat.abort()
+                self._tstat = None
             self._streams_open = False
             raise
 
@@ -378,7 +390,7 @@ class BinarySumstatsWriter:
         """Number of marker-by-trait cells appended so far."""
         return self._written * self.n_traits
 
-    def write_chunk(self, start: int, end: int, beta, t_stat) -> None:
+    def write_chunk(self, start: int, end: int, beta, t_stat, neg_log10_p=None) -> None:
         if self._closed:
             raise RuntimeError("writer is closed")
         if start != self._written:
@@ -388,12 +400,19 @@ class BinarySumstatsWriter:
             )
         count = end - start
         started = time.perf_counter()
+        if neg_log10_p is None:
+            from .tails import upper_tail_log10_from_t
+
+            df = np.asarray(self.df, dtype=np.float64)
+            if df.ndim == 1:
+                df = df[None, :]
+            neg_log10_p = upper_tail_log10_from_t(t_stat, df)
         if not self._streams_open:
             payload = count * self.n_traits * 4
             self._open_streams(
                 min(MAX_AUTO_BLOCK_BYTES, max(MIN_AUTO_BLOCK_BYTES, payload))
             )
-        pairs = [(t_stat, self._tstat)]
+        pairs = [(t_stat, self._tstat), (neg_log10_p, self._logp)]
         if self._beta is not None:
             pairs.insert(0, (beta, self._beta))
         for array, stream in pairs:
@@ -421,11 +440,12 @@ class BinarySumstatsWriter:
             self._open_streams(self.block_bytes or DEFAULT_BLOCK_BYTES)
         beta_stats = _StreamStats() if self._beta is None else self._beta.close(fsync=self.fsync)
         tstat_stats = self._tstat.close(fsync=self.fsync)
+        logp_stats = self._logp.close(fsync=self.fsync)
         if self._written != self.n_variants:
             raise ValueError(
                 f"sumstats covered {self._written} variants, expected {self.n_variants}"
             )
-        arrays = {"t_stat": TSTAT_NAME}
+        arrays = {"t_stat": TSTAT_NAME, "neg_log10_p": LOGP_NAME}
         if self.store_beta:
             arrays = {"beta": BETA_NAME, **arrays}
         manifest = {
@@ -446,10 +466,8 @@ class BinarySumstatsWriter:
             "excluded_convention": (
                 "NaN marks a missing or invariant variant in every stored array"
             ),
-            "p_value": (
-                "not stored; two-sided Student t on t_stat with per-trait df"
-                if np.ndim(self.df) else
-                "not stored; two-sided Student t on t_stat with df"
+            "significance": (
+                "neg_log10_p is -log10 of the exact two-sided Student-t tail"
             ),
             **(
                 {}
@@ -464,30 +482,38 @@ class BinarySumstatsWriter:
             **self.extra_manifest,
         }
         (self.directory / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
-        payload = beta_stats.payload_bytes + tstat_stats.payload_bytes
-        write_seconds = beta_stats.write_seconds + tstat_stats.write_seconds
+        payload = (beta_stats.payload_bytes + tstat_stats.payload_bytes
+                   + logp_stats.payload_bytes)
+        write_seconds = (beta_stats.write_seconds + tstat_stats.write_seconds
+                         + logp_stats.write_seconds)
         # Writer-thread time actually spent facing storage: the write calls,
         # the blocking writeback waits and the closing fsync.
         service_seconds = (
             write_seconds
             + beta_stats.writeback_seconds
             + tstat_stats.writeback_seconds
+            + logp_stats.writeback_seconds
             + beta_stats.fsync_seconds
             + tstat_stats.fsync_seconds
+            + logp_stats.fsync_seconds
         )
         self._summary = {
             "directory": str(self.directory),
             "cells": self._written * self.n_traits,
             "payload_bytes": payload,
             "append_seconds": self._append_seconds,
-            "stall_seconds": beta_stats.stall_seconds + tstat_stats.stall_seconds,
+            "stall_seconds": (beta_stats.stall_seconds + tstat_stats.stall_seconds
+                              + logp_stats.stall_seconds),
             "write_seconds": write_seconds,
             "writeback_seconds": (
                 beta_stats.writeback_seconds + tstat_stats.writeback_seconds
+                + logp_stats.writeback_seconds
             ),
-            "drain_seconds": max(beta_stats.drain_seconds, tstat_stats.drain_seconds),
-            "fsync_seconds": beta_stats.fsync_seconds + tstat_stats.fsync_seconds,
-            "blocks": beta_stats.blocks + tstat_stats.blocks,
+            "drain_seconds": max(beta_stats.drain_seconds, tstat_stats.drain_seconds,
+                                 logp_stats.drain_seconds),
+            "fsync_seconds": (beta_stats.fsync_seconds + tstat_stats.fsync_seconds
+                              + logp_stats.fsync_seconds),
+            "blocks": beta_stats.blocks + tstat_stats.blocks + logp_stats.blocks,
             "block_bytes": self.block_bytes,
             "queue_depth": self.queue_depth,
             "writeback_bytes": self.writeback_bytes,
@@ -508,6 +534,8 @@ class BinarySumstatsWriter:
             self._beta.abort()
         if self._tstat is not None:
             self._tstat.abort()
+        if self._logp is not None:
+            self._logp.abort()
 
     def __enter__(self):
         return self
@@ -524,7 +552,7 @@ def read_manifest(directory) -> dict:
 
 
 def open_binary_sumstats(directory):
-    """Memory-map beta and t_stat from a binary sumstats directory."""
+    """Memory-map beta, t_stat and -log10(P) from a binary directory."""
     directory = Path(directory)
     manifest = read_manifest(directory)
     if manifest.get("format") != "torchgwas-binary-sumstats":
@@ -543,4 +571,5 @@ def open_binary_sumstats(directory):
     # silently reading a zero array.
     beta = _map(arrays["beta"]) if "beta" in arrays else None
     tstat = _map(arrays["t_stat"])
-    return beta, tstat, manifest
+    logp = _map(arrays["neg_log10_p"])
+    return beta, tstat, logp, manifest

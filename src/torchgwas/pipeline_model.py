@@ -45,9 +45,9 @@ import json
 import math
 
 
-# Binary sumstats hold float32 beta and t_stat per marker-trait cell, so the
-# output volume is a property of the requested fields, not of the storage.
-SUMSTATS_BYTES_PER_TEST = {"beta+t": 8.0, "t": 4.0}
+# Binary sumstats always hold float32 t_stat and neg_log10_p, with optional
+# float32 beta, so output volume is a property of the requested fields.
+SUMSTATS_BYTES_PER_TEST = {"beta+t": 12.0, "t": 8.0}
 
 
 def sumstats_output_bytes_per_test(fields: str = "beta+t") -> float:
@@ -708,6 +708,7 @@ def explain_time(*, variants: int, samples: int, traits: int,
     if not 0 <= overlap <= 1 or not 0 <= write_overlap <= 1:
         raise ValueError("overlap values must be in [0, 1]")
     chunks = math.ceil(m / chunk_variants)
+    result_bytes_per_test = 16.0 if output_bytes_per_test else 8.0
     resources = {
         'disk': stored_bytes / disk_bytes_per_second,
         'h2d': m * transfer_bytes_per_variant / h2d_bytes_per_second,
@@ -715,7 +716,10 @@ def explain_time(*, variants: int, samples: int, traits: int,
                 / gemm_rate_at_width(gemm_flops_per_second, k + c + 1,
                                      chunk_variants=chunk_variants,
                                      realized_fraction=gemm_realized_fraction),
-        'd2h': m * (8.0 * k + 1.0) / d2h_bytes_per_second,
+        # Dense output also returns float64 -log10(P) from the GPU. It is
+        # stored as float32, but the device-to-host transfer preserves the
+        # calculation before the writer performs that final cast.
+        'd2h': m * (result_bytes_per_test * k + 1.0) / d2h_bytes_per_second,
     }
     # Host-side decompression, for a compressed store. Priced on the bytes it
     # PRODUCES, because that is what the codec's rate is quoted against and
@@ -1806,10 +1810,10 @@ def binary_output_pipeline_seconds(producer_chunk, consumer_chunk, variants,
                                    traits, chunk_variants, append_seconds,
                                    storage_seconds, final_seconds,
                                    block_bytes=1 << 20, queue_depth=3):
-    """Finite producer/main/background-write schedule for dense beta+t output.
+    """Finite producer/main/background-write schedule for dense binary output.
 
     append_seconds excludes queue stalls; storage_seconds is the critical
-    service of the two concurrent array writers for the whole payload.
+    service of the concurrent array writers for the whole payload.
     final_seconds contains measured fsync and metadata publication service.
     Blocks become writable only after their bytes have been produced. A bounded
     staging pool propagates storage backpressure to the consumer. Rates are

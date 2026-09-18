@@ -127,8 +127,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default="binary",
         choices=["binary", "none"],
         help=(
-            "binary writes a tiled float32 beta/t_stat "
-            "store under sumstats/ (8 bytes per marker-trait cell); "
+            "binary writes tiled float32 beta/t_stat/-log10(P) "
+            "arrays under sumstats/ (12 bytes per marker-trait cell); "
             "none runs the scan and discards results, isolating scan cost"
         ),
     )
@@ -137,9 +137,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default="beta+t",
         choices=["beta+t", "t"],
         help=(
-            "binary store contents: 'beta+t' (default, 8 bytes per cell) keeps "
-            "effect size and statistic; 't' halves the output to 4 bytes per cell "
-            "but is screening-only, with no effect size and no standard error, so "
+            "binary store contents: 'beta+t' (default, 12 bytes per cell) keeps "
+            "effect size, statistic and -log10(P); 't' writes t and -log10(P) at "
+            "8 bytes per cell but is screening-only, with no effect size or standard error, so "
             "it cannot be meta-analysed"
         ),
     )

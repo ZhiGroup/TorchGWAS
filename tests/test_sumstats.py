@@ -15,6 +15,7 @@ from torchgwas.sumstats import (
     open_binary_sumstats,
     read_manifest,
 )
+from torchgwas.tails import upper_tail_log10_from_t
 
 
 def _write_store(tmp_path, n_variants=57, n_traits=5, block_bytes=1024, seed=0):
@@ -43,12 +44,36 @@ def _write_store(tmp_path, n_variants=57, n_traits=5, block_bytes=1024, seed=0):
 
 def test_roundtrip_is_bit_exact(tmp_path):
     directory, beta, tstat, summary = _write_store(tmp_path)
-    stored_beta, stored_t, manifest = open_binary_sumstats(directory)
+    stored_beta, stored_t, stored_logp, manifest = open_binary_sumstats(directory)
     np.testing.assert_array_equal(np.asarray(stored_beta), beta)
     np.testing.assert_array_equal(np.asarray(stored_t), tstat)
+    np.testing.assert_allclose(
+        np.asarray(stored_logp),
+        -np.log10(2.0 * special.stdtr(990, -np.abs(tstat))),
+        rtol=1e-6, atol=1e-8, equal_nan=True)
     assert manifest["shape"] == list(beta.shape)
     assert manifest["df"] == 990
-    assert summary["payload_bytes"] == beta.nbytes + tstat.nbytes
+    assert summary["payload_bytes"] == beta.nbytes + tstat.nbytes + stored_logp.nbytes
+
+
+def test_binary_logp_remains_finite_above_one_thousand(tmp_path):
+    tstat = np.asarray([[100.0]], dtype=np.float32)
+    logp = upper_tail_log10_from_t(tstat, 20000.0)
+    writer = BinarySumstatsWriter(
+        directory=tmp_path / "extreme",
+        n_variants=1,
+        trait_names=["trait"],
+        n_samples=20002,
+        df=20000,
+        fsync=False,
+    )
+    writer.write_chunk(0, 1, np.ones_like(tstat), tstat, logp)
+    writer.close()
+    _beta, _tstat, stored_logp, _manifest = open_binary_sumstats(
+        tmp_path / "extreme")
+    assert np.isfinite(stored_logp[0, 0])
+    assert stored_logp[0, 0] > 1000.0
+    assert stored_logp[0, 0] == pytest.approx(float(logp[0, 0]), rel=1e-7)
 
 
 def test_manifest_preserves_trait_specific_df(tmp_path):
@@ -71,12 +96,13 @@ def test_manifest_preserves_trait_specific_df(tmp_path):
 
     manifest = read_manifest(tmp_path / "sumstats")
     assert manifest["df"] == trait_df
-    assert manifest["p_value"].endswith("per-trait df")
+    assert "p_value" not in manifest
+    assert "neg_log10_p" in manifest["significance"]
 
 
-def test_payload_is_eight_bytes_per_cell(tmp_path):
+def test_payload_is_twelve_bytes_per_cell(tmp_path):
     directory, beta, _tstat, summary = _write_store(tmp_path)
-    assert summary["payload_bytes"] == 8 * beta.size
+    assert summary["payload_bytes"] == 12 * beta.size
     assert summary["cells"] == beta.size
 
 
@@ -85,7 +111,7 @@ def test_block_size_does_not_change_bytes(tmp_path, block_bytes):
     directory, beta, tstat, _ = _write_store(
         tmp_path / str(block_bytes), block_bytes=block_bytes
     )
-    stored_beta, stored_t, _ = open_binary_sumstats(directory)
+    stored_beta, stored_t, _stored_logp, _ = open_binary_sumstats(directory)
     np.testing.assert_array_equal(np.asarray(stored_beta), beta)
     np.testing.assert_array_equal(np.asarray(stored_t), tstat)
 
@@ -135,10 +161,10 @@ def test_pass_through_fires_when_a_chunk_fills_a_block(tmp_path):
     )
     chunks = n_variants // chunk
     # One queued item per chunk per array, with no staging coalescing.
-    assert summary["blocks"] == 2 * chunks
-    assert summary["payload_bytes"] == beta.nbytes + tstat.nbytes
+    assert summary["blocks"] == 3 * chunks
+    assert summary["payload_bytes"] == 3 * tstat.nbytes
 
-    stored_beta, stored_t, _ = open_binary_sumstats(tmp_path / "borrow")
+    stored_beta, stored_t, _stored_logp, _ = open_binary_sumstats(tmp_path / "borrow")
     np.testing.assert_array_equal(np.asarray(stored_beta), beta)
     np.testing.assert_array_equal(np.asarray(stored_t), tstat)
 
@@ -151,12 +177,12 @@ def test_borrow_disabled_coalesces_through_staging(tmp_path):
         tmp_path / "staged", n_variants, n_traits, chunk, block_bytes, borrow=False
     )
     per_array = beta.nbytes
-    expected_blocks = 2 * -(-per_array // block_bytes)
+    expected_blocks = 3 * -(-per_array // block_bytes)
     assert summary["blocks"] == expected_blocks
     assert summary["blocks"] > 2 * (n_variants // chunk)
-    assert summary["payload_bytes"] == beta.nbytes + tstat.nbytes
+    assert summary["payload_bytes"] == 3 * tstat.nbytes
 
-    stored_beta, stored_t, _ = open_binary_sumstats(tmp_path / "staged")
+    stored_beta, stored_t, _stored_logp, _ = open_binary_sumstats(tmp_path / "staged")
     np.testing.assert_array_equal(np.asarray(stored_beta), beta)
     np.testing.assert_array_equal(np.asarray(stored_t), tstat)
 
@@ -174,7 +200,7 @@ def test_oversized_block_silently_disables_pass_through(tmp_path):
         tmp_path / "oversized", n_variants, n_traits, chunk, block_bytes, borrow=True
     )
     # Borrowing is requested but cannot engage: four chunks per block.
-    assert summary["blocks"] == 2 * (n_variants // chunk) // 4
+    assert summary["blocks"] == 3 * (n_variants // chunk) // 4
 
 
 @pytest.mark.parametrize(
@@ -194,9 +220,9 @@ def test_geometries_are_bit_exact(tmp_path, n_variants, n_traits, chunk, block_b
     beta, tstat, summary = _write_geometry(
         directory, n_variants, n_traits, chunk, block_bytes, borrow
     )
-    stored_beta, stored_t, manifest = open_binary_sumstats(directory)
+    stored_beta, stored_t, stored_logp, manifest = open_binary_sumstats(directory)
     assert manifest["shape"] == [n_variants, n_traits]
-    assert summary["payload_bytes"] == beta.nbytes + tstat.nbytes
+    assert summary["payload_bytes"] == beta.nbytes + tstat.nbytes + stored_logp.nbytes
     np.testing.assert_array_equal(np.asarray(stored_beta), beta)
     np.testing.assert_array_equal(np.asarray(stored_t), tstat)
     assert np.isnan(np.asarray(stored_t)[0]).all()
@@ -233,12 +259,12 @@ def test_borrowed_payload_is_not_read_after_the_caller_mutates_it(tmp_path):
         scratch_beta.fill(np.nan)  # a reusing iterator would do this next
         scratch_t.fill(np.nan)
     writer.close()
-    stored_beta, stored_t, _ = open_binary_sumstats(directory)
+    stored_beta, stored_t, _stored_logp, _ = open_binary_sumstats(directory)
     np.testing.assert_array_equal(np.asarray(stored_beta), beta)
     np.testing.assert_array_equal(np.asarray(stored_t), tstat)
 
 
-def test_t_only_store_is_half_the_bytes_and_omits_beta(tmp_path):
+def test_t_only_store_omits_beta_and_keeps_logp(tmp_path):
     n_variants, n_traits, chunk = 600, 16, 100
     rng = np.random.default_rng(19)
     beta = rng.normal(size=(n_variants, n_traits)).astype(np.float32)
@@ -258,14 +284,15 @@ def test_t_only_store_is_half_the_bytes_and_omits_beta(tmp_path):
         writer.write_chunk(start, end, beta[start:end].copy(), tstat[start:end].copy())
     summary = writer.close()
 
-    assert summary["payload_bytes"] == 4 * n_variants * n_traits
-    assert summary["payload_bytes"] == tstat.nbytes
+    assert summary["payload_bytes"] == 8 * n_variants * n_traits
+    assert summary["payload_bytes"] == 2 * tstat.nbytes
     assert not (directory / "beta.f32").exists()
 
-    stored_beta, stored_t, manifest = open_binary_sumstats(directory)
+    stored_beta, stored_t, stored_logp, manifest = open_binary_sumstats(directory)
     assert stored_beta is None
     assert "beta" not in manifest["arrays"]
     np.testing.assert_array_equal(np.asarray(stored_t), tstat)
+    assert stored_logp.shape == tstat.shape
 
 
 
@@ -285,7 +312,7 @@ def test_t_only_writer_with_no_chunks_creates_no_beta(tmp_path):
     assert summary["payload_bytes"] == 0
     assert not (directory / "beta.f32").exists()
     assert (directory / "tstat.f32").exists()
-    stored_beta, _stored_t, manifest = open_binary_sumstats(directory)
+    stored_beta, _stored_t, _stored_logp, manifest = open_binary_sumstats(directory)
     assert stored_beta is None
     assert "beta" not in manifest["arrays"]
 
@@ -387,7 +414,7 @@ def test_binary_store_matches_in_memory_statistics(tmp_path):
     run_linear_gwas(output_dir=binary_dir, sumstats_format="binary", **shared)
 
     rows = reference.table
-    beta, tstat, manifest = open_binary_sumstats(binary_dir / "sumstats")
+    beta, tstat, logp, manifest = open_binary_sumstats(binary_dir / "sumstats")
     assert manifest["traits"] == trait_columns
 
     # The in-memory path drops the invariant column, so the store covers the
@@ -401,11 +428,13 @@ def test_binary_store_matches_in_memory_statistics(tmp_path):
     trait_position = {name: index for index, name in enumerate(trait_columns)}
     assert rows, "in-memory reference produced no rows"
     assert len(rows) == len(stored_ids) * len(trait_columns)
+    assert all("p_value" not in row for row in rows)
     for row in rows:
         variant = marker_position[row["marker_id"]]
         trait = trait_position[row["trait"]]
         assert float(beta[variant, trait]) == pytest.approx(float(row["beta"]), rel=1e-6)
         assert float(tstat[variant, trait]) == pytest.approx(float(row["t_stat"]), rel=1e-6)
+        assert float(logp[variant, trait]) == pytest.approx(float(row["-log10_p"]), rel=1e-6)
 
 
 def test_dropped_columns_do_not_shift_marker_labels(tmp_path):

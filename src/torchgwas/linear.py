@@ -695,7 +695,10 @@ def linear_scan(
 
     beta = np.empty((n_markers, n_traits), dtype=np_dtype)
     t_stat = np.empty((n_markers, n_traits), dtype=np_dtype)
-    p_value = np.empty((n_markers, n_traits), dtype=np.float64)
+    p_value = (
+        None if return_log10_p
+        else np.empty((n_markers, n_traits), dtype=np.float64)
+    )
     log10_p = (
         np.empty((n_markers, n_traits), dtype=np.float64)
         if return_log10_p else None
@@ -713,8 +716,6 @@ def linear_scan(
             logp_chunk = upper_tail_log10_from_t_torch(adjusted_t, pair_df_t)
             t_chunk = adjusted_t.cpu().numpy()
             logp_chunk = logp_chunk.cpu().numpy()
-            with np.errstate(under="ignore"):
-                p_chunk = np.power(10.0, -logp_chunk)
         else:
             t_chunk = t_chunk_t.cpu().numpy()
             variant_df = df_chunk_t.cpu().numpy()
@@ -723,11 +724,12 @@ def linear_scan(
             p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
         beta[start:end] = beta_chunk
         t_stat[start:end] = t_chunk
-        p_value[start:end] = p_chunk
+        if p_value is not None:
+            p_value[start:end] = p_chunk
         if return_log10_p:
             log10_p[start:end] = logp_chunk
     if return_log10_p:
-        return beta, t_stat, p_value, log10_p, q_matrix
+        return beta, t_stat, log10_p, q_matrix
     return beta, t_stat, p_value, q_matrix
 
 
@@ -757,29 +759,34 @@ def linear_scan_streaming(
             compute_dtype=compute_dtype,
             reader_workers=reader_workers,
             prefetch_chunks=prefetch_chunks,
+            compute_p_values=not return_log10_p,
             compute_log10_p=return_log10_p,
         )
         n_markers = genotype.shape[1]
         n_traits = phenotype.shape[1]
         beta = np.empty((n_markers, n_traits), dtype=np.float32)
         t_stat = np.empty((n_markers, n_traits), dtype=np.float32)
-        p_value = np.empty((n_markers, n_traits), dtype=np.float64)
+        p_value = (
+            None if return_log10_p
+            else np.empty((n_markers, n_traits), dtype=np.float64)
+        )
         log10_p = (
             np.empty((n_markers, n_traits), dtype=np.float64)
             if return_log10_p else None
         )
         for chunk_result in chunk_iterator:
             if return_log10_p:
-                start, end, beta_chunk, t_chunk, p_chunk, logp_chunk = chunk_result
+                start, end, beta_chunk, t_chunk, _p_chunk, logp_chunk = chunk_result
             else:
                 start, end, beta_chunk, t_chunk, p_chunk = chunk_result
             beta[start:end] = beta_chunk
             t_stat[start:end] = t_chunk
-            p_value[start:end] = p_chunk
+            if p_value is not None:
+                p_value[start:end] = p_chunk
             if return_log10_p:
                 log10_p[start:end] = logp_chunk
         if return_log10_p:
-            return beta, t_stat, p_value, log10_p, q_matrix
+            return beta, t_stat, log10_p, q_matrix
         return beta, t_stat, p_value, q_matrix
 
     pheno_proc, q_matrix, phenotype_observed_counts = residualize_and_standardize(
@@ -807,7 +814,10 @@ def linear_scan_streaming(
 
     beta = np.empty((n_markers, n_traits), dtype=np_dtype)
     t_stat = np.empty((n_markers, n_traits), dtype=np_dtype)
-    p_value = np.empty((n_markers, n_traits), dtype=np.float64)
+    p_value = (
+        None if return_log10_p
+        else np.empty((n_markers, n_traits), dtype=np.float64)
+    )
     log10_p = (
         np.empty((n_markers, n_traits), dtype=np.float64)
         if return_log10_p else None
@@ -835,8 +845,6 @@ def linear_scan_streaming(
             logp_chunk = upper_tail_log10_from_t_torch(adjusted_t, pair_df_t)
             t_chunk = adjusted_t.cpu().numpy()
             logp_chunk = logp_chunk.cpu().numpy()
-            with np.errstate(under="ignore"):
-                p_chunk = np.power(10.0, -logp_chunk)
         else:
             t_chunk = t_chunk_t.cpu().numpy()
             variant_df = df_chunk_t.cpu().numpy()
@@ -845,11 +853,12 @@ def linear_scan_streaming(
             p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
         beta[start:end] = beta_chunk
         t_stat[start:end] = t_chunk
-        p_value[start:end] = p_chunk
+        if p_value is not None:
+            p_value[start:end] = p_chunk
         if return_log10_p:
             log10_p[start:end] = logp_chunk
     if return_log10_p:
-        return beta, t_stat, p_value, log10_p, q_matrix
+        return beta, t_stat, log10_p, q_matrix
     return beta, t_stat, p_value, q_matrix
 
 

@@ -15,6 +15,7 @@ def test_selected_indices_labels_and_t_only(tmp_path):
     assert rows == manifest["rows"] == 2
     np.testing.assert_array_equal(part["variant_index"], [3, 2])
     np.testing.assert_array_equal(part["trait_index"], [1, 0])
+    assert "neg_log10_p" in part
     assert "beta" not in part
     assert np.load(tmp_path / "variant_ids.npy").tolist() == labels
     assert not list(tmp_path.glob("*.tsv*"))
@@ -31,6 +32,7 @@ def test_topk_across_chunks_and_threshold(tmp_path):
     assert rows == 2
     np.testing.assert_array_equal(part["variant_index"], [2, 2])
     np.testing.assert_array_equal(part["t_stat"], [6., 8.])
+    assert np.all(np.isfinite(part["neg_log10_p"]))
 
 
 def test_empty_selection_and_joint_statistics(tmp_path):

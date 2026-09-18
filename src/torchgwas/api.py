@@ -373,7 +373,7 @@ def _write_linear_binary_streaming(
     extra_manifest: dict | None = None,
     borrow_results: bool = False,
 ) -> tuple[int, dict]:
-    """Stream beta/t_stat chunks into a binary sumstats directory.
+    """Stream beta/t_stat/-log10(P) chunks into a binary directory.
 
     Returns the cell count and a timing summary. The iterator is consumed in
     variant order; storage back-pressure reaches the scan through the writer's
@@ -403,8 +403,8 @@ def _write_linear_binary_streaming(
         borrow_chunks=not borrow_results,
     )
     try:
-        for start, end, beta_chunk, t_chunk, _p_chunk in chunk_iterator:
-            writer.write_chunk(start, end, beta_chunk, t_chunk)
+        for start, end, beta_chunk, t_chunk, _p_chunk, logp_chunk in chunk_iterator:
+            writer.write_chunk(start, end, beta_chunk, t_chunk, logp_chunk)
     except BaseException:
         writer.abort()
         raise
@@ -988,6 +988,15 @@ def run_linear_gwas(
             borrow_results = (sumstats_format == "none"
                               and trait_block is None)
 
+            dense_binary = (
+                sumstats_format == "binary"
+                and significance is None
+                and jagwas is None
+                and reduction is None
+                and topk_per_trait is None
+                and p_value_threshold is None
+            )
+
             def _scan(trait_slice=None, device=None):
                 return linear_scan_streaming_chunks(
                     genotype,
@@ -1005,12 +1014,13 @@ def run_linear_gwas(
                     # 153.6 million p-values per chunk at K = 150,000 -- and
                     # the significance path then throws every one of them
                     # away: `_significant_pairs_iterator` takes that chunk as
-                    # `_p_chunk` and ignores it, and the writer recomputes p
-                    # for the handful of pairs that clear the threshold. It
+                    # `_p_chunk` and ignores it, and the writer computes
+                    # -log10(P) only for pairs that clear the threshold. It
                     # presented as a multi-GPU problem (one core pinned, all
                     # cards idle, disk idle, worse as K grows, unaffected by
                     # running one process per card) and it was not one.
                     compute_p_values=False,
+                    compute_log10_p=dense_binary,
                     variant_range=variant_range,
                     reduction=reduction,
                     borrow_results=borrow_results,
@@ -1145,7 +1155,7 @@ def run_linear_gwas(
                 raise ValueError(
                     "variant_range requires output_dir: the in-memory result "
                     "path scans the whole file and would silently ignore it")
-            beta, t_stat, p_value, logp, q_matrix = linear_scan_streaming(
+            beta, t_stat, logp, q_matrix = linear_scan_streaming(
                 genotype,
                 phenotype,
                 covariates,
@@ -1163,7 +1173,6 @@ def run_linear_gwas(
                         "marker_id": marker_name,
                         "trait": trait_name,
                         "n": int(genotype_shape[0]),
-                        "p_value": float(p_value[marker_index, trait_index]),
                         "-log10_p": float(logp[marker_index, trait_index]),
                     }
                     if return_beta:
@@ -1187,7 +1196,7 @@ def run_linear_gwas(
             qc["n_variants_excluded"] = int(sum(scan_exclusions.values()))
     else:
         genotype, phenotype, covariates, qc = prepare_inputs(genotype, phenotype, covariates)
-        beta, t_stat, p_value, logp, q_matrix = linear_scan(
+        beta, t_stat, logp, q_matrix = linear_scan(
             genotype,
             phenotype,
             covariates,
@@ -1219,7 +1228,6 @@ def run_linear_gwas(
                     "marker_id": marker_name,
                     "trait": trait_name,
                     "n": int(genotype_shape[0]),
-                    "p_value": float(p_value[marker_index, trait_index]),
                     "-log10_p": float(logp[marker_index, trait_index]),
                 }
                 if return_beta:
@@ -1354,7 +1362,7 @@ def run_linear_gwas(
                     marker_names=marker_names,
                     trait_names=trait_names,
                     n_samples=genotype_shape[0],
-                    chunk_iterator=iter([(0, n_variants, beta, t_stat, None)]),
+                    chunk_iterator=iter([(0, n_variants, beta, t_stat, None, logp)]),
                     n_variants=n_variants,
                     df=genotype_shape[0]
                     - (0 if q_matrix is None else q_matrix.shape[1])

@@ -139,14 +139,19 @@ instead, use a mixed-model association method.
 ## Output
 
 Full scans write a tiled binary store under `OUTPUT_DIR/sumstats/`. By default,
-each marker-trait cell contains float32 `beta` and `t_stat` values. The output
-manifest records array shapes, data types, field names, and tile layout.
+each marker-trait cell contains float32 `beta`, `t_stat`, and `neg_log10_p`
+values. `neg_log10_p` is computed in float64 from the exact two-sided Student-t
+tail before being stored as float32; raw P values are not stored because they
+are redundant and can underflow for strong associations. The output manifest
+records array shapes, data types, field names, and tile layout.
 `run.json` records the analysis configuration and timing, while `qc.json`
 records sample, covariate, missingness, and invariant-variant decisions.
+Runs without `--output-dir` return `-log10_p` in each result row and omit the
+redundant raw `p_value` field.
 
-Use `--sumstats-fields t` for screening-only output containing t statistics,
-or `--sumstats-format none` to run the scan without writing association
-statistics. See [`docs/sumstats-format.md`](docs/sumstats-format.md).
+Use `--sumstats-fields t` for screening-only output containing `t_stat` and
+`neg_log10_p`. Use `--sumstats-format none` to run the scan without writing
+association statistics. See [`docs/sumstats-format.md`](docs/sumstats-format.md).
 
 ## Genotype conventions
 
