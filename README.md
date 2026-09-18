@@ -109,6 +109,33 @@ torchgwas linear \
 The same interface accepts `.pgen` and `.bgen` input. For BGEN files with
 external sample identifiers, add `--sample-file /path/to/study.sample`.
 
+## Unrelated-sample workflow
+
+For fixed-effect analyses that exclude related individuals, the repository
+includes `scripts/run_linear_unrelated.py`. The workflow uses PLINK 2.0
+`--king-cutoff` to construct an unrelated genotype subset, intersects the
+retained sample identifiers with the phenotype and covariate tables, and then
+runs TorchGWAS on the aligned cohort.
+
+Our analysis used a KING kinship cutoff of `(0.5)^4.5`, or approximately
+`0.044194`, to exclude third-degree or closer relationships. Pass this value
+explicitly:
+
+```bash
+PYTHONPATH=src python scripts/run_linear_unrelated.py \
+  --genotype /path/to/study.bed \
+  --genotype-format plink \
+  --phenotype-table /path/to/pheno.tsv \
+  --covariates-table /path/to/covar.tsv \
+  --sample-id-column IID \
+  --king-cutoff 0.04419417382415922 \
+  --output-dir unrelated_linear_run
+```
+
+The workflow writes the retained sample list, aligned genotype, phenotype and
+covariate inputs, and the TorchGWAS results. If related individuals are retained
+instead, use a mixed-model association method.
+
 ## Output
 
 Full scans write a tiled binary store under `OUTPUT_DIR/sumstats/`. By default,
