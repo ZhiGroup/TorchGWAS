@@ -43,9 +43,11 @@ def _scan_streams(device):
 
 def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                          reader_workers=None, prefetch_chunks=None,
-                         compute_p_values=True, variant_range=None,
+                         compute_p_values=True, compute_log10_p=False,
+                         variant_range=None,
                          reduction=None):
     from .linear import _dosage_statistics, _two_sided_t_pvalue
+    from .tails import upper_tail_log10_from_t_torch
 
     profiling = os.environ.get('TORCHGWAS_SCAN_PROFILE', '0') != '0'
     blocking_events = os.environ.get('TORCHGWAS_BLOCKING_EVENTS', '0') != '0'
@@ -164,7 +166,11 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                            torch.empty((chunk_size, traits), pin_memory=True),
                            torch.empty(chunk_size, dtype=torch.uint8, pin_memory=True),
                            # One residual df per variant, not per test.
-                           torch.empty(chunk_size, pin_memory=True))
+                           torch.empty(chunk_size, pin_memory=True),
+                           *(tuple([torch.empty((chunk_size, traits),
+                                                dtype=torch.float64,
+                                                pin_memory=True)])
+                             if compute_log10_p else tuple()))
                           for _ in range(depth)]
     else:
         result_buffers = [reduction.host_buffers(chunk_size, reduction_width)
@@ -187,7 +193,8 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         # Return owned arrays: callers may retain results beyond ring reuse.
         staged = [value[:count].numpy().copy() for value in result_buffers[slot]]
         if reduction is None:
-            beta, t, status, variant_df = staged
+            beta, t, status, variant_df = staged[:4]
+            logp = staged[4] if compute_log10_p else None
             trait_index = None
         else:
             beta, t, trait_index, status, variant_df = staged
@@ -197,14 +204,22 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         invalid = status != 0
         beta[invalid] = np.nan
         t[invalid] = np.nan
+        if logp is not None:
+            logp[invalid] = np.nan
         # df is per variant either way; a reduced chunk broadcasts it across the
         # k traits it kept, so the p-values match the unreduced scan exactly.
         df_for_p = variant_df[:, None] if reduction is not None else variant_df
-        p = (_two_sided_t_pvalue(t, df_for_p) if compute_p_values else None)
+        if logp is not None and compute_p_values:
+            with np.errstate(under="ignore"):
+                p = np.power(10.0, -logp)
+        else:
+            p = (_two_sided_t_pvalue(t, df_for_p) if compute_p_values else None)
         gpu_times = (compute_start[slot].elapsed_time(compute_done[slot]),
                      result_start[slot].elapsed_time(result_done[slot]),
                      0.0 if device_source else conversion_start[slot].elapsed_time(compute_start[slot])) if profiling else None
-        emitted = ((start, end, beta, t, p) if reduction is None
+        emitted = ((start, end, beta, t, p, logp)
+                   if reduction is None and compute_log10_p else
+                   (start, end, beta, t, p) if reduction is None
                    else (start, end, beta, t, p, trait_index))
         return emitted, int((status == 1).sum()), int((status == 2).sum()), gpu_times
 
@@ -313,7 +328,11 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                     beta, t, status, variant_df, reduction_width)
                 staged_values = (beta, t, index_t, status, variant_df)
             else:
+                logp = (upper_tail_log10_from_t_torch(
+                    t, variant_df[:, None]) if compute_log10_p else None)
                 staged_values = (beta, t, status, variant_df)
+                if logp is not None:
+                    staged_values += (logp,)
             compute_done[slot].record(compute_stream)
             with torch.cuda.stream(result_stream):
                 result_stream.wait_event(compute_done[slot])

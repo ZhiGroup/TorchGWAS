@@ -15,6 +15,7 @@ from scipy import special
 from .kernels import linear_chunk_kernel
 from .preprocess import residualize_and_standardize
 from .streaming import ChunkedGenotype
+from .tails import upper_tail_log10_from_t_torch
 from .utils import choose_device, chunk_bounds
 
 
@@ -260,6 +261,7 @@ def _packed_bed_cuda_iterator(
     torch_device: torch.device,
     reader_workers: int | None,
     compute_p_values: bool,
+    compute_log10_p: bool = False,
     variant_range: tuple[int, int] | None = None,
     reduction=None,
     borrow_results: bool = False,
@@ -392,7 +394,8 @@ def _packed_bed_cuda_iterator(
     # the cap it is measured against shrink with it.
     reduction_width = None if reduction is None else reduction.resolved_width(n_traits)
     staged_traits = n_traits if reduction is None else reduction_width
-    result_slot_bytes = chunk_size * (staged_traits * 2 * 4 + 1)
+    logp_bytes = staged_traits * 8 if compute_log10_p else 0
+    result_slot_bytes = chunk_size * (staged_traits * 2 * 4 + logp_bytes + 1)
     max_slots_by_memory = max(2, (1 << 30) // max(1, result_slot_bytes))
     result_depth = max(2, min(pvalue_workers, max_slots_by_memory))
     beta_host = [
@@ -403,6 +406,11 @@ def _packed_bed_cuda_iterator(
         torch.empty((chunk_size, staged_traits), dtype=torch.float32, pin_memory=True)
         for _ in range(result_depth)
     ]
+    logp_host = (
+        [torch.empty((chunk_size, staged_traits), dtype=torch.float64, pin_memory=True)
+         for _ in range(result_depth)]
+        if compute_log10_p else None
+    )
     index_host = (
         None if reduction is None else [
             torch.empty((chunk_size, staged_traits), dtype=torch.int32, pin_memory=True)
@@ -534,6 +542,15 @@ def _packed_bed_cuda_iterator(
             beta_chunk[invalid, :] = np.nan
             t_chunk[invalid, :] = np.nan
         if reduction is None:
+            if compute_log10_p:
+                logp_chunk = logp_host[result_slot][:count].numpy().copy()
+                if np.any(invalid):
+                    logp_chunk[invalid, :] = np.nan
+                p_chunk = None
+                if compute_p_values:
+                    with np.errstate(under="ignore"):
+                        p_chunk = np.power(10.0, -logp_chunk)
+                return start, end, beta_chunk, t_chunk, p_chunk, logp_chunk
             p_chunk = (_two_sided_t_pvalue(t_chunk, df=df_chunk)
                        if compute_p_values else None)
             return start, end, beta_chunk, t_chunk, p_chunk
@@ -595,6 +612,7 @@ def _packed_bed_cuda_iterator(
                 sample_bit_shifts_t,
             )
             index_t = None
+            logp_t = None
             if reduction is not None:
                 # On the compute stream and before compute_done, so the copy
                 # stream waits on the narrow result and the wide tensors are
@@ -602,6 +620,9 @@ def _packed_bed_cuda_iterator(
                 beta_t, t_t, index_t, status_t, df_t = reduction.reduce(
                     beta_t[:count], t_t[:count], status_t[:count], df_t[:count],
                     reduction_width)
+            elif compute_log10_p:
+                logp_t = upper_tail_log10_from_t_torch(
+                    t_t[:count], df_t[:count, None])
             if profiling:
                 compute_end[result_slot].record(compute_stream)
             compute_done[device_slot].record(compute_stream)
@@ -613,6 +634,8 @@ def _packed_bed_cuda_iterator(
                 if reduction is None:
                     staged = ((beta_host, beta_t), (t_host, t_t),
                               (status_host, status_t), (df_host, df_t))
+                    if compute_log10_p:
+                        staged += ((logp_host, logp_t),)
                 else:
                     # Already sliced to `count` by the reduction above.
                     staged = ((beta_host, beta_t), (t_host, t_t),
@@ -644,6 +667,7 @@ def linear_scan(
     chunk_size: int | None = None,
     device: str = "auto",
     compute_dtype: str = "float64",
+    return_log10_p: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     pheno_proc, q_matrix, phenotype_observed_counts = residualize_and_standardize(
         phenotype, covariates, return_observed_counts=True)
@@ -662,10 +686,20 @@ def linear_scan(
     if np.any(trait_df <= 0):
         raise ValueError("non-positive phenotype-specific residual degrees of freedom")
     trait_scale = np.sqrt(trait_df / float(df))
+    trait_scale_t = torch.as_tensor(
+        trait_scale, dtype=torch_dtype, device=torch_device
+    ) if return_log10_p else None
+    trait_df_factor_t = torch.as_tensor(
+        trait_df / float(df), dtype=torch.float64, device=torch_device
+    ) if return_log10_p else None
 
     beta = np.empty((n_markers, n_traits), dtype=np_dtype)
     t_stat = np.empty((n_markers, n_traits), dtype=np_dtype)
     p_value = np.empty((n_markers, n_traits), dtype=np.float64)
+    log10_p = (
+        np.empty((n_markers, n_traits), dtype=np.float64)
+        if return_log10_p else None
+    )
 
     for start, end in chunk_bounds(n_markers, chunk_size):
         geno_chunk = np.asarray(genotype[:, start:end], dtype=np_dtype)
@@ -673,14 +707,27 @@ def linear_scan(
         beta_t, t_chunk_t, df_chunk_t = linear_chunk_kernel(
             geno_t, pheno_t, q_t, df, covariate_rank=covariate_rank)
         beta_chunk = beta_t.cpu().numpy()
-        t_chunk = t_chunk_t.cpu().numpy()
-        variant_df = df_chunk_t.cpu().numpy()
-        t_chunk *= trait_scale[None, :]
-        pair_df = variant_df[:, None] * (trait_df[None, :] / float(df))
-        p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
+        if return_log10_p:
+            adjusted_t = t_chunk_t * trait_scale_t[None, :]
+            pair_df_t = df_chunk_t.double()[:, None] * trait_df_factor_t[None, :]
+            logp_chunk = upper_tail_log10_from_t_torch(adjusted_t, pair_df_t)
+            t_chunk = adjusted_t.cpu().numpy()
+            logp_chunk = logp_chunk.cpu().numpy()
+            with np.errstate(under="ignore"):
+                p_chunk = np.power(10.0, -logp_chunk)
+        else:
+            t_chunk = t_chunk_t.cpu().numpy()
+            variant_df = df_chunk_t.cpu().numpy()
+            t_chunk *= trait_scale[None, :]
+            pair_df = variant_df[:, None] * (trait_df[None, :] / float(df))
+            p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
         beta[start:end] = beta_chunk
         t_stat[start:end] = t_chunk
         p_value[start:end] = p_chunk
+        if return_log10_p:
+            log10_p[start:end] = logp_chunk
+    if return_log10_p:
+        return beta, t_stat, p_value, log10_p, q_matrix
     return beta, t_stat, p_value, q_matrix
 
 
@@ -693,6 +740,7 @@ def linear_scan_streaming(
     compute_dtype: str = "float32",
     reader_workers: int | None = None,
     prefetch_chunks: int | None = None,
+    return_log10_p: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     requested_device = choose_device(device)
     if (
@@ -709,16 +757,29 @@ def linear_scan_streaming(
             compute_dtype=compute_dtype,
             reader_workers=reader_workers,
             prefetch_chunks=prefetch_chunks,
+            compute_log10_p=return_log10_p,
         )
         n_markers = genotype.shape[1]
         n_traits = phenotype.shape[1]
         beta = np.empty((n_markers, n_traits), dtype=np.float32)
         t_stat = np.empty((n_markers, n_traits), dtype=np.float32)
         p_value = np.empty((n_markers, n_traits), dtype=np.float64)
-        for start, end, beta_chunk, t_chunk, p_chunk in chunk_iterator:
+        log10_p = (
+            np.empty((n_markers, n_traits), dtype=np.float64)
+            if return_log10_p else None
+        )
+        for chunk_result in chunk_iterator:
+            if return_log10_p:
+                start, end, beta_chunk, t_chunk, p_chunk, logp_chunk = chunk_result
+            else:
+                start, end, beta_chunk, t_chunk, p_chunk = chunk_result
             beta[start:end] = beta_chunk
             t_stat[start:end] = t_chunk
             p_value[start:end] = p_chunk
+            if return_log10_p:
+                log10_p[start:end] = logp_chunk
+        if return_log10_p:
+            return beta, t_stat, p_value, log10_p, q_matrix
         return beta, t_stat, p_value, q_matrix
 
     pheno_proc, q_matrix, phenotype_observed_counts = residualize_and_standardize(
@@ -747,6 +808,16 @@ def linear_scan_streaming(
     beta = np.empty((n_markers, n_traits), dtype=np_dtype)
     t_stat = np.empty((n_markers, n_traits), dtype=np_dtype)
     p_value = np.empty((n_markers, n_traits), dtype=np.float64)
+    log10_p = (
+        np.empty((n_markers, n_traits), dtype=np.float64)
+        if return_log10_p else None
+    )
+    trait_scale_t = torch.as_tensor(
+        trait_scale, dtype=torch_dtype, device=torch_device
+    ) if return_log10_p else None
+    trait_df_factor_t = torch.as_tensor(
+        trait_df / float(df), dtype=torch.float64, device=torch_device
+    ) if return_log10_p else None
 
     for start, end, geno_chunk in genotype.iter_chunks(
         chunk_size=chunk,
@@ -758,14 +829,27 @@ def linear_scan_streaming(
         beta_t, t_chunk_t, df_chunk_t = linear_chunk_kernel(
             geno_t, pheno_t, q_t, df, covariate_rank=covariate_rank)
         beta_chunk = beta_t.cpu().numpy()
-        t_chunk = t_chunk_t.cpu().numpy()
-        variant_df = df_chunk_t.cpu().numpy()
-        t_chunk *= trait_scale[None, :]
-        pair_df = variant_df[:, None] * (trait_df[None, :] / float(df))
-        p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
+        if return_log10_p:
+            adjusted_t = t_chunk_t * trait_scale_t[None, :]
+            pair_df_t = df_chunk_t.double()[:, None] * trait_df_factor_t[None, :]
+            logp_chunk = upper_tail_log10_from_t_torch(adjusted_t, pair_df_t)
+            t_chunk = adjusted_t.cpu().numpy()
+            logp_chunk = logp_chunk.cpu().numpy()
+            with np.errstate(under="ignore"):
+                p_chunk = np.power(10.0, -logp_chunk)
+        else:
+            t_chunk = t_chunk_t.cpu().numpy()
+            variant_df = df_chunk_t.cpu().numpy()
+            t_chunk *= trait_scale[None, :]
+            pair_df = variant_df[:, None] * (trait_df[None, :] / float(df))
+            p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
         beta[start:end] = beta_chunk
         t_stat[start:end] = t_chunk
         p_value[start:end] = p_chunk
+        if return_log10_p:
+            log10_p[start:end] = logp_chunk
+    if return_log10_p:
+        return beta, t_stat, p_value, log10_p, q_matrix
     return beta, t_stat, p_value, q_matrix
 
 
@@ -975,6 +1059,7 @@ def linear_scan_streaming_chunks(
     reader_workers: int | None = None,
     prefetch_chunks: int | None = None,
     compute_p_values: bool = True,
+    compute_log10_p: bool = False,
     variant_range: tuple[int, int] | None = None,
     already_processed: bool = False,
     reduction=None,
@@ -983,6 +1068,9 @@ def linear_scan_streaming_chunks(
     Iterator[tuple[int, int, np.ndarray, np.ndarray, np.ndarray | None]],
     np.ndarray | None,
 ]:
+    if compute_log10_p and reduction is not None:
+        raise ValueError("compute_log10_p is supported only for full result matrices")
+
     # With `reduction` set, every backend yields a six-tuple
     # `(start, end, beta, t, p, trait_index)` whose trait axis is k wide instead
     # of K, and the wide matrix is never copied off the device. The five-tuple
@@ -1036,13 +1124,29 @@ def linear_scan_streaming_chunks(
             yield from iterator
             return
         for chunk_result in iterator:
-            start, end, beta, t_stat, _p = chunk_result
+            if compute_log10_p:
+                start, end, beta, t_stat, _p, _logp = chunk_result
+            else:
+                start, end, beta, t_stat, _p = chunk_result
             t_stat *= trait_scale[None, :]
-            p_value = (
-                _two_sided_t_pvalue(t_stat, df=trait_df[None, :])
-                if compute_p_values else None
-            )
-            yield start, end, beta, t_stat, p_value
+            if compute_log10_p:
+                t_tail = torch.as_tensor(
+                    t_stat, dtype=torch.float64, device=torch_device)
+                df_tail = torch.as_tensor(
+                    trait_df[None, :], dtype=torch.float64,
+                    device=torch_device)
+                logp = upper_tail_log10_from_t_torch(t_tail, df_tail).cpu().numpy()
+                p_value = None
+                if compute_p_values:
+                    with np.errstate(under="ignore"):
+                        p_value = np.power(10.0, -logp)
+                yield start, end, beta, t_stat, p_value, logp
+            else:
+                p_value = (
+                    _two_sided_t_pvalue(t_stat, df=trait_df[None, :])
+                    if compute_p_values else None
+                )
+                yield start, end, beta, t_stat, p_value
     np_dtype, torch_dtype = _resolve_compute_dtypes(compute_dtype)
 
     # Both CUDA fast paths stage results through a preallocated `chunk x k`
@@ -1069,6 +1173,7 @@ def linear_scan_streaming_chunks(
                 torch_device,
                 reader_workers,
                 compute_p_values,
+                compute_log10_p,
                 variant_range,
                 reduction=reduction,
                 borrow_results=borrow_results,
@@ -1082,6 +1187,7 @@ def linear_scan_streaming_chunks(
         return apply_phenotype_missingness(dosage_cuda_iterator(genotype, pheno_proc, q_matrix, chunk,
                                     torch_device, reader_workers, prefetch_chunks,
                                     compute_p_values,
+                                    compute_log10_p,
                                     variant_range=variant_range,
                                     reduction=reduction)), q_matrix
 
@@ -1120,6 +1226,15 @@ def linear_scan_streaming_chunks(
                 p_chunk = (_two_sided_t_pvalue(t_chunk, df=df_chunk[:, None])
                            if compute_p_values else None)
                 yield start, end, beta_chunk, t_chunk, p_chunk, index_chunk
+                continue
+            if compute_log10_p:
+                logp_chunk = upper_tail_log10_from_t_torch(
+                    t_chunk_t, df_chunk_t[:, None]).cpu().numpy()
+                p_chunk = None
+                if compute_p_values:
+                    with np.errstate(under="ignore"):
+                        p_chunk = np.power(10.0, -logp_chunk)
+                yield start, end, beta_chunk, t_chunk, p_chunk, logp_chunk
                 continue
             p_chunk = (_two_sided_t_pvalue(t_chunk, df=df_chunk)
                        if compute_p_values else None)

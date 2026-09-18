@@ -19,8 +19,7 @@ from .pgen import (
 from .preprocess import prepare_inputs, prepare_inputs_for_prep
 from .streaming import ChunkedGenotype, _resolve_variant_range
 from .types import GWASResult
-from .utils import (choose_device, elapsed, mkdir,
-                    timestamp, upper_tail_log10, write_json)
+from .utils import choose_device, elapsed, mkdir, timestamp, write_json
 
 
 DEFAULT_SUMSTATS_BLOCK_BYTES = 16 << 20
@@ -1146,7 +1145,7 @@ def run_linear_gwas(
                 raise ValueError(
                     "variant_range requires output_dir: the in-memory result "
                     "path scans the whole file and would silently ignore it")
-            beta, t_stat, p_value, q_matrix = linear_scan_streaming(
+            beta, t_stat, p_value, logp, q_matrix = linear_scan_streaming(
                 genotype,
                 phenotype,
                 covariates,
@@ -1155,8 +1154,8 @@ def run_linear_gwas(
                 compute_dtype=resolved_compute_dtype,
                 reader_workers=reader_workers,
                 prefetch_chunks=prefetch_chunks,
+                return_log10_p=True,
             )
-            logp = upper_tail_log10(p_value)
             table = []
             for marker_index, marker_name in enumerate(marker_names):
                 for trait_index, trait_name in enumerate(trait_names):
@@ -1188,16 +1187,16 @@ def run_linear_gwas(
             qc["n_variants_excluded"] = int(sum(scan_exclusions.values()))
     else:
         genotype, phenotype, covariates, qc = prepare_inputs(genotype, phenotype, covariates)
-        beta, t_stat, p_value, q_matrix = linear_scan(
+        beta, t_stat, p_value, logp, q_matrix = linear_scan(
             genotype,
             phenotype,
             covariates,
             chunk_size=chunk_size,
             device=str(resolved_device),
             compute_dtype=resolved_compute_dtype,
+            return_log10_p=True,
         )
         genotype_shape = list(genotype.shape)
-        logp = upper_tail_log10(p_value)
         # Zero-variance columns are dropped by prepare_inputs, so labels follow
         # the retained indices rather than a prefix of the original order.
         kept_markers = qc.get("genotype_kept_column_indices")

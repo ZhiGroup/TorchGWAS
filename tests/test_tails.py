@@ -124,6 +124,8 @@ class DeviceStudentTailTestCase(unittest.TestCase):
         np.testing.assert_allclose(device, host, rtol=1e-12)
         self.assertTrue(np.all(np.isfinite(device)))
         self.assertTrue(np.all(np.diff(device) > 0))
+        self.assertGreater(device[2], 1000.0,
+                           "the device tail must remain finite above -log10(P)=1000")
 
     def test_device_broadcasts_degrees_of_freedom_per_variant(self):
         t = np.array([[10.0, 40.0], [80.0, 5.0]])
