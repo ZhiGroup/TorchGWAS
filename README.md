@@ -73,6 +73,10 @@ autotuner for association chunk size, read/decode tile size, queue depth, and
 related execution parameters. It should not yet be treated as a supported
 wall-clock predictor.
 
+The source/resource equations, byte accounting, overlap schedule, and current
+limitations of the research predictor are documented in
+[`docs/runtime-predictor.md`](docs/runtime-predictor.md).
+
 ## Quick start
 
 Run the bundled toy workflow:

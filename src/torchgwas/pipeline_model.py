@@ -267,7 +267,8 @@ def device_ring_bytes(*, chunk_variants: int, depth: int, n_samples: int,
 def host_pinned_bytes(*, chunk_variants: int, depth: int, n_traits: int,
                       transfer_bytes_per_variant: float,
                       reduction_width: int | None = None,
-                      stage_on_host: bool = True) -> float:
+                      stage_on_host: bool = True,
+                      compute_log10_p: bool = False) -> float:
     """Pinned host memory the scan holds, term by term.
 
     The device ring is not the only ring. Every slot is pinned on BOTH sides:
@@ -290,11 +291,13 @@ def host_pinned_bytes(*, chunk_variants: int, depth: int, n_traits: int,
         total += depth * chunk * transfer_bytes_per_variant
 
     # The result ring. Unreduced: float32 beta and t per marker-trait cell,
-    # plus a uint8 status and a float32 residual df per VARIANT. Reduced: the
-    # narrow width carries an extra int32 trait-index column, and the whole
-    # point of the mode is that `width` replaces `K` here.
+    # optional float64 -log10(P), plus a uint8 status and a float32 residual
+    # df per VARIANT. Reduced: the narrow width carries an extra int32
+    # trait-index column, and the whole point of the mode is that `width`
+    # replaces `K` here.
     if reduction_width is None:
-        total += depth * chunk * (8.0 * n_traits + 5.0)
+        result_bytes_per_test = 16.0 if compute_log10_p else 8.0
+        total += depth * chunk * (result_bytes_per_test * n_traits + 5.0)
     else:
         total += depth * chunk * (12.0 * max(int(reduction_width), 1) + 5.0)
     return total
@@ -307,7 +310,8 @@ def predicted_peak_bytes(*, chunk_variants: int, depth: int, n_samples: int,
                          decode_on_gpu: bool = False,
                          reduction_width: int | None = None,
                          trait_block: int | None = None,
-                         trait_devices: int = 1) -> dict:
+                         trait_devices: int = 1,
+                         compute_log10_p: bool = False) -> dict:
     """Both peaks for one resolved plan, as the benchmark tables report them.
 
     `trait_block` is what actually sits on a device at once; `n_traits` is the
@@ -328,7 +332,8 @@ def predicted_peak_bytes(*, chunk_variants: int, depth: int, n_samples: int,
         chunk_variants=chunk_variants, depth=depth, n_traits=block,
         transfer_bytes_per_variant=transfer_bytes_per_variant,
         reduction_width=reduction_width,
-        stage_on_host=not decode_on_gpu) * devices
+        stage_on_host=not decode_on_gpu,
+        compute_log10_p=compute_log10_p) * devices
     return {
         "gpu_bytes_per_device": gpu,
         "host_pinned_bytes": host,
@@ -719,7 +724,7 @@ def explain_time(*, variants: int, samples: int, traits: int,
         # Dense output also returns float64 -log10(P) from the GPU. It is
         # stored as float32, but the device-to-host transfer preserves the
         # calculation before the writer performs that final cast.
-        'd2h': m * (result_bytes_per_test * k + 1.0) / d2h_bytes_per_second,
+        'd2h': m * (result_bytes_per_test * k + 5.0) / d2h_bytes_per_second,
     }
     # Host-side decompression, for a compressed store. Priced on the bytes it
     # PRODUCES, because that is what the codec's rate is quoted against and
@@ -1374,7 +1379,10 @@ def estimate(w: Workload, p: InputProfile, h: Hardware, plan: PipelinePlan,
                          else n * p.decoded_bytes_per_value)
     decoded = m * decoded_row_bytes
     output = m * k * w.output_bytes_per_test
-    result_bytes = m * (8 * k + 5)  # beta, t, residual df (float32), status (uint8)
+    # Dense output also returns float64 -log10(P) before the writer casts it
+    # to float32. Scan-only paths retain the older beta+t result contract.
+    result_bytes_per_test = 16 if w.output_bytes_per_test else 8
+    result_bytes = m * (result_bytes_per_test * k + 5)
     record_read_bytes = p.stored_bytes if p.genotype_record_read_bytes_total is None else p.genotype_record_read_bytes_total
     storage = record_read_bytes / h.disk_bytes_per_second
     output_time = output / h.output_bytes_per_second if output else 0.0
@@ -1438,7 +1446,8 @@ def estimate(w: Workload, p: InputProfile, h: Hardware, plan: PipelinePlan,
             host_ring += plan.depth * plan.chunk_variants * n * 4
         if not p.direct_native_fill or p.host_staging_copies:
             host_ring += min(plan.workers, plan.depth) * decode_tile * decoded_row_bytes
-    host_ring += plan.depth * plan.chunk_variants * (8 * k + 5)
+    host_ring += plan.depth * plan.chunk_variants * (
+        result_bytes_per_test * k + 5)
     # The same accounting the scan uses to choose its chunk, so a predicted
     # plan and a live scan cannot disagree about what fits.
     device_ring = device_ring_bytes(

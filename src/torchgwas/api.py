@@ -846,6 +846,18 @@ def run_linear_gwas(
             "trait_devices requires trait_block: the devices are given trait "
             "blocks to work on, so there must be blocks to give")
 
+    # Dense binary output asks the GPU for an additional float64 -log10(P)
+    # matrix before the writer casts it to float32. Resolve that contract
+    # before preflight so its pinned-result estimate includes the extra ring.
+    dense_binary = (
+        output_dir is not None
+        and sumstats_format == "binary"
+        and significance is None
+        and jagwas is None
+        and reduction is None
+        and p_value_threshold is None
+    )
+
     # PREFLIGHT. Refuse an impossible plan here, before a byte is read.
     #
     # Supplementary Methods S3.1 lists as a limitation that "users must
@@ -885,7 +897,8 @@ def run_linear_gwas(
                                        else np.asarray(covariates).shape[1]),
                     transfer_bytes_per_variant=per_variant,
                     device_memory_bytes=float(free_bytes),
-                    reduced=(reduction is not None or significance is not None))
+                    reduced=(reduction is not None or significance is not None),
+                    compute_log10_p=dense_binary)
         except ImportError:
             pass
         # PlanTooLarge is NOT caught: refusing early with a workable setting is
@@ -984,14 +997,6 @@ def run_linear_gwas(
             # retain owned arrays until their background writes complete.
             borrow_results = (sumstats_format == "none"
                               and trait_block is None)
-
-            dense_binary = (
-                sumstats_format == "binary"
-                and significance is None
-                and jagwas is None
-                and reduction is None
-                and p_value_threshold is None
-            )
 
             def _scan(trait_slice=None, device=None):
                 return linear_scan_streaming_chunks(

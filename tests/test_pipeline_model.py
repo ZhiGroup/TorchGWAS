@@ -306,6 +306,7 @@ class PipelineModelTests(unittest.TestCase):
         r = estimate(replace(self.w, output_bytes_per_test=4), self.p,
                      replace(self.h, output_bytes_per_second=1e6), self.plan)
         self.assertAlmostEqual(r['resource_seconds']['storage'], .0025 + .32)
+        self.assertEqual(r['result_d2h_bytes'], 10000 * (16 * 8 + 5))
 
     def test_memory_constraint_and_shallow_depth(self):
         result = choose_plan(self.w, self.p, self.h, read_variants=(1000,),
@@ -347,6 +348,17 @@ class PeakMemoryTests(unittest.TestCase):
         # the device alone underestimates the host by an order of magnitude.
         staging_ring = 32 * 4096 * 8355.0
         self.assertGreater((wide - staging_ring) / staging_ring, 90.0)
+
+    def test_logp_adds_float64_result_ring(self):
+        without = host_pinned_bytes(
+            n_traits=100, reduction_width=None, compute_log10_p=False,
+            **self.GEOMETRY)
+        with_logp = host_pinned_bytes(
+            n_traits=100, reduction_width=None, compute_log10_p=True,
+            **self.GEOMETRY)
+        self.assertEqual(
+            with_logp - without,
+            32 * 4096 * 8 * 100)
 
     def test_reduction_replaces_the_trait_axis_in_the_result_ring(self):
         wide = host_pinned_bytes(n_traits=2085000, reduction_width=None, **self.GEOMETRY)
