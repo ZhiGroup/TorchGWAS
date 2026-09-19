@@ -414,7 +414,9 @@ def infer_genotype_format(genotype_path: str | Path, genotype_format: str = "aut
     path = Path(genotype_path)
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        return "npy"
+        raise ValueError(
+            "NumPy genotype files are not supported; use BED, PGEN, or BGEN input"
+        )
     if suffix == ".bed":
         return "plink"
     if suffix == ".bgen":
@@ -465,9 +467,6 @@ def load_genotype(
             f"hardcall_store is only supported for the PLINK format, not "
             f"{resolved_format!r}; the store holds bed-convention two-bit "
             f"rows and stands in for a .bed")
-    if resolved_format == "npy":
-        genotype = load_array(genotype_path)
-        return genotype, None, None, {"genotype_format": "npy"}
     if resolved_format == "zstd":
         prefix = str(genotype_path)
         if prefix.endswith(".zst"):
