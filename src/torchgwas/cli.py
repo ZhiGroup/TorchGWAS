@@ -32,7 +32,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     prep = subparsers.add_parser("prep", help="Validate and preprocess phenotype/covariates")
     prep.add_argument("--genotype", required=True)
-    prep.add_argument("--genotype-format", default="auto", choices=["auto", "npy", "plink", "bgen", "pgen", "zstd"])
+    prep.add_argument("--genotype-format", default="auto", choices=["auto", "plink", "bgen", "pgen", "zstd"])
     prep.add_argument("--phenotype", default=None)
     prep.add_argument("--phenotype-table", default=None)
     prep.add_argument("--covariates", default=None)
@@ -65,7 +65,7 @@ def _build_parser() -> argparse.ArgumentParser:
              ".bed. The .bim/.fam are still used, so this is a transport swap "
              "only. Measured 2.15x faster at K=1 and no faster at K=512, "
              "where the write and the GEMM set the floor.")
-    linear.add_argument("--genotype-format", default="auto", choices=["auto", "npy", "plink", "bgen", "pgen", "zstd"])
+    linear.add_argument("--genotype-format", default="auto", choices=["auto", "plink", "bgen", "pgen", "zstd"])
     linear.add_argument("--phenotype", default=None)
     linear.add_argument("--phenotype-table", default=None)
     linear.add_argument("--covariates", default=None)
@@ -464,9 +464,9 @@ def _run_demo(args) -> int:
     out = mkdir(args.output_dir)
     linear_out = out / "linear"
     linear_result = run_linear_gwas(
-        genotype=toy["genotype"],
-        phenotype=toy["phenotype"],
-        covariates=toy["covariates"],
+        genotype=np.load(toy["genotype"], allow_pickle=False),
+        phenotype=np.load(toy["phenotype"], allow_pickle=False),
+        covariates=np.load(toy["covariates"], allow_pickle=False),
         marker_ids=toy["marker_ids"],
         sample_ids=toy["sample_ids"],
         chunk_size=4,

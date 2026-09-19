@@ -15,7 +15,7 @@ instead.
 
 - Linear association testing for one or more quantitative phenotypes.
 - Internal sample alignment, covariate projection, and phenotype preprocessing.
-- Direct support for NumPy arrays, PLINK 1 BED, PLINK 2 PGEN, and BGEN.
+- Direct support for PLINK 1 BED, PLINK 2 PGEN, and BGEN.
 - Direct hard-call PGEN decoding, with `pgenlib` used for dosage records.
 - Optional reusable zstd stores for BGEN, PGEN, and lossless packed BED input.
 - Binary, tiled summary-statistic output for large scans.
@@ -81,20 +81,7 @@ Run the bundled toy workflow:
 torchgwas demo --output-dir demo_run
 ```
 
-Run a linear scan from aligned NumPy arrays:
-
-```bash
-torchgwas linear \
-  --genotype examples/toy/genotype.npy \
-  --phenotype examples/toy/pheno.npy \
-  --covariates examples/toy/covar.npy \
-  --marker-ids examples/toy/markers.tsv \
-  --sample-ids examples/toy/samples.tsv \
-  --output-dir linear_out
-```
-
-For cohort data, phenotype and covariate tables can be aligned to genotype
-sample order by `IID`:
+Phenotype and covariate tables are aligned to genotype sample order by `IID`:
 
 ```bash
 torchgwas linear \
