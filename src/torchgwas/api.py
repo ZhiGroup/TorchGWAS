@@ -117,21 +117,6 @@ def _resolve_linear_compute_dtype(genotype, compute_dtype: str) -> str:
     return "float32" if isinstance(genotype, ChunkedGenotype) else "float64"
 
 
-
-
-
-
-_QUOTE_TRIGGERS = ("\t", "\n", "\r", '"')
-
-
-
-
-
-
-
-
-
-
 def _accumulate(accumulated, order, reduction, chunk, offset, guard=None):
     """Merge one reduced chunk into the running per-variant accumulator."""
     start, end, beta, t, p, index = chunk
@@ -344,17 +329,6 @@ def _trait_blocked_reduced_chunks(scan_once, reduction, n_traits, trait_block,
         beta, t, p, index, _status, _df = accumulated[key]
         yield (start, end, beta.numpy(), t.numpy(),
                None if p is None else p.numpy(), index.numpy())
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _write_linear_binary_streaming(
