@@ -21,6 +21,27 @@ instead.
 - Binary, tiled summary-statistic output for large scans.
 - Optional device-side significance and joint-trait reductions.
 
+## Benchmark
+
+The benchmark scanned 35,365 subjects, 8,931,083 variants, and 512
+phenotypes, producing 36.68 GB of binary beta and t-statistic results.
+
+Hardware: NVIDIA H100 80GB HBM3 GPU (driver 560.35.05), two Intel Xeon
+Gold 6442Y CPUs (48 physical cores total), and 1 TiB DDR5 system memory.
+Measured cold-read throughput was 5.71-5.94 GB/s, and application-level
+binary-output throughput was 1.41-1.63 GB/s.
+
+| Input format | Genotype representation | Wall time | Scan time | Peak RSS | Peak VRAM allocated / reserved | Input size |
+|---|---|---:|---:|---:|---:|---:|
+| BED | Hard calls | 28.46 s | 19.90 s | 4.94 GB | 0.90 / 1.37 GB | 78.97 GB |
+| PGEN | Hard calls | 29.13 s | 20.35 s | 9.67 GB | 2.47 / 3.16 GB | 35.93 GB |
+| Zstd hard-call store | Hard calls | 44.01 s | 35.90 s | 5.20 GB | 0.90 / 1.37 GB | 10.37 GB |
+| BGEN | Dosages | 51.48 s | 28.63 s | 6.49 GB | 5.07 / 8.05 GB | 86.41 GB |
+| PGEN | Dosages | 58.95 s | 50.12 s | 38.66 GB | 19.84 / 20.54 GB | 73.16 GB |
+
+BED, PGEN, and BGEN values are medians of two full-scale runs. The zstd
+hard-call result is the median of three full-scale runs.
+
 ## Installation
 
 TorchGWAS requires Python 3.10 or newer.
