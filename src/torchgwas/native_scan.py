@@ -192,6 +192,7 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         count = end - start
         # Return owned arrays: callers may retain results beyond ring reuse.
         staged = [value[:count].numpy().copy() for value in result_buffers[slot]]
+        logp = None
         if reduction is None:
             beta, t, status, variant_df = staged[:4]
             logp = staged[4] if compute_log10_p else None
