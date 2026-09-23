@@ -516,9 +516,16 @@ def run_linear_gwas(
     sumstats_fsync: bool = True,
     sumstats_variant_ids: bool = True,
     sumstats_fields: str = "beta+t",
+    # Optional streaming consumer for advanced workflows such as overlapping
+    # a reduced scan with locus clumping. The callback runs synchronously once
+    # per result chunk, before that chunk is drained or written. Consumers that
+    # retain arrays must copy them because native scans reuse their host ring.
+    result_chunk_callback=None,
 ) -> GWASResult:
     if sumstats_format not in {"binary", "none"}:
         raise ValueError("sumstats_format must be 'binary' or 'none'; TSV output has been removed")
+    if result_chunk_callback is not None and not callable(result_chunk_callback):
+        raise TypeError("result_chunk_callback must be callable")
     sumstats_summary: dict = {}
     requested_reader_workers = reader_workers
     requested_prefetch_chunks = prefetch_chunks
@@ -1083,6 +1090,13 @@ def run_linear_gwas(
                 chunk_iterator = _significant_pairs_iterator(
                     chunk_iterator, significance, len(trait_names),
                     residual_df)
+            if result_chunk_callback is not None:
+                def _with_result_callback(source):
+                    for chunk in source:
+                        result_chunk_callback(chunk)
+                        yield chunk
+
+                chunk_iterator = _with_result_callback(chunk_iterator)
             write_started = time.perf_counter()
             if sumstats_format == "none":
                 n_rows, sumstats_summary = _drain_linear_chunks(chunk_iterator)

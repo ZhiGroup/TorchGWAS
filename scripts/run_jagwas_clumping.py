@@ -19,7 +19,14 @@ import pandas as pd
 from scipy import special
 
 from torchgwas.api import run_linear_gwas
+from torchgwas.io import load_genotype
 from torchgwas.sumstats_indexed import open_indexed_sumstats
+
+from jagwas_streaming import (
+    PipelinedClumper,
+    build_clumping_cache,
+    validate_clumping_cache,
+)
 
 
 MHC_START = 29_614_758
@@ -226,6 +233,79 @@ def run_clumping(
     )
 
 
+def ensure_clumping_cache(args, maf_path: Path, cache_dir: Path) -> tuple[dict, float]:
+    """Validate an existing cache or build it once from the genotype metadata."""
+    started = time.perf_counter()
+    phenotype = np.load(args.phenotype, mmap_mode="r", allow_pickle=False)
+    n_samples = int(phenotype.shape[0])
+    if (cache_dir / "manifest.json").is_file():
+        # Opening the genotype merely to learn M would defeat the point of a
+        # reusable cache. Its manifest records the aligned full variant count;
+        # run_linear_gwas will independently reject an incompatible input.
+        manifest = json.loads((cache_dir / "manifest.json").read_text())
+        manifest = validate_clumping_cache(
+            cache_dir,
+            n_variants=int(manifest["n_variants"]),
+            maf_min=args.maf_min,
+            exclude_mhc=not args.include_mhc,
+        )
+        return manifest, time.perf_counter() - started
+
+    requested_sample_ids = (
+        None
+        if args.sample_ids is None
+        else np.load(args.sample_ids, allow_pickle=False)
+    )
+    genotype, _sample_ids, marker_ids, _metadata = load_genotype(
+        args.genotype,
+        genotype_format=args.genotype_format,
+        sample_file=args.sample_file,
+        selected_sample_ids=requested_sample_ids,
+        genotype_cache_dir=args.genotype_cache_dir,
+        reader_workers=args.reader_workers,
+        zstd_read_workers=args.zstd_read_workers,
+        prefetch_chunks=args.prefetch_chunks,
+        bgen_decode_backend=args.bgen_decode_backend,
+    )
+    try:
+        if int(genotype.shape[0]) != n_samples:
+            raise ValueError(
+                f"genotype has {genotype.shape[0]} selected samples but phenotype "
+                f"has {n_samples} rows"
+            )
+        variant_metadata = getattr(genotype, "variant_metadata", None)
+        if variant_metadata is None or marker_ids is None:
+            raise ValueError("genotype input does not expose variant metadata")
+        manifest = build_clumping_cache(
+            cache_dir,
+            marker_ids=marker_ids,
+            variant_metadata=variant_metadata,
+            maf=load_maf(maf_path, None),
+            maf_min=args.maf_min,
+            exclude_mhc=not args.include_mhc,
+            mhc_start=MHC_START,
+            mhc_end=MHC_END,
+        )
+    finally:
+        close = getattr(genotype, "close", None)
+        if close is not None:
+            close()
+    return manifest, time.perf_counter() - started
+
+
+def common_report(args, maf_path: Path) -> dict:
+    return {
+        "genotype": str(args.genotype),
+        "genotype_format": args.genotype_format,
+        "phenotype": str(args.phenotype),
+        "covariates": None if args.covariates is None else str(args.covariates),
+        "sample_file": None if args.sample_file is None else str(args.sample_file),
+        "sample_ids": None if args.sample_ids is None else str(args.sample_ids),
+        "maf": str(maf_path),
+        "variant_range": args.variant_range,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--genotype", type=Path, required=True)
@@ -250,13 +330,25 @@ def main() -> int:
     parser.add_argument("--compute-dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--chunk-size", type=int)
     parser.add_argument("--reader-workers", type=int, default=24)
+    parser.add_argument("--zstd-read-workers", type=int)
     parser.add_argument("--prefetch-chunks", type=int, default=4)
+    parser.add_argument("--genotype-cache-dir", type=Path)
     parser.add_argument("--variant-range", type=parse_variant_range)
     parser.add_argument("--gwas-p", type=float, default=0.05)
     parser.add_argument("--lead-p", type=float, default=5e-8)
     parser.add_argument("--maf-min", type=float, default=0.01)
     parser.add_argument("--include-mhc", action="store_true")
     parser.add_argument("--reuse-scan", action="store_true")
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="write indexed JAGWAS output, then harmonize and clump sequentially",
+    )
+    parser.add_argument(
+        "--clump-cache",
+        type=Path,
+        help="reusable compact variant cache; defaults inside output-dir",
+    )
     parser.add_argument(
         "--clumping-dir", type=Path,
         default=Path("/data484_4/zxie3/local_clumping"),
@@ -299,66 +391,148 @@ def main() -> int:
     started = time.perf_counter()
     scan_dir = args.output_dir / "torchgwas"
     sumstats_dir = scan_dir / "sumstats"
-    if args.reuse_scan:
-        if not (sumstats_dir / "manifest.json").is_file():
-            raise FileNotFoundError(sumstats_dir / "manifest.json")
-    else:
-        run_linear_gwas(
-            genotype=args.genotype,
-            genotype_format=args.genotype_format,
-            phenotype=args.phenotype,
-            covariates=args.covariates,
-            sample_file=args.sample_file,
-            sample_ids=args.sample_ids,
-            bgen_decode_backend=args.bgen_decode_backend,
-            device=args.device,
-            compute_dtype=args.compute_dtype,
-            chunk_size=args.chunk_size,
-            reader_workers=args.reader_workers,
-            prefetch_chunks=args.prefetch_chunks,
+    if args.reuse_scan or args.sequential:
+        if args.reuse_scan:
+            if not (sumstats_dir / "manifest.json").is_file():
+                raise FileNotFoundError(sumstats_dir / "manifest.json")
+        else:
+            run_linear_gwas(
+                genotype=args.genotype,
+                genotype_format=args.genotype_format,
+                phenotype=args.phenotype,
+                covariates=args.covariates,
+                sample_file=args.sample_file,
+                sample_ids=args.sample_ids,
+                bgen_decode_backend=args.bgen_decode_backend,
+                genotype_cache_dir=args.genotype_cache_dir,
+                device=args.device,
+                compute_dtype=args.compute_dtype,
+                chunk_size=args.chunk_size,
+                reader_workers=args.reader_workers,
+                zstd_read_workers=args.zstd_read_workers,
+                prefetch_chunks=args.prefetch_chunks,
+                variant_range=args.variant_range,
+                reduce="jagwas",
+                sumstats_fields="t",
+                output_dir=scan_dir,
+            )
+        scan_done = time.perf_counter()
+        table, report = harmonized_table(
+            sumstats_dir,
+            maf_path,
+            gwas_p=args.gwas_p,
+            maf_min=args.maf_min,
+            exclude_mhc=not args.include_mhc,
             variant_range=args.variant_range,
-            reduce="jagwas",
-            sumstats_fields="t",
-            output_dir=scan_dir,
         )
-    scan_done = time.perf_counter()
-
-    table, report = harmonized_table(
-        sumstats_dir,
-        maf_path,
-        gwas_p=args.gwas_p,
-        maf_min=args.maf_min,
-        exclude_mhc=not args.include_mhc,
-        variant_range=args.variant_range,
-    )
-    harmonized_path = args.output_dir / "jagwas_clump_input.npz"
-    write_harmonized_npz(table, harmonized_path, report)
-    harmonized_done = time.perf_counter()
-    run_clumping(
-        harmonized_path,
-        args.output_dir / "loci",
-        clumping_dir=args.clumping_dir,
-        ld_dir=args.ld_dir,
-        lead_p=args.lead_p,
-        gwas_p=args.gwas_p,
-    )
-    clumping_done = time.perf_counter()
-    report.update(
-        {
-            "genotype": str(args.genotype),
-            "genotype_format": args.genotype_format,
-            "phenotype": str(args.phenotype),
-            "covariates": None if args.covariates is None else str(args.covariates),
-            "sample_file": None if args.sample_file is None else str(args.sample_file),
-            "sample_ids": None if args.sample_ids is None else str(args.sample_ids),
-            "maf": str(maf_path),
-            "variant_range": args.variant_range,
-            "torchgwas_seconds": scan_done - started,
-            "harmonization_seconds": harmonized_done - scan_done,
-            "clumping_seconds": clumping_done - harmonized_done,
-            "total_seconds": clumping_done - started,
+        harmonized_path = args.output_dir / "jagwas_clump_input.npz"
+        write_harmonized_npz(table, harmonized_path, report)
+        harmonized_done = time.perf_counter()
+        run_clumping(
+            harmonized_path,
+            args.output_dir / "loci",
+            clumping_dir=args.clumping_dir,
+            ld_dir=args.ld_dir,
+            lead_p=args.lead_p,
+            gwas_p=args.gwas_p,
+        )
+        clumping_done = time.perf_counter()
+        report.update(
+            {
+                **common_report(args, maf_path),
+                "pipeline_mode": "sequential",
+                "torchgwas_seconds": scan_done - started,
+                "harmonization_seconds": harmonized_done - scan_done,
+                "clumping_seconds": clumping_done - harmonized_done,
+                "total_seconds": clumping_done - started,
+            }
+        )
+    else:
+        phenotype_shape = np.load(
+            args.phenotype, mmap_mode="r", allow_pickle=False
+        ).shape
+        if len(phenotype_shape) != 2:
+            raise ValueError("phenotype must be a two-dimensional NumPy array")
+        n_samples, degrees_of_freedom = map(int, phenotype_shape)
+        cache_dir = args.clump_cache or (args.output_dir / "clump-cache")
+        cache_manifest, cache_seconds = ensure_clumping_cache(
+            args, maf_path, cache_dir
+        )
+        full_variant_count = int(cache_manifest["n_variants"])
+        if args.variant_range is None:
+            variant_offset = 0
+            scan_variant_count = full_variant_count
+        else:
+            variant_offset, variant_end = args.variant_range
+            if variant_end > full_variant_count:
+                raise ValueError("variant range exceeds the clumping cache")
+            scan_variant_count = variant_end - variant_offset
+        clumper = PipelinedClumper(
+            cache_dir=cache_dir,
+            output_dir=args.output_dir / "loci",
+            clumping_dir=args.clumping_dir,
+            ld_dir=args.ld_dir,
+            degrees_of_freedom=degrees_of_freedom,
+            n_samples=n_samples,
+            n_variants=scan_variant_count,
+            gwas_p=args.gwas_p,
+            lead_p=args.lead_p,
+            variant_offset=variant_offset,
+        )
+        scan_started = time.perf_counter()
+        try:
+            gwas_result = run_linear_gwas(
+                genotype=args.genotype,
+                genotype_format=args.genotype_format,
+                phenotype=args.phenotype,
+                covariates=args.covariates,
+                sample_file=args.sample_file,
+                sample_ids=args.sample_ids,
+                bgen_decode_backend=args.bgen_decode_backend,
+                genotype_cache_dir=args.genotype_cache_dir,
+                device=args.device,
+                compute_dtype=args.compute_dtype,
+                chunk_size=args.chunk_size,
+                reader_workers=args.reader_workers,
+                zstd_read_workers=args.zstd_read_workers,
+                prefetch_chunks=args.prefetch_chunks,
+                variant_range=args.variant_range,
+                reduce="jagwas",
+                sumstats_format="none",
+                result_chunk_callback=clumper.consume,
+                output_dir=scan_dir,
+            )
+            observed_variant_count = int(
+                gwas_result.run_metadata["genotype_shape"][1]
+            )
+            if observed_variant_count != scan_variant_count:
+                raise ValueError(
+                    f"clumping cache expects {scan_variant_count} scanned "
+                    f"variants but TorchGWAS reported {observed_variant_count}"
+                )
+            scan_done = time.perf_counter()
+            pipeline_report = clumper.finish()
+        except BaseException:
+            clumper.abort()
+            raise
+        finished = time.perf_counter()
+        report = {
+            **common_report(args, maf_path),
+            **pipeline_report,
+            "pipeline_mode": "overlapped",
+            "clump_cache": str(cache_dir),
+            "clump_cache_seconds": cache_seconds,
+            "clump_cache_eligible_variants": int(
+                cache_manifest["eligible_variants"]
+            ),
+            "jagwas_df": degrees_of_freedom,
+            "jagwas_rows": int(pipeline_report["finite_jagwas_rows"]),
+            "scanned_variants": scan_variant_count,
+            "torchgwas_seconds": scan_done - scan_started,
+            "post_scan_wait_seconds": finished - scan_done,
+            "total_seconds_excluding_cache": finished - scan_started,
+            "total_seconds": finished - started,
         }
-    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "pipeline.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n"

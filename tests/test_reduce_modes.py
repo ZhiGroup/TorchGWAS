@@ -11,7 +11,9 @@ decision recorded only in prose is enforced by whoever remembers to reread the
 prose; a test is enforced by the test runner.
 """
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, "src")
 
@@ -26,6 +28,37 @@ def _tiny():
     genotype = rng.integers(0, 3, size=(40, 12)).astype(np.float32)
     phenotype = rng.normal(size=(40, 3))
     return genotype, phenotype
+
+
+class _ArrayStream:
+    supports_fused_qc = True
+    native_dtype = np.float32
+    ndim = 2
+
+    def __init__(self, data):
+        self.data = data
+        self.sample_ids = np.asarray([f"s{i}" for i in range(data.shape[0])])
+        self.marker_ids = np.asarray([f"m{i}" for i in range(data.shape[1])])
+        self.input_bytes = data.nbytes
+        self.reader_workers = self.decode_workers = 1
+        self.decode_batch_size = 4
+        self.prefetch_chunks = 2
+
+    @property
+    def shape(self):
+        return self.data.shape
+
+    @property
+    def genotype(self):
+        return self
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def iter_chunks(self, chunk_size, dtype=np.float32, **_kwargs):
+        for start in range(0, self.shape[1], chunk_size):
+            end = min(self.shape[1], start + chunk_size)
+            yield start, end, np.asarray(self.data[:, start:end], dtype=dtype)
 
 
 class RejectedModesTestCase(unittest.TestCase):
@@ -76,6 +109,38 @@ class MachineryStillWorksTestCase(unittest.TestCase):
     def test_top_k_still_requires_its_k(self):
         with self.assertRaises(ValueError):
             VariantReduction("top-k")
+
+
+class StreamingCallbackTestCase(unittest.TestCase):
+    def test_jagwas_chunks_can_be_consumed_without_sumstats_output(self):
+        genotype, phenotype = _tiny()
+        observed = []
+
+        def consume(chunk):
+            observed.append(
+                (int(chunk[0]), int(chunk[1]), np.asarray(chunk[3]).copy())
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "callback"
+            run_linear_gwas(
+                _ArrayStream(genotype),
+                phenotype,
+                reduce="jagwas",
+                result_chunk_callback=consume,
+                sumstats_format="none",
+                output_dir=output,
+                chunk_size=5,
+                device="cpu",
+                compute_dtype="float64",
+            )
+            self.assertFalse((output / "sumstats").exists())
+
+        self.assertEqual([(start, end) for start, end, _ in observed],
+                         [(0, 5), (5, 10), (10, 12)])
+        statistic = np.concatenate([values.reshape(-1) for _, _, values in observed])
+        self.assertEqual(statistic.shape, (genotype.shape[1],))
+        self.assertTrue(np.isfinite(statistic).all())
 
 
 class CliSurfaceTestCase(unittest.TestCase):
