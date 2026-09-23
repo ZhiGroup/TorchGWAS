@@ -80,3 +80,26 @@ harmonization, and clumping, but its locus count is not a genome-wide result.
 
 Use `--reuse-scan` to reuse an existing compatible `torchgwas/sumstats`
 directory and rerun only harmonization and clumping.
+
+## Optional hard-call zstd input
+
+A current-format hard-call zstd store is available at this prefix:
+
+```text
+/data484_4/zxie3/torchGWAS-jagwas-clump-data/discovery
+```
+
+Its 22,250 stored sample rows exactly match
+`T1_discovery_sample_order.npy`, so do not pass `--sample-ids`. To use it,
+replace the BGEN-specific arguments in the full command with:
+
+```bash
+--genotype /data484_4/zxie3/torchGWAS-jagwas-clump-data/discovery \
+--genotype-format zstd \
+--maf /data484_4/zxie3/torchGWAS-jagwas-clump-data/discovery.maf.npy
+```
+
+The bare value passed to `--genotype` is a store prefix. Its `.zst`, index,
+manifest, sample, and variant-metadata sidecars must remain together. This
+store contains hard calls; use the network BGEN command above when dosage
+genotypes are required.
