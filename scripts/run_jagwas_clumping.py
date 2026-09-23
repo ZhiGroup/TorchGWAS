@@ -272,8 +272,22 @@ def main() -> int:
         parser.error("maf-min must be in [0, 0.5]")
     default_maf = Path(f"{args.genotype}.maf.npy")
     maf_path = args.maf or default_maf
+    if args.genotype_format in {"auto", "zstd"} and not args.genotype.exists():
+        zstd_paths = tuple(
+            Path(f"{args.genotype}{suffix}")
+            for suffix in (
+                ".zst", ".idx.npz", ".samples.tsv", ".variants.tsv",
+                ".complete.json",
+            )
+        )
+        missing_zstd_paths = [path for path in zstd_paths if not path.exists()]
+        if missing_zstd_paths:
+            raise FileNotFoundError(missing_zstd_paths[0])
+    elif not args.genotype.exists():
+        raise FileNotFoundError(args.genotype)
+
     for path in (
-        args.genotype, args.phenotype, maf_path,
+        args.phenotype, maf_path,
         args.clumping_dir / "fuma_clump.py", args.ld_dir,
         *(() if args.covariates is None else (args.covariates,)),
         *(() if args.sample_file is None else (args.sample_file,)),
