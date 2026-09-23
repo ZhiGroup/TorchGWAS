@@ -106,6 +106,10 @@ Run the bundled toy workflow:
 torchgwas demo --output-dir demo_run
 ```
 
+For the lab's joint-trait JAGWAS reduction followed by locus clumping, see
+[`docs/jagwas-clumping.md`](docs/jagwas-clumping.md).  That handoff includes a
+single end-to-end script and the ready-to-use discovery zstd store path.
+
 Phenotype and covariate tables are aligned to genotype sample order by `IID`:
 
 ```bash
