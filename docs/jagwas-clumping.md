@@ -5,6 +5,32 @@ lab workflow wrapper. TorchGWAS performs the current joint-trait reduction
 (`reduce="jagwas"`); the wrapper converts its indexed chi-square output into the
 harmonized input consumed by the validated local FUMA-style clumper.
 
+## Running a batch of phenotypes
+
+`scripts/run_jagwas_batch.sh` runs any number of phenotype groups in one
+genotype pass, with the standard QC described below:
+
+```bash
+bash /path/to/TorchGWAS/scripts/run_jagwas_batch.sh \
+  -o OUTPUT_DIR -d cuda:0 PHENOTYPES... [-- EXTRA_OPTIONS...]
+```
+
+- **PHENOTYPES:** any mix of the following.
+  - A directory: every `*.npy` in it is a group named after its file.
+  - A `.npy` file: one group, named after the file.
+  - `NAME=PATH`: one group with that name.
+- **Phenotype files:** each is a (samples × traits) array whose rows follow the
+  sample-ID order. An optional `NAME.traits.txt` beside it names the traits.
+- **Outputs:** each group's `loci/`, `pipeline.json` and `excluded_samples.txt`
+  go to `OUTPUT_DIR/<group>/`.
+- **Other inputs:** they default to the 35k fusionN discovery set. Override any
+  of them with the environment variables `GENOTYPE`, `SAMPLE_IDS`, `COVARIATES`,
+  `MAF`, `GENO_CACHE`, `CLUMP_CACHE`, `LD_DIR` and `PY`.
+- **Extra options:** anything after `--` goes to `run_jagwas_clumping.py`, for
+  example `--lead-p 1e-9` or `--phenotype-outlier-sd 0`.
+- **Checks:** `-n` prints the command without running it, and `-h` shows the
+  usage.
+
 ## The joint statistic and its degrees of freedom
 
 `reduce="jagwas"` (`torchgwas.jagwas_projection.JagwasReduction`) computes
