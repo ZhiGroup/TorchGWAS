@@ -118,11 +118,15 @@ are an integration measurement, not a hardware benchmark.
 
 ## Several phenotype groups in one genotype pass
 
-Each run reads the whole BGEN once. On the shared server that pass is the run.
-The 102 GB network BGEN takes about 10 minutes to scan, and harmonization plus
-clumping add about 1.5 minutes. Rereading it for the next group does not come
-from memory: the page cache on that busy host evicted a once-read region within
-a few minutes, so every pass went back to the file server.
+Each run reads the whole BGEN once, and on the shared server that pass is most
+of the run.
+
+- **Scan time:** six single-group scans of the 102 GB network BGEN on
+  the H100 host took 588, 521, 430, 309, 466 and 147 s. Harmonization plus
+  clumping added about 75 s.
+- **Cache:** the spread is page cache luck. The busy host evicted a
+  once-read region within a few minutes, so a reread usually went back to the
+  file server; the 147 s scan followed another pass immediately.
 
 Groups on the same samples and covariates can share that pass. Replace
 `--phenotype` with one `--phenotype-group NAME=PATH` per group:
@@ -145,6 +149,11 @@ Groups on the same samples and covariates can share that pass. Replace
 - **Trait names:** a `NAME.traits.txt` sidecar next to the `.npy`, one name
   per line, names the traits in the rank reports.
 
+**Measured:** all 22 of the colleague's groups (2,655 traits) finished in 497 s
+from one pass: a 447 s scan, then 31 s for the last group's clumping. That was
+on an H100 shared with another user's training job at 99% utilization. The
+same 22 groups as separate runs had taken the colleague 27,076 s of run time.
+
 A grouped run matches separate runs:
 
 - **Residualization:** each group is residualized by its own call, exactly as
@@ -159,7 +168,10 @@ A grouped run matches separate runs:
 - **Statistic:** it differs only by the scan's rounding of t, a median
   relative difference below 1e-5 on the colleague's panels.
 - **Loci:** overlapped and `--sequential` grouped runs produced byte-identical
-  locus tables.
+  locus tables for all 22 groups. Against five whole-genome single-group runs,
+  locus counts were identical. P values differed by at most 0.003 in log10.
+  The only other differences were near-ties: adjacent SNPs in tight LD
+  swapping as lead or independent SNP, and one SNP at P = 4.996e-8.
 
 `--sequential` writes one indexed scan with a chi-square column per group
 (the manifest's `groups` and `df` list them). `--reuse-scan` with any subset of
