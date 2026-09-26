@@ -116,6 +116,56 @@ took 242.1 seconds and the overlapped workflow waited another 20.5 seconds
 after the scan, for 262.7 seconds total. The server was shared and these times
 are an integration measurement, not a hardware benchmark.
 
+## Several phenotype groups in one genotype pass
+
+Each run reads the whole BGEN once. On the shared server that pass is the run.
+The 102 GB network BGEN takes about 10 minutes to scan, and harmonization plus
+clumping add about 1.5 minutes. Rereading it for the next group does not come
+from memory: the page cache on that busy host evicted a once-read region within
+a few minutes, so every pass went back to the file server.
+
+Groups on the same samples and covariates can share that pass. Replace
+`--phenotype` with one `--phenotype-group NAME=PATH` per group:
+
+```bash
+--phenotype-group CNN=$BATCH/phenos/CNN.npy \
+--phenotype-group graphunet=$BATCH/phenos/graphunet.npy \
+--output-dir $BATCH/runs
+```
+
+- **Scan:** TorchGWAS scans the concatenated phenotypes once. Each group gets
+  its own joint test (`run_linear_gwas(jagwas_groups=...)`,
+  `jagwas_projection.JagwasGroups`) with its own correlation, kept traits and df.
+- **Clumping:** in the default overlapped mode every group has its own
+  clumping worker, and all of them finish together after the scan.
+- **Outputs:** each group's `loci/` and `pipeline.json` go to
+  `OUTPUT_DIR/NAME`, which is the layout a per-group run with
+  `--output-dir OUTPUT_DIR/NAME` produces. The scan record and the combined
+  `pipeline.json` are at the top level.
+- **Trait names:** a `NAME.traits.txt` sidecar next to the `.npy`, one name
+  per line, names the traits in the rank reports.
+
+A grouped run matches separate runs:
+
+- **Residualization:** each group is residualized by its own call, exactly as
+  a run of that group alone would do it. The per-column arithmetic is the same
+  either way, but kernels chosen for a different width round differently. On a
+  near-collinear group, that rounding alone changed which traits the rank
+  cutoff kept: three of fourier_PE_L4_xyz's twelve dropped traits, and
+  graphunet kept 99 traits instead of 98. The joint statistic moved by a median
+  1.6% and by up to 32%.
+- **Kept traits and df:** with per-group residualization they are identical to
+  the separate runs.
+- **Statistic:** it differs only by the scan's rounding of t, a median
+  relative difference below 1e-5 on the colleague's panels.
+- **Loci:** overlapped and `--sequential` grouped runs produced byte-identical
+  locus tables.
+
+`--sequential` writes one indexed scan with a chi-square column per group
+(the manifest's `groups` and `df` list them). `--reuse-scan` with any subset of
+the groups reclumps them, for example at another `--lead-p`, with
+`--clump-workers` concurrent clumping processes.
+
 ## Short integration check
 
 Add this option to the command above:

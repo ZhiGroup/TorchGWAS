@@ -338,8 +338,15 @@ def residualize_and_standardize(
     trait_block: int = RESIDUALIZE_TRAIT_BLOCK,
     out_dtype=None,
     return_observed_counts: bool = False,
+    column_groups=None,
 ):
     """Centre each trait, project out the covariates, and scale to unit variance.
+
+    `column_groups` (index arrays, disjoint) residualises each group by its
+    own call, exactly as a run of that group alone would. The arithmetic per
+    column is the same either way, but reductions and GEMMs are chosen by the
+    block width and round differently, and a JAGWAS rank decision on a
+    near-collinear group can turn on that rounding (jagwas_projection.JagwasGroups).
 
     `device` is optional and advisory: pass a CUDA device to run the projection
     there. The numpy path stays the reference implementation and the two are
@@ -366,6 +373,22 @@ def residualize_and_standardize(
     caller's own array, dropping the peak to the phenotype itself; it mutates
     the argument, so it is opt-in and the default remains the safe copy.
     """
+    if column_groups is not None:
+        if inplace:
+            raise ValueError("column_groups cannot be combined with inplace=True")
+        out = q_matrix = None
+        groups = [np.asarray(columns, dtype=np.int64) for columns in column_groups]
+        uncovered = np.setdiff1d(np.arange(phenotype.shape[1]), np.concatenate(groups))
+        for columns in groups + ([uncovered] if len(uncovered) else []):
+            block, q_matrix = residualize_and_standardize(
+                phenotype[:, columns], covariates, device=device,
+                trait_block=trait_block, out_dtype=out_dtype)
+            if out is None:
+                out = np.empty(phenotype.shape, dtype=block.dtype)
+            out[:, columns] = block
+        counts = np.sum(~np.isnan(phenotype), axis=0).astype(np.int64)
+        return (out, q_matrix, counts) if return_observed_counts else (out, q_matrix)
+
     q_matrix = None
     if covariates is not None and covariates.shape[1] > 0:
         q_matrix = _covariate_basis(covariates)

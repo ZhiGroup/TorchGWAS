@@ -30,7 +30,10 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
  for chunk in chunks:
   start,end=chunk[:2]
   if kind=='jagwas':
-   values=np.asarray(chunk[3],dtype=np.float64).reshape(-1);keep=np.flatnonzero(np.isfinite(values))
+   # One column per JAGWAS group: chi2 is (rows, groups), a row kept while any group is finite.
+   values=np.asarray(chunk[3],dtype=np.float64).reshape(end-start,-1)
+   if values.shape[1]==1:values=values[:,0];keep=np.flatnonzero(np.isfinite(values))
+   else:keep=np.flatnonzero(np.isfinite(values).any(axis=1))
    emit({'variant_index':start+keep,'chi2':values[keep]});continue
   if kind=='significant':
    _,_,vi,ti,beta,t,_chunk_df=chunk
@@ -60,7 +63,10 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
  np.save(directory/'variant_ids.npy',np.asarray(marker_names,dtype=str),allow_pickle=False)
  if variant_metadata is not None:
   np.savez(directory/'variant_metadata.npz',**{key:np.asarray(v,dtype=np.int64 if key=='position' else str) for key,v in variant_metadata.items()})
- manifest={'format':'torchgwas-indexed-sumstats','version':2,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':int((chi2_df() if callable(chi2_df) else chi2_df) if kind=='jagwas' else df),'traits':list(trait_names),'parts':parts,'rows':total,'variant_ids':'variant_ids.npy','significance':'chi-square tail derived from chi2 and df' if kind=='jagwas' else 'neg_log10_p is -log10 of the exact two-sided Student-t tail'}
+ if kind=='jagwas':
+  df=chi2_df() if callable(chi2_df) else chi2_df
+  df=[int(value) for value in df] if isinstance(df,(list,tuple)) else int(df)
+ manifest={'format':'torchgwas-indexed-sumstats','version':2,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':df if kind=='jagwas' else int(df),'traits':list(trait_names),'parts':parts,'rows':total,'variant_ids':'variant_ids.npy','significance':'chi-square tail derived from chi2 and df' if kind=='jagwas' else 'neg_log10_p is -log10 of the exact two-sided Student-t tail'}
  if extra_manifest is not None:
   manifest.update(extra_manifest() if callable(extra_manifest) else extra_manifest)
  (directory/'manifest.json').write_text(json.dumps(manifest,indent=2))

@@ -259,4 +259,4 @@ class SignificantPairs:
 
 # The one JAGWAS reduction (score statistic, FP64 correlation, rounding-target
 # rank cutoff, block-triangular projection) lives in jagwas_projection.
-from .jagwas_projection import JagwasReduction  # noqa: E402,F401
+from .jagwas_projection import JagwasGroups, JagwasReduction  # noqa: E402,F401

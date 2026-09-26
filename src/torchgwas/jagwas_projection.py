@@ -43,6 +43,10 @@ traits.
 
 Projection. L^-1 is lower triangular, so (L^-1 z')[b] = L^-1[b, :end_b] z'[:end_b]:
 one GEMM per row block, about (B+1)/(2B) of the dense work.
+
+Groups. JagwasGroups runs one such test per trait group from a single scan of
+the groups' concatenated panel, so G panels on the same samples and
+covariates cost one genotype pass instead of G.
 """
 from __future__ import annotations
 
@@ -117,31 +121,44 @@ class JagwasReduction:
     mode = "jagwas"
     width = 1
 
-    def __init__(self, selection=None):
+    def __init__(self, selection=None, name=None):
         self._inverse_cholesky = None
         self._n_traits = None
         self._selection = JagwasRankSelection() if selection is None else selection
         self._kept = None
         self._blocks = None
+        self.name = name
 
     def spawn(self):
         """A reduction for another device that shares this run's kept-trait decision."""
-        return type(self)(self._selection)
+        return type(self)(self._selection, self.name)
 
     def resolved_width(self, n_traits: int) -> int:
         return 1
 
-    def prepare(self, phenotype, device=None):
+    def prepare(self, phenotype, device=None, columns=None):
         """Factorise R once before the scan, keeping the traits the rounding target allows.
 
         The fast path is an FP64 Gram in sample blocks, FP64 Cholesky and
         triangular solve, and the check. The phenotype, correlation, factor,
         identity and inverse coexist during the solve; during the Gram the
         phenotype, correlation and one FP64 block (jagwas_blocks.gram_rows).
+
+        columns: this test's traits within a wider scanned panel (JagwasGroups).
+        reduce() then takes the whole panel's t and gathers its kept traits.
         """
         matrix = torch.as_tensor(phenotype)
         if device is not None:
             matrix = matrix.to(device)
+        self._kept = None
+        if columns is None:
+            return self._prepare(matrix)
+        index = torch.as_tensor(np.asarray(columns, dtype=np.int64), device=matrix.device)
+        self._prepare(matrix.index_select(1, index))
+        self._kept = index if self._kept is None else index.index_select(0, self._kept)
+        return self
+
+    def _prepare(self, matrix):
         samples, traits = matrix.shape
         if traits < 1:
             raise ValueError("jagwas needs at least one trait")
@@ -172,10 +189,11 @@ class JagwasReduction:
             record = self._pivoted_selection(correlation, limit, precision)
         agreed = self._selection.agree(record)
         if agreed is record and record['dropped']:
-            warnings.warn(f"jagwas: {len(record['dropped'])} of {traits} traits are collinear with the others and "
+            label = "jagwas" if self.name is None else f"jagwas group {self.name}"
+            warnings.warn(f"{label}: {len(record['dropped'])} of {traits} traits are collinear with the others and "
                           f"were dropped (keeping them would put the rounding error of T above "
                           f"{self._selection.target:g}); the joint test has {record['rank']} degrees of freedom",
-                          stacklevel=2)
+                          stacklevel=3)
         if agreed['kept'] is None and inverse is not None:
             return self._set_factor(inverse)
         return self._subset_factor(correlation, agreed['kept'])
@@ -294,3 +312,93 @@ class JagwasReduction:
             "jagwas cannot be trait-blocked: the statistic is a quadratic form "
             "over the whole trait correlation, so a block of traits does not "
             "carry enough information to be merged with another block")
+
+
+class JagwasGroups:
+    """One joint test per trait group, all from one scan of the concatenated panel.
+
+    A trait's t depends only on its own phenotype, the covariates and the
+    genotype, so each group's t, kept traits, T and df are exactly those of a
+    scan of that group alone; only the genotype pass is shared. Each group is
+    an independent JagwasReduction (its own correlation, rank cutoff and
+    factor) over its columns of the scanned panel. Groups may overlap.
+    The result has one column per group, in order.
+    """
+
+    mode = "jagwas"
+
+    def __init__(self, groups, reductions=None):
+        groups = list(groups.items()) if isinstance(groups, dict) else list(groups)
+        if not groups:
+            raise ValueError("jagwas groups need at least one group")
+        self.names = [str(name) for name, _ in groups]
+        if len(set(self.names)) != len(self.names):
+            raise ValueError("jagwas group names must be unique")
+        self.columns = [np.asarray(columns, dtype=np.int64).reshape(-1) for _, columns in groups]
+        for name, columns in zip(self.names, self.columns):
+            if len(columns) == 0 or len(np.unique(columns)) != len(columns):
+                raise ValueError(f"jagwas group {name} needs distinct trait columns")
+        self.reductions = ([JagwasReduction(name=name) for name in self.names]
+                           if reductions is None else list(reductions))
+        self.width = len(groups)
+
+    @property
+    def column_groups(self):
+        """Residualise each group on its own (preprocess.residualize_and_standardize):
+        a near-collinear group's kept set can turn on the rounding of its panel,
+        so it must see the same bits a scan of that group alone would."""
+        return self.columns
+
+    def spawn(self):
+        """Groups for another device that share each group's kept-trait decision."""
+        return type(self)(list(zip(self.names, self.columns)), [reduction.spawn() for reduction in self.reductions])
+
+    def resolved_width(self, n_traits: int) -> int:
+        return self.width
+
+    def prepare(self, phenotype, device=None):
+        matrix = torch.as_tensor(phenotype)
+        if device is not None:
+            matrix = matrix.to(device)
+        traits = matrix.shape[1]
+        for name, columns in zip(self.names, self.columns):
+            if columns.min() < 0 or columns.max() >= traits:
+                raise ValueError(f"jagwas group {name} refers outside the {traits} scanned traits")
+        for reduction, columns in zip(self.reductions, self.columns):
+            reduction.prepare(matrix, columns=columns)
+        return self
+
+    @property
+    def degrees_of_freedom(self) -> list[int]:
+        return [reduction.degrees_of_freedom for reduction in self.reductions]
+
+    def rank_report(self, trait_names=None):
+        """Each group's kept-trait report, with its name, in column order."""
+        reports = []
+        for name, columns, reduction in zip(self.names, self.columns, self.reductions):
+            report = reduction.rank_report(None if trait_names is None else [trait_names[i] for i in columns])
+            if report is None:
+                return None
+            reports.append(dict(group=name, **report))
+        return reports
+
+    def host_buffers(self, chunk_size: int, width: int, pin_memory: bool = True):
+        return (
+            torch.empty((chunk_size, width), dtype=torch.float32, pin_memory=pin_memory),
+            torch.empty((chunk_size, width), dtype=torch.float32, pin_memory=pin_memory),
+            torch.empty((chunk_size, width), dtype=torch.int32, pin_memory=pin_memory),
+            torch.empty(chunk_size, dtype=torch.uint8, pin_memory=pin_memory),
+            torch.empty(chunk_size, pin_memory=pin_memory),
+        )
+
+    def reduce(self, beta, t, status, variant_df, width):
+        """(chunk, K) t of the whole panel in, (chunk, groups) T out in the t slot."""
+        statistic = torch.cat([reduction.reduce(beta, t, status, variant_df, 1)[1]
+                               for reduction in self.reductions], dim=1)
+        return (torch.full_like(statistic, float("nan"), dtype=beta.dtype),
+                statistic,
+                torch.zeros_like(statistic, dtype=torch.int32),
+                status, variant_df)
+
+    def merge(self, running, incoming, trait_offset: int):
+        return self.reductions[0].merge(running, incoming, trait_offset)

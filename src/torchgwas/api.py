@@ -525,6 +525,11 @@ def run_linear_gwas(
     # is the chi-square df) after the factor is prepared and before the first
     # result chunk is delivered, so streaming consumers can convert T to P.
     jagwas_rank_callback=None,
+    # reduce='jagwas' only: [(name, phenotype column indices), ...] or a dict,
+    # for one joint test per group from a single genotype pass (one chi2
+    # column and one df per group; see jagwas_projection.JagwasGroups). The
+    # rank callback and the manifest's jagwas_rank then carry one report per group.
+    jagwas_groups=None,
 ) -> GWASResult:
     if sumstats_format not in {"binary", "none"}:
         raise ValueError("sumstats_format must be 'binary' or 'none'; TSV output has been removed")
@@ -532,6 +537,8 @@ def run_linear_gwas(
         raise TypeError("result_chunk_callback must be callable")
     if jagwas_rank_callback is not None and (not callable(jagwas_rank_callback) or reduce != "jagwas"):
         raise TypeError("jagwas_rank_callback must be callable and needs reduce='jagwas'")
+    if jagwas_groups is not None and reduce != "jagwas":
+        raise TypeError("jagwas_groups needs reduce='jagwas'")
     sumstats_summary: dict = {}
     requested_reader_workers = reader_workers
     requested_prefetch_chunks = prefetch_chunks
@@ -619,7 +626,7 @@ def run_linear_gwas(
     significance = None
     jagwas = None
     if reduce == "jagwas":
-        from .reduce import JagwasReduction
+        from .reduce import JagwasGroups, JagwasReduction
 
         if output_dir is None:
             raise ValueError(
@@ -638,9 +645,12 @@ def run_linear_gwas(
         # inverse factor) at once, and none can be tiled. Say so here, with
         # the arithmetic, rather than letting a voxel-scale K fail inside the
         # scan: at K = 2,085,000 the correlation alone is 35 TB.
+        # Groups factor one at a time and keep each group's inverse factor.
         traits = int(np.asarray(phenotype).shape[1])
         samples = int(np.asarray(phenotype).shape[0])
-        correlation_bytes = 4 * traits * traits * 8
+        jagwas = JagwasReduction() if jagwas_groups is None else JagwasGroups(jagwas_groups)
+        sizes = [traits] if jagwas_groups is None else [len(columns) for columns in jagwas.columns]
+        correlation_bytes = (sum(size * size for size in sizes) + 3 * max(sizes) ** 2) * 8
         residual_bytes = samples * traits * 4
         try:
             import torch as _torch
@@ -660,7 +670,6 @@ def run_linear_gwas(
                 f"quadratic form over all traits, so it cannot be tiled -- use "
                 f"reduce='significant', which streams and is what scales to "
                 f"this many traits")
-        jagwas = JagwasReduction()
         reduction = jagwas
         reduce = None
     if reduce == "significant":
@@ -1131,7 +1140,9 @@ def run_linear_gwas(
                     kind=kind, df=residual_df,
                     # The kept rank is known once the factor is prepared, before the manifest.
                     chi2_df=(lambda: jagwas.degrees_of_freedom) if jagwas is not None else None,
-                    extra_manifest=((lambda: dict(jagwas_rank=jagwas.rank_report(trait_names)))
+                    extra_manifest=((lambda: dict(jagwas_rank=jagwas.rank_report(trait_names),
+                                                  **({} if jagwas_groups is None else
+                                                     dict(groups=jagwas.names))))
                                     if jagwas is not None else None),
                     p_value_threshold=p_value_threshold,
                     variant_metadata=variant_metadata,fsync=sumstats_fsync,
@@ -1304,6 +1315,7 @@ def run_linear_gwas(
             None if significance is None
             else significance.resolved_threshold(len(trait_names))),
         "reduce_top_k": None if reduction is None else reduction.width,
+        "jagwas_groups": None if jagwas_groups is None else jagwas.names,
         # Recorded because it changes how many passes the run made over the
         # genotypes, which is the first thing to check against a wall time.
         "trait_block": None if trait_block is None else int(trait_block),

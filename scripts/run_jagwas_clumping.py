@@ -6,13 +6,20 @@ r the number of traits the JAGWAS rank cutoff keeps (K for a well-conditioned
 panel; see torchgwas.jagwas_projection).
 This wrapper converts that indexed output to the harmonized table expected by
 the lab's validated local-clumping implementation, then runs locus clumping.
+
+--phenotype-group NAME=PATH (repeatable, instead of --phenotype) runs one
+joint test per group from a single genotype pass over the groups' concatenated
+phenotypes; each group's loci and pipeline.json go to OUTPUT_DIR/NAME.
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import json
+import multiprocessing as mp
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -25,6 +32,7 @@ from torchgwas.io import load_genotype
 from torchgwas.sumstats_indexed import open_indexed_sumstats
 
 from jagwas_streaming import (
+    GroupedClumpers,
     PipelinedClumper,
     build_clumping_cache,
     validate_clumping_cache,
@@ -86,9 +94,20 @@ def harmonized_table(
     variant_range: tuple[int, int] | None,
 ) -> tuple[pd.DataFrame, dict]:
     manifest, variant_index, chi2 = collect_jagwas(sumstats_dir)
-    degrees_of_freedom = int(manifest["df"])
-    if degrees_of_freedom < 1:
-        raise ValueError("JAGWAS degrees of freedom must be positive")
+    if chi2.ndim != 1:
+        raise ValueError("this scan has JAGWAS groups; harmonize each group's column")
+    variants = variant_table(sumstats_dir, maf_path, variant_range)
+    return harmonize(
+        variants, variant_index, chi2,
+        degrees_of_freedom=manifest["df"], n_samples=manifest["n_samples"],
+        gwas_p=gwas_p, maf_min=maf_min, exclude_mhc=exclude_mhc,
+    )
+
+
+def variant_table(
+    sumstats_dir: Path, maf_path: Path, variant_range: tuple[int, int] | None,
+) -> tuple[np.ndarray, ...]:
+    """(marker IDs, chromosome, position, effect, other, MAF), aligned to the scan."""
     metadata_path = sumstats_dir / "variant_metadata.npz"
     if not metadata_path.is_file():
         raise FileNotFoundError(metadata_path)
@@ -117,6 +136,25 @@ def harmonized_table(
         other = other[start:end]
     if not all(len(array) == n_variants for array in (chromosome, position, effect, other, maf)):
         raise ValueError("marker, metadata, and MAF arrays are not aligned")
+    return marker_ids, chromosome, position, effect, other, maf
+
+
+def harmonize(
+    variants: tuple[np.ndarray, ...],
+    variant_index: np.ndarray,
+    chi2: np.ndarray,
+    *,
+    degrees_of_freedom: int,
+    n_samples: int,
+    gwas_p: float,
+    maf_min: float,
+    exclude_mhc: bool,
+) -> tuple[pd.DataFrame, dict]:
+    marker_ids, chromosome, position, effect, other, maf = variants
+    n_variants = len(marker_ids)
+    degrees_of_freedom = int(degrees_of_freedom)
+    if degrees_of_freedom < 1:
+        raise ValueError("JAGWAS degrees of freedom must be positive")
     if len(variant_index) and (variant_index.min() < 0 or variant_index.max() >= n_variants):
         raise ValueError("indexed JAGWAS output refers outside the marker table")
 
@@ -125,6 +163,10 @@ def harmonized_table(
     # strongest valid statistics are retained by the clumper's P > 0 filter.
     p_value = special.gammaincc(degrees_of_freedom / 2.0, chi2 / 2.0)
     p_value = np.maximum(p_value, np.nextafter(np.float64(0), np.float64(1)))
+    # The P filter first (the filters are a conjunction, and order is kept),
+    # so the string work below touches ~gwas_p of the rows rather than all.
+    candidate = np.isfinite(p_value) & (p_value > 0.0) & (p_value <= gwas_p)
+    variant_index, p_value = variant_index[candidate], p_value[candidate]
 
     chrom_selected = chromosome[variant_index]
     position_selected = position[variant_index]
@@ -162,7 +204,7 @@ def harmonized_table(
             "POS": position_selected[selected],
             "A1": a1,
             "A2": a2,
-            "N": np.int32(manifest["n_samples"]),
+            "N": np.int32(n_samples),
             "AF1": maf_selected[selected].astype(np.float32),
             "P": p_value[selected],
             "uniqID": np.char.add(
@@ -235,11 +277,11 @@ def run_clumping(
     )
 
 
-def ensure_clumping_cache(args, maf_path: Path, cache_dir: Path) -> tuple[dict, float]:
+def ensure_clumping_cache(
+    args, maf_path: Path, cache_dir: Path, n_samples: int,
+) -> tuple[dict, float]:
     """Validate an existing cache or build it once from the genotype metadata."""
     started = time.perf_counter()
-    phenotype = np.load(args.phenotype, mmap_mode="r", allow_pickle=False)
-    n_samples = int(phenotype.shape[0])
     if (cache_dir / "manifest.json").is_file():
         # Opening the genotype merely to learn M would defeat the point of a
         # reusable cache. Its manifest records the aligned full variant count;
@@ -295,16 +337,288 @@ def ensure_clumping_cache(args, maf_path: Path, cache_dir: Path) -> tuple[dict, 
     return manifest, time.perf_counter() - started
 
 
-def common_report(args, maf_path: Path) -> dict:
+def common_report(args, maf_path: Path, phenotype: Path | None = None) -> dict:
+    phenotype = args.phenotype if phenotype is None else phenotype
     return {
         "genotype": str(args.genotype),
         "genotype_format": args.genotype_format,
-        "phenotype": str(args.phenotype),
+        "phenotype": None if phenotype is None else str(phenotype),
         "covariates": None if args.covariates is None else str(args.covariates),
         "sample_file": None if args.sample_file is None else str(args.sample_file),
         "sample_ids": None if args.sample_ids is None else str(args.sample_ids),
         "maf": str(maf_path),
         "variant_range": args.variant_range,
+    }
+
+
+def scanned_span(variant_range, full_variant_count: int) -> tuple[int, int]:
+    """(offset, count) of the scanned variants within the clumping cache's axis."""
+    if variant_range is None:
+        return 0, full_variant_count
+    start, end = variant_range
+    if end > full_variant_count:
+        raise ValueError("variant range exceeds the clumping cache")
+    return start, end - start
+
+
+def write_report(directory: Path, report: dict) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "pipeline.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+
+
+GROUP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+RESERVED_GROUP_NAMES = {"torchgwas", "clump-cache", "loci"}
+
+
+def parse_phenotype_group(value: str) -> tuple[str, Path]:
+    name, separator, path = value.partition("=")
+    if not separator or not path or not GROUP_NAME.fullmatch(name) or name in RESERVED_GROUP_NAMES:
+        raise argparse.ArgumentTypeError(
+            "phenotype group must be NAME=PATH, NAME of letters, digits, '.', '_' "
+            f"or '-' and not one of {sorted(RESERVED_GROUP_NAMES)}"
+        )
+    return name, Path(path)
+
+
+def group_panel(groups) -> tuple[np.ndarray, list[str], list[tuple[str, list[int]]]]:
+    """The groups' phenotypes side by side, their trait names, and each group's columns.
+
+    A trait is named from a NAME.traits.txt sidecar (one name per line) when
+    it lists every column, else trait_<i>, prefixed with its group.
+    """
+    arrays, names, columns = [], [], []
+    for name, path in groups:
+        values = np.load(path, allow_pickle=False)
+        if values.ndim != 2:
+            raise ValueError(f"phenotype group {name} is not a two-dimensional array")
+        if arrays and values.shape[0] != arrays[0].shape[0]:
+            raise ValueError(
+                f"phenotype group {name} has {values.shape[0]} rows but the first "
+                f"group has {arrays[0].shape[0]}"
+            )
+        sidecar = path.with_suffix(".traits.txt")
+        labels = (
+            [line.strip() for line in sidecar.read_text().splitlines() if line.strip()]
+            if sidecar.is_file()
+            else []
+        )
+        if len(labels) != values.shape[1]:
+            labels = [f"trait_{index}" for index in range(values.shape[1])]
+        offset = sum(array.shape[1] for array in arrays)
+        columns.append((name, list(range(offset, offset + values.shape[1]))))
+        names.extend(f"{name}:{label}" for label in labels)
+        arrays.append(values)
+    return np.concatenate(arrays, axis=1), names, columns
+
+
+def scan_arguments(args) -> dict:
+    """run_linear_gwas arguments shared by every mode."""
+    return dict(
+        genotype=args.genotype,
+        genotype_format=args.genotype_format,
+        covariates=args.covariates,
+        sample_file=args.sample_file,
+        sample_ids=args.sample_ids,
+        bgen_decode_backend=args.bgen_decode_backend,
+        genotype_cache_dir=args.genotype_cache_dir,
+        device=args.device,
+        compute_dtype=args.compute_dtype,
+        chunk_size=args.chunk_size,
+        reader_workers=args.reader_workers,
+        zstd_read_workers=args.zstd_read_workers,
+        prefetch_chunks=args.prefetch_chunks,
+        variant_range=args.variant_range,
+        reduce="jagwas",
+    )
+
+
+def run_groups_overlapped(args, groups, maf_path: Path, started: float) -> dict:
+    """One genotype pass for every group, with one overlapped clumping worker per group."""
+    n_samples = int(np.load(groups[0][1], mmap_mode="r", allow_pickle=False).shape[0])
+    cache_dir = args.clump_cache or (args.output_dir / "clump-cache")
+    cache_manifest, cache_seconds = ensure_clumping_cache(args, maf_path, cache_dir, n_samples)
+    variant_offset, scan_variant_count = scanned_span(
+        args.variant_range, int(cache_manifest["n_variants"])
+    )
+    # The workers fork here, before this process holds the panel or CUDA.
+    workers = []
+    try:
+        for name, _path in groups:
+            workers.append(
+                PipelinedClumper(
+                    cache_dir=cache_dir,
+                    output_dir=args.output_dir / name / "loci",
+                    clumping_dir=args.clumping_dir,
+                    ld_dir=args.ld_dir,
+                    n_samples=n_samples,
+                    n_variants=scan_variant_count,
+                    gwas_p=args.gwas_p,
+                    lead_p=args.lead_p,
+                    variant_offset=variant_offset,
+                )
+            )
+    except BaseException:
+        for worker in workers:
+            worker.abort()
+        raise
+    clumpers = GroupedClumpers(workers)
+    scan_started = time.perf_counter()
+    try:
+        panel, trait_names, columns = group_panel(groups)
+        gwas_result = run_linear_gwas(
+            **scan_arguments(args),
+            phenotype=panel,
+            trait_columns=trait_names,
+            jagwas_groups=columns,
+            sumstats_format="none",
+            result_chunk_callback=clumpers.consume,
+            jagwas_rank_callback=clumpers.set_rank,
+            output_dir=args.output_dir / "torchgwas",
+        )
+        del panel
+        observed_variant_count = int(gwas_result.run_metadata["genotype_shape"][1])
+        if observed_variant_count != scan_variant_count:
+            raise ValueError(
+                f"clumping cache expects {scan_variant_count} scanned "
+                f"variants but TorchGWAS reported {observed_variant_count}"
+            )
+        scan_done = time.perf_counter()
+        collected = clumpers.finish()
+    except BaseException:
+        clumpers.abort()
+        raise
+    shared = {
+        "pipeline_mode": "overlapped_groups",
+        "groups_in_scan": len(groups),
+        "clump_cache": str(cache_dir),
+        "clump_cache_seconds": cache_seconds,
+        "clump_cache_eligible_variants": int(cache_manifest["eligible_variants"]),
+        "scanned_variants": scan_variant_count,
+        "torchgwas_seconds": scan_done - scan_started,
+    }
+    summaries = []
+    for (name, path), (_name, group_columns), worker, (worker_report, done) in zip(
+        groups, columns, workers, collected
+    ):
+        report = {
+            **common_report(args, maf_path, path),
+            **worker_report,
+            **shared,
+            "group": name,
+            "traits": len(group_columns),
+            "jagwas_df": worker.degrees_of_freedom,
+            "jagwas_rank": worker.rank_report,
+            "jagwas_rows": int(worker_report["finite_jagwas_rows"]),
+            "post_scan_wait_seconds": done - scan_done,
+            "total_seconds_excluding_cache": done - scan_started,
+            "total_seconds": done - started,
+        }
+        write_report(args.output_dir / name, report)
+        summaries.append(
+            {key: report[key] for key in ("group", "traits", "jagwas_df", "harmonized_rows", "ok")}
+        )
+    finished = max(done for _report, done in collected)
+    return {
+        **common_report(args, maf_path),
+        **shared,
+        "phenotype_groups": {name: str(path) for name, path in groups},
+        "groups": summaries,
+        "post_scan_wait_seconds": finished - scan_done,
+        "total_seconds_excluding_cache": finished - scan_started,
+        "total_seconds": finished - started,
+    }
+
+
+def run_groups_sequential(args, groups, maf_path: Path, started: float) -> dict:
+    """One indexed grouped scan (or --reuse-scan), then each group's harmonization and clumping.
+
+    The variant table is loaded once. Clumping runs in spawned processes,
+    overlapping this process's harmonization of the next group.
+    """
+    sumstats_dir = args.output_dir / "torchgwas" / "sumstats"
+    if args.reuse_scan:
+        if not (sumstats_dir / "manifest.json").is_file():
+            raise FileNotFoundError(sumstats_dir / "manifest.json")
+    else:
+        panel, trait_names, columns = group_panel(groups)
+        run_linear_gwas(
+            **scan_arguments(args),
+            phenotype=panel,
+            trait_columns=trait_names,
+            jagwas_groups=columns,
+            sumstats_fields="t",
+            output_dir=args.output_dir / "torchgwas",
+        )
+        del panel
+    scan_done = time.perf_counter()
+    manifest, variant_index, chi2 = collect_jagwas(sumstats_dir)
+    scanned = manifest.get("groups")
+    if scanned is None:
+        raise ValueError(f"{sumstats_dir} is not a grouped JAGWAS scan")
+    absent = [name for name, _path in groups if name not in scanned]
+    if absent:
+        raise ValueError(f"{sumstats_dir} has no JAGWAS group(s) {absent}")
+    chi2 = chi2.reshape(len(chi2), len(scanned))
+    variants = variant_table(sumstats_dir, maf_path, args.variant_range)
+    workers = args.clump_workers or min(8, len(groups))
+    pending = []
+    with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
+        for name, path in groups:
+            column = scanned.index(name)
+            group_started = time.perf_counter()
+            finite = np.isfinite(chi2[:, column])
+            table, report = harmonize(
+                variants, variant_index[finite], chi2[finite, column],
+                degrees_of_freedom=manifest["df"][column], n_samples=manifest["n_samples"],
+                gwas_p=args.gwas_p, maf_min=args.maf_min, exclude_mhc=not args.include_mhc,
+            )
+            harmonized_path = args.output_dir / name / "jagwas_clump_input.npz"
+            write_harmonized_npz(table, harmonized_path, report)
+            report.update(
+                {
+                    **common_report(args, maf_path, path),
+                    "group": name,
+                    "jagwas_rank": manifest["jagwas_rank"][column],
+                    "harmonization_seconds": time.perf_counter() - group_started,
+                }
+            )
+            future = pool.submit(
+                run_clumping,
+                harmonized_path,
+                args.output_dir / name / "loci",
+                clumping_dir=args.clumping_dir,
+                ld_dir=args.ld_dir,
+                lead_p=args.lead_p,
+                gwas_p=args.gwas_p,
+            )
+            pending.append((name, future, report))
+        summaries = []
+        for name, future, report in pending:
+            future.result()
+            done = time.perf_counter()
+            report.update(
+                {
+                    "ok": True,
+                    "pipeline_mode": "sequential_groups",
+                    "groups_in_scan": len(scanned),
+                    "torchgwas_seconds": scan_done - started,
+                    "total_seconds": done - started,
+                }
+            )
+            write_report(args.output_dir / name, report)
+            summaries.append(
+                {key: report[key] for key in ("group", "jagwas_df", "harmonized_rows", "ok")}
+            )
+    finished = time.perf_counter()
+    return {
+        **common_report(args, maf_path),
+        "pipeline_mode": "sequential_groups",
+        "phenotype_groups": {name: str(path) for name, path in groups},
+        "groups": summaries,
+        "torchgwas_seconds": scan_done - started,
+        "total_seconds": finished - started,
     }
 
 
@@ -324,7 +638,23 @@ def main() -> int:
     parser.add_argument(
         "--bgen-decode-backend", choices=("auto", "cpu", "gpu"), default="auto",
     )
-    parser.add_argument("--phenotype", type=Path, required=True)
+    parser.add_argument("--phenotype", type=Path)
+    parser.add_argument(
+        "--phenotype-group",
+        type=parse_phenotype_group,
+        action="append",
+        metavar="NAME=PATH",
+        help=(
+            "repeatable, instead of --phenotype: one joint test per group from a "
+            "single genotype pass; each group's loci and pipeline.json go to "
+            "OUTPUT_DIR/NAME"
+        ),
+    )
+    parser.add_argument(
+        "--clump-workers",
+        type=int,
+        help="concurrent group clumping processes with --sequential/--reuse-scan (default min(8, groups))",
+    )
     parser.add_argument("--covariates", type=Path)
     parser.add_argument("--maf", type=Path, help="aligned .npy, or .npz containing 'maf'")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -364,6 +694,14 @@ def main() -> int:
         parser.error("require 0 < lead-p <= gwas-p <= 1")
     if not (0.0 <= args.maf_min <= 0.5):
         parser.error("maf-min must be in [0, 0.5]")
+    if (args.phenotype is None) == (args.phenotype_group is None):
+        parser.error("pass either --phenotype or --phenotype-group")
+    if args.phenotype_group is not None:
+        group_names = [name for name, _path in args.phenotype_group]
+        if len(set(group_names)) != len(group_names):
+            parser.error("phenotype group names must be unique")
+    if args.clump_workers is not None and args.clump_workers < 1:
+        parser.error("clump-workers must be positive")
     default_maf = Path(f"{args.genotype}.maf.npy")
     maf_path = args.maf or default_maf
     if args.genotype_format in {"auto", "zstd"} and not args.genotype.exists():
@@ -380,8 +718,13 @@ def main() -> int:
     elif not args.genotype.exists():
         raise FileNotFoundError(args.genotype)
 
+    phenotype_paths = (
+        (args.phenotype,)
+        if args.phenotype_group is None
+        else tuple(path for _name, path in args.phenotype_group)
+    )
     for path in (
-        args.phenotype, maf_path,
+        *phenotype_paths, maf_path,
         args.clumping_dir / "fuma_clump.py", args.ld_dir,
         *(() if args.covariates is None else (args.covariates,)),
         *(() if args.sample_file is None else (args.sample_file,)),
@@ -391,6 +734,16 @@ def main() -> int:
             raise FileNotFoundError(path)
 
     started = time.perf_counter()
+    if args.phenotype_group is not None:
+        run = (
+            run_groups_sequential
+            if args.reuse_scan or args.sequential
+            else run_groups_overlapped
+        )
+        report = run(args, args.phenotype_group, maf_path, started)
+        write_report(args.output_dir, report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
     scan_dir = args.output_dir / "torchgwas"
     sumstats_dir = scan_dir / "sumstats"
     if args.reuse_scan or args.sequential:
@@ -399,22 +752,8 @@ def main() -> int:
                 raise FileNotFoundError(sumstats_dir / "manifest.json")
         else:
             run_linear_gwas(
-                genotype=args.genotype,
-                genotype_format=args.genotype_format,
+                **scan_arguments(args),
                 phenotype=args.phenotype,
-                covariates=args.covariates,
-                sample_file=args.sample_file,
-                sample_ids=args.sample_ids,
-                bgen_decode_backend=args.bgen_decode_backend,
-                genotype_cache_dir=args.genotype_cache_dir,
-                device=args.device,
-                compute_dtype=args.compute_dtype,
-                chunk_size=args.chunk_size,
-                reader_workers=args.reader_workers,
-                zstd_read_workers=args.zstd_read_workers,
-                prefetch_chunks=args.prefetch_chunks,
-                variant_range=args.variant_range,
-                reduce="jagwas",
                 sumstats_fields="t",
                 output_dir=scan_dir,
             )
@@ -458,17 +797,11 @@ def main() -> int:
         n_samples = int(phenotype_shape[0])
         cache_dir = args.clump_cache or (args.output_dir / "clump-cache")
         cache_manifest, cache_seconds = ensure_clumping_cache(
-            args, maf_path, cache_dir
+            args, maf_path, cache_dir, n_samples
         )
-        full_variant_count = int(cache_manifest["n_variants"])
-        if args.variant_range is None:
-            variant_offset = 0
-            scan_variant_count = full_variant_count
-        else:
-            variant_offset, variant_end = args.variant_range
-            if variant_end > full_variant_count:
-                raise ValueError("variant range exceeds the clumping cache")
-            scan_variant_count = variant_end - variant_offset
+        variant_offset, scan_variant_count = scanned_span(
+            args.variant_range, int(cache_manifest["n_variants"])
+        )
         clumper = PipelinedClumper(
             cache_dir=cache_dir,
             output_dir=args.output_dir / "loci",
@@ -483,22 +816,8 @@ def main() -> int:
         scan_started = time.perf_counter()
         try:
             gwas_result = run_linear_gwas(
-                genotype=args.genotype,
-                genotype_format=args.genotype_format,
+                **scan_arguments(args),
                 phenotype=args.phenotype,
-                covariates=args.covariates,
-                sample_file=args.sample_file,
-                sample_ids=args.sample_ids,
-                bgen_decode_backend=args.bgen_decode_backend,
-                genotype_cache_dir=args.genotype_cache_dir,
-                device=args.device,
-                compute_dtype=args.compute_dtype,
-                chunk_size=args.chunk_size,
-                reader_workers=args.reader_workers,
-                zstd_read_workers=args.zstd_read_workers,
-                prefetch_chunks=args.prefetch_chunks,
-                variant_range=args.variant_range,
-                reduce="jagwas",
                 sumstats_format="none",
                 result_chunk_callback=clumper.consume,
                 jagwas_rank_callback=clumper.set_rank,

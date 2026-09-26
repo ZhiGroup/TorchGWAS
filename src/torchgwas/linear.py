@@ -1096,9 +1096,11 @@ def linear_scan_streaming_chunks(
     if already_processed:
         pheno_proc, q_matrix = phenotype, covariates
     else:
+        # JagwasGroups: each group residualised as a run of it alone would be.
         pheno_proc, q_matrix, phenotype_observed_counts = residualize_and_standardize(
             phenotype, covariates, device=torch_device,
-            return_observed_counts=True)
+            return_observed_counts=True,
+            column_groups=getattr(reduction, "column_groups", None))
     if already_processed:
         phenotype_observed_counts = np.full(
             pheno_proc.shape[1], pheno_proc.shape[0], dtype=np.int64)

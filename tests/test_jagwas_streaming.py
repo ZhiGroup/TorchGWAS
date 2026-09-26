@@ -5,7 +5,7 @@ sys.path.insert(0, "scripts")
 import numpy as np
 import pytest
 
-from jagwas_streaming import ClumpingPrep, build_clumping_cache, validate_clumping_cache
+from jagwas_streaming import ClumpingPrep, GroupedClumpers, build_clumping_cache, validate_clumping_cache
 
 
 def test_compact_cache_applies_only_static_clumping_filters(tmp_path):
@@ -61,3 +61,42 @@ def test_cache_validation_refuses_a_different_filter(tmp_path):
         validate_clumping_cache(
             cache, n_variants=1, maf_min=0.05, exclude_mhc=True
         )
+
+
+class _RecordingClumper:
+    def __init__(self, log, index):
+        self.log, self.index, self.rank = log, index, None
+
+    def set_rank(self, report):
+        self.rank = report
+
+    def consume(self, chunk):
+        self.log.append(("consume", self.index, chunk[0], chunk[1], np.asarray(chunk[3]).tolist()))
+
+    def close(self):
+        self.log.append(("close", self.index))
+
+    def collect(self, timeout):
+        self.log.append(("collect", self.index))
+        return {"ok": True, "index": self.index}
+
+    def abort(self):
+        self.log.append(("abort", self.index))
+
+
+def test_grouped_clumpers_route_columns_and_finish_every_group_together():
+    log = []
+    clumpers = GroupedClumpers([_RecordingClumper(log, 0), _RecordingClumper(log, 1)])
+    clumpers.set_rank([{"rank": 3}, {"rank": 5}])
+    assert [clumper.rank for clumper in clumpers.clumpers] == [{"rank": 3}, {"rank": 5}]
+    clumpers.consume((10, 12, None, np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)))
+    assert log == [("consume", 0, 10, 12, [1.0, 3.0]), ("consume", 1, 10, 12, [2.0, 4.0])]
+    log.clear()
+    reports = clumpers.finish()
+    # Every worker is told the scan is over before any is waited on.
+    assert log == [("close", 0), ("close", 1), ("collect", 0), ("collect", 1)]
+    assert [report["index"] for report, _done in reports] == [0, 1]
+    with pytest.raises(ValueError, match="expected 2 JAGWAS group reports"):
+        clumpers.set_rank([{"rank": 3}])
+    with pytest.raises(ValueError, match="expected 2 JAGWAS group columns"):
+        clumpers.consume((0, 1, None, np.zeros((1, 3))))

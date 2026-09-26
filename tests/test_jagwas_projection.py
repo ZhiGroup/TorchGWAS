@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from torchgwas.jagwas_projection import JagwasRankSelection, JagwasReduction, triangular_blocks
+from torchgwas.jagwas_projection import JagwasGroups, JagwasRankSelection, JagwasReduction, triangular_blocks
 
 U32 = 2.0 ** -24
 
@@ -275,6 +275,42 @@ def test_devices_share_one_kept_set():
         JagwasReduction().degrees_of_freedom
 
 
+def test_groups_match_separate_reductions():
+    independent, collinear = _panel(3000, 12, seed=3), _collinear_panel()
+    groups = JagwasGroups([('a', range(12)), ('b', range(12, 44))])
+    with pytest.warns(UserWarning, match='jagwas group b: 2 of 32 traits'):
+        groups.prepare(torch.cat([independent, collinear], dim=1))
+    alone_a, alone_b = JagwasReduction(), JagwasReduction()
+    alone_a.prepare(independent)
+    with pytest.warns(UserWarning, match='^jagwas: 2 of 32'):
+        alone_b.prepare(collinear)
+    t = torch.as_tensor(np.random.default_rng(5).standard_normal((64, 44)) * 3, dtype=torch.float32)
+    t[7, 20] = float('nan')  # invalidates group b only
+    beta, status = torch.zeros_like(t), torch.zeros(64, dtype=torch.uint8)
+    statistic = groups.reduce(beta, t, status, _df(64, 2998), groups.resolved_width(44))[1]
+    assert statistic.shape == (64, 2) and groups.degrees_of_freedom == [12, 30]
+    torch.testing.assert_close(statistic[:, 0], _reduce(alone_a, t[:, :12], 2998), rtol=1e-6, atol=0)
+    torch.testing.assert_close(statistic[:, 1], _reduce(alone_b, t[:, 12:], 2998), rtol=1e-6, atol=0,
+                               equal_nan=True)
+    assert torch.isfinite(statistic[7, 0]) and torch.isnan(statistic[7, 1])
+    names = [f'a{i}' for i in range(12)] + [f'b{i}' for i in range(32)]
+    report_a, report_b = groups.rank_report(names)
+    assert report_a['group'] == 'a' and report_a['rank'] == 12 and report_a['dropped'] == []
+    assert report_b == dict(group='b', **alone_b.rank_report(names[12:]))
+    spawned = groups.spawn()
+    assert all(mine._selection is theirs._selection for mine, theirs in zip(spawned.reductions, groups.reductions))
+    assert spawned.degrees_of_freedom == [12, 30]
+
+
+def test_groups_refuse_bad_definitions():
+    with pytest.raises(ValueError, match='unique'):
+        JagwasGroups([('a', [0]), ('a', [1])])
+    with pytest.raises(ValueError, match='distinct'):
+        JagwasGroups({'a': [0, 0]})
+    with pytest.raises(ValueError, match='outside the 3 scanned traits'):
+        JagwasGroups({'a': [0, 3]}).prepare(_panel(100, 3))
+
+
 
 
 # --- Public API (single device) --------------------------------------------
@@ -358,3 +394,49 @@ def test_rank_callback_reports_df_before_the_first_result_chunk(tmp_path):
         from torchgwas.api import run_linear_gwas
         run_linear_gwas(_ArrayStream(genotype), phenotype, reduce='significant', output_dir=tmp_path / 'bad',
                         device='cpu', jagwas_rank_callback=print)
+
+
+def test_api_groups_match_separate_scans(tmp_path):
+    from torchgwas.sumstats_indexed import open_indexed_sumstats
+    genotype, phenotype = _api_inputs(traits=6)
+    duplicated = np.column_stack([phenotype[:, 3:], phenotype[:, 4]])
+    reports = []
+    with pytest.warns(UserWarning, match='jagwas group b: 1 of 4 traits'):
+        result = _api_run(genotype, np.column_stack([phenotype[:, :3], duplicated]), tmp_path / 'grouped',
+                          jagwas_groups=[('a', [0, 1, 2]), ('b', [3, 4, 5, 6])], jagwas_rank_callback=reports.append)
+    _api_run(genotype, phenotype[:, :3], tmp_path / 'a')
+    with pytest.warns(UserWarning):
+        _api_run(genotype, duplicated, tmp_path / 'b')
+    manifest, parts = open_indexed_sumstats(tmp_path / 'grouped' / 'sumstats')
+    values = np.full((manifest['shape'][0], 2), np.nan)
+    for part in parts:
+        values[np.asarray(part['variant_index'])] = np.asarray(part['chi2'])
+    assert manifest['groups'] == ['a', 'b'] and manifest['df'] == [3, 3]
+    assert reports == [manifest['jagwas_rank']] and result.run_metadata['jagwas_groups'] == ['a', 'b']
+    rank_a, rank_b = manifest['jagwas_rank']
+    assert rank_a['group'] == 'a' and rank_a['rank'] == 3 and rank_b['rank'] == 3 and rank_b['traits'] == 4
+    assert [item['trait'] for item in rank_b['dropped']] in (['trait_4'], ['trait_6'])
+    for column, name in enumerate('ab'):
+        separate, alone = _api_statistic(tmp_path / name)
+        assert separate['df'] == 3
+        np.testing.assert_allclose(values[:, column], alone, rtol=1e-12, atol=0)
+
+
+def test_groups_are_residualised_as_if_alone():
+    from torchgwas.preprocess import residualize_and_standardize
+    rng = np.random.default_rng(3)
+    phenotype = rng.normal(size=(300, 9)).astype(np.float32)
+    covariates = rng.normal(size=(300, 4))
+    grouped, _ = residualize_and_standardize(phenotype, covariates, column_groups=[[0, 1, 2], [5, 6]])
+    for columns in ([0, 1, 2], [5, 6], [3, 4, 7, 8]):  # the last: columns in no group
+        alone, _ = residualize_and_standardize(phenotype[:, columns], covariates)
+        np.testing.assert_array_equal(grouped[:, columns], alone)
+
+
+def test_api_refuses_groups_without_jagwas(tmp_path):
+    from test_reduce_modes import _ArrayStream
+    from torchgwas.api import run_linear_gwas
+    genotype, phenotype = _api_inputs()
+    with pytest.raises(TypeError, match='jagwas_groups'):
+        run_linear_gwas(_ArrayStream(genotype), phenotype, reduce='significant', output_dir=tmp_path / 'bad',
+                        device='cpu', jagwas_groups={'a': [0, 1]})

@@ -470,9 +470,16 @@ class PipelinedClumper:
         )
 
     def finish(self, timeout: float = 900.0) -> dict:
+        self.close()
+        return self.collect(timeout)
+
+    def close(self):
+        """Tell the worker the scan is complete; its final clumping starts now."""
         self.control.put(None)
         self.control.close()
         self.control.join_thread()
+
+    def collect(self, timeout: float = 900.0) -> dict:
         try:
             report = self.done.get(timeout=timeout)
         except queue.Empty as error:
@@ -493,3 +500,39 @@ class PipelinedClumper:
             self.process.terminate()
         self.process.join()
         shutil.rmtree(self.scratch, ignore_errors=True)
+
+
+class GroupedClumpers:
+    """Feed column g of each grouped JAGWAS chunk (run_linear_gwas(jagwas_groups=...)) to clumper g.
+
+    Every group's worker overlaps the one scan; after it, all final clumping
+    stages run at once rather than one group after another.
+    """
+
+    def __init__(self, clumpers):
+        self.clumpers = list(clumpers)
+
+    def set_rank(self, reports):
+        """jagwas_rank_callback: one kept-trait report per group, in column order."""
+        if len(reports) != len(self.clumpers):
+            raise ValueError(f"expected {len(self.clumpers)} JAGWAS group reports, got {len(reports)}")
+        for clumper, report in zip(self.clumpers, reports):
+            clumper.set_rank(report)
+
+    def consume(self, chunk):
+        start, end = int(chunk[0]), int(chunk[1])
+        statistic = np.asarray(chunk[3], dtype=np.float64).reshape(end - start, -1)
+        if statistic.shape[1] != len(self.clumpers):
+            raise ValueError(f"expected {len(self.clumpers)} JAGWAS group columns, got {statistic.shape[1]}")
+        for column, clumper in enumerate(self.clumpers):
+            clumper.consume((start, end, None, statistic[:, column]))
+
+    def finish(self, timeout: float = 900.0) -> list[tuple[dict, float]]:
+        """Each group's report and the perf_counter time it was collected."""
+        for clumper in self.clumpers:
+            clumper.close()
+        return [(clumper.collect(timeout), time.perf_counter()) for clumper in self.clumpers]
+
+    def abort(self):
+        for clumper in self.clumpers:
+            clumper.abort()
