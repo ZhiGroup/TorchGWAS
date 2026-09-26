@@ -99,10 +99,12 @@ def projection_flops_per_variant(n_traits):
     return sum(2 * (end - start) * (n_traits - start) for start, end in triangular_blocks(n_traits))
 
 
-def projection_gemm_dimensions(n_traits, markers):
+def projection_gemm_dimensions(n_traits, markers, *, upper=True):
     """(inner, markers, width) per projection GEMM in execution order, as tensor_service.gemm_work takes them.
 
-    With the default eigen factor at k = K, block b writes (w_b x markers) rows
-    of the transposed product with inner K - s_b.
+    Block b writes (w_b x markers) rows of the transposed product: with the
+    default eigen factor at k = K (upper) its inner size is K - s_b, with the
+    rounding cutoff's L^-1 (upper=False) it is e_b.
     """
-    return [(n_traits - start, end - start, markers) for start, end in triangular_blocks(n_traits)]
+    return [((n_traits - start) if upper else end, end - start, markers)
+            for start, end in triangular_blocks(n_traits)]
