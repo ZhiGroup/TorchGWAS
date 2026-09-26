@@ -5,6 +5,33 @@ lab workflow wrapper. TorchGWAS performs the current joint-trait reduction
 (`reduce="jagwas"`); the wrapper converts its indexed chi-square output into the
 harmonized input consumed by the validated local FUMA-style clumper.
 
+## The joint statistic and its degrees of freedom
+
+`reduce="jagwas"` (`torchgwas.jagwas_projection.JagwasReduction`) computes
+T = z'R⁻¹z over the traits it keeps, chi-square on r degrees of freedom:
+
+- **z:** the score form, z = t / sqrt(1 + t²/df) = sqrt(df)·r. It is linear
+  in the phenotype, so a trait that is a linear combination of others adds
+  nothing to T. A quadratic form of t itself does not have that property.
+  On near-collinear panels it overstated strong hits by hundreds of chi-square
+  units.
+- **R:** the FP64 Gram matrix of the scanned (residualised, FP32) phenotype.
+- **Kept traits:** the longest greedy pivoted-Cholesky prefix meeting two
+  conditions:
+  - its estimated null rounding error in T, 2·u·sqrt(N)·sqrt(tr R_S⁻¹), is at
+    most `TORCHGWAS_JAGWAS_T_ROUNDING` (default 0.01);
+  - it stays within R's FP64 numerical rank.
+
+  Well-conditioned panels keep every trait. Collinear panels drop the
+  redundant ones with a warning.
+- **df = r:** the manifest's `df` is the kept count r, and `jagwas_rank`
+  records the dropped traits with their residual variance and VIF.
+
+The overlapped wrapper learns r through `run_linear_gwas(jagwas_rank_callback=...)`,
+which fires after the factor is prepared and before the first chunk. So
+p-values use r, never the column count. `pipeline.json` reports `jagwas_df` and
+`jagwas_rank`.
+
 ## Established discovery inputs
 
 The colleague workflow reads the original BGEN on the network drive:

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Run current TorchGWAS JAGWAS reduction and FUMA-style locus clumping.
 
-The scan writes one chi-square statistic per variant with K degrees of freedom.
+The scan writes one chi-square statistic per variant with r degrees of freedom,
+r the number of traits the JAGWAS rank cutoff keeps (K for a well-conditioned
+panel; see torchgwas.jagwas_projection).
 This wrapper converts that indexed output to the harmonized table expected by
 the lab's validated local-clumping implementation, then runs locus clumping.
 """
@@ -453,7 +455,7 @@ def main() -> int:
         ).shape
         if len(phenotype_shape) != 2:
             raise ValueError("phenotype must be a two-dimensional NumPy array")
-        n_samples, degrees_of_freedom = map(int, phenotype_shape)
+        n_samples = int(phenotype_shape[0])
         cache_dir = args.clump_cache or (args.output_dir / "clump-cache")
         cache_manifest, cache_seconds = ensure_clumping_cache(
             args, maf_path, cache_dir
@@ -472,7 +474,6 @@ def main() -> int:
             output_dir=args.output_dir / "loci",
             clumping_dir=args.clumping_dir,
             ld_dir=args.ld_dir,
-            degrees_of_freedom=degrees_of_freedom,
             n_samples=n_samples,
             n_variants=scan_variant_count,
             gwas_p=args.gwas_p,
@@ -500,6 +501,7 @@ def main() -> int:
                 reduce="jagwas",
                 sumstats_format="none",
                 result_chunk_callback=clumper.consume,
+                jagwas_rank_callback=clumper.set_rank,
                 output_dir=scan_dir,
             )
             observed_variant_count = int(
@@ -525,7 +527,8 @@ def main() -> int:
             "clump_cache_eligible_variants": int(
                 cache_manifest["eligible_variants"]
             ),
-            "jagwas_df": degrees_of_freedom,
+            "jagwas_df": clumper.degrees_of_freedom,
+            "jagwas_rank": clumper.rank_report,
             "jagwas_rows": int(pipeline_report["finite_jagwas_rows"]),
             "scanned_variants": scan_variant_count,
             "torchgwas_seconds": scan_done - scan_started,

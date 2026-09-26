@@ -11,7 +11,8 @@ from .tails import upper_tail_log10_from_t
 
 def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
                            *,kind,df,chi2_df=None,topk_per_trait=None,
-                           p_value_threshold=None,variant_metadata=None,fsync=True,store_beta=True):
+                           p_value_threshold=None,variant_metadata=None,fsync=True,store_beta=True,
+                           extra_manifest=None):
  directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
  parts=[];total=0;started=time.perf_counter()
  def emit(values):
@@ -59,7 +60,9 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
  np.save(directory/'variant_ids.npy',np.asarray(marker_names,dtype=str),allow_pickle=False)
  if variant_metadata is not None:
   np.savez(directory/'variant_metadata.npz',**{key:np.asarray(v,dtype=np.int64 if key=='position' else str) for key,v in variant_metadata.items()})
- manifest={'format':'torchgwas-indexed-sumstats','version':2,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':int(chi2_df if kind=='jagwas' else df),'traits':list(trait_names),'parts':parts,'rows':total,'variant_ids':'variant_ids.npy','significance':'chi-square tail derived from chi2 and df' if kind=='jagwas' else 'neg_log10_p is -log10 of the exact two-sided Student-t tail'}
+ manifest={'format':'torchgwas-indexed-sumstats','version':2,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':int((chi2_df() if callable(chi2_df) else chi2_df) if kind=='jagwas' else df),'traits':list(trait_names),'parts':parts,'rows':total,'variant_ids':'variant_ids.npy','significance':'chi-square tail derived from chi2 and df' if kind=='jagwas' else 'neg_log10_p is -log10 of the exact two-sided Student-t tail'}
+ if extra_manifest is not None:
+  manifest.update(extra_manifest() if callable(extra_manifest) else extra_manifest)
  (directory/'manifest.json').write_text(json.dumps(manifest,indent=2))
  return total,{'cells':total,'directory':str(directory),'indexed':True,'write_seconds':time.perf_counter()-started}
 

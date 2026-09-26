@@ -521,11 +521,17 @@ def run_linear_gwas(
     # per result chunk, before that chunk is drained or written. Consumers that
     # retain arrays must copy them because native scans reuse their host ring.
     result_chunk_callback=None,
+    # reduce='jagwas' only: called once with the kept-trait report (its 'rank'
+    # is the chi-square df) after the factor is prepared and before the first
+    # result chunk is delivered, so streaming consumers can convert T to P.
+    jagwas_rank_callback=None,
 ) -> GWASResult:
     if sumstats_format not in {"binary", "none"}:
         raise ValueError("sumstats_format must be 'binary' or 'none'; TSV output has been removed")
     if result_chunk_callback is not None and not callable(result_chunk_callback):
         raise TypeError("result_chunk_callback must be callable")
+    if jagwas_rank_callback is not None and (not callable(jagwas_rank_callback) or reduce != "jagwas"):
+        raise TypeError("jagwas_rank_callback must be callable and needs reduce='jagwas'")
     sumstats_summary: dict = {}
     requested_reader_workers = reader_workers
     requested_prefetch_chunks = prefetch_chunks
@@ -627,13 +633,14 @@ def run_linear_gwas(
                 "form over the whole trait correlation, so a block of traits "
                 "does not carry enough information to be merged")
         # Which makes jagwas feasible only while the WHOLE phenotype fits --
-        # it needs the full K-wide residualised matrix and a K x K correlation
-        # at once, and neither can be tiled. Say so here, with the arithmetic,
-        # rather than letting a voxel-scale K fail somewhere inside the scan:
-        # at K = 2,085,000 the correlation alone is 17 TB.
+        # it needs the full K-wide residualised matrix and, while factoring,
+        # four K x K FP64 matrices (correlation, Cholesky factor, identity and
+        # inverse factor) at once, and none can be tiled. Say so here, with
+        # the arithmetic, rather than letting a voxel-scale K fail inside the
+        # scan: at K = 2,085,000 the correlation alone is 35 TB.
         traits = int(np.asarray(phenotype).shape[1])
         samples = int(np.asarray(phenotype).shape[0])
-        correlation_bytes = traits * traits * 4
+        correlation_bytes = 4 * traits * traits * 8
         residual_bytes = samples * traits * 4
         try:
             import torch as _torch
@@ -645,8 +652,8 @@ def run_linear_gwas(
             budget = None
         if budget is not None and correlation_bytes + residual_bytes > budget:
             raise ValueError(
-                f"reduce='jagwas' needs the whole phenotype at once: a "
-                f"{traits} x {traits} trait correlation is "
+                f"reduce='jagwas' needs the whole phenotype at once: its "
+                f"{traits} x {traits} FP64 factor matrices are "
                 f"{correlation_bytes / 1e9:.1f} GB and the residualised "
                 f"phenotype is {residual_bytes / 1e9:.1f} GB, against "
                 f"{budget / 1e9:.1f} GB free on {device}. The statistic is a "
@@ -1090,6 +1097,20 @@ def run_linear_gwas(
                 chunk_iterator = _significant_pairs_iterator(
                     chunk_iterator, significance, len(trait_names),
                     residual_df)
+            if jagwas_rank_callback is not None:
+                def _with_rank_callback(source):
+                    # The factor (and so the kept rank) is prepared before the
+                    # first chunk exists; report it before anyone consumes one.
+                    reported = False
+                    for chunk in source:
+                        if not reported:
+                            jagwas_rank_callback(jagwas.rank_report(trait_names))
+                            reported = True
+                        yield chunk
+                    if not reported:
+                        jagwas_rank_callback(jagwas.rank_report(trait_names))
+
+                chunk_iterator = _with_rank_callback(chunk_iterator)
             if result_chunk_callback is not None:
                 def _with_result_callback(source):
                     for chunk in source:
@@ -1108,7 +1129,10 @@ def run_linear_gwas(
                 n_rows, sumstats_summary = write_indexed_sumstats(
                     out / "sumstats", marker_names, trait_names, genotype_shape[0], chunk_iterator,
                     kind=kind, df=residual_df,
-                    chi2_df=jagwas.degrees_of_freedom if jagwas is not None else None,
+                    # The kept rank is known once the factor is prepared, before the manifest.
+                    chi2_df=(lambda: jagwas.degrees_of_freedom) if jagwas is not None else None,
+                    extra_manifest=((lambda: dict(jagwas_rank=jagwas.rank_report(trait_names)))
+                                    if jagwas is not None else None),
                     p_value_threshold=p_value_threshold,
                     variant_metadata=variant_metadata,fsync=sumstats_fsync,
                     store_beta=sumstats_fields != "t")
@@ -1130,6 +1154,8 @@ def run_linear_gwas(
                     borrow_results=borrow_results,
                 )
             sumstats_summary["scan_and_write_seconds"] = time.perf_counter() - write_started
+            if jagwas is not None:
+                sumstats_summary["jagwas_rank"] = jagwas.rank_report(trait_names)
             table: list[dict] = []
             p_value = None
             beta = None

@@ -326,7 +326,7 @@ def _clumping_worker(control, done, config):
             item = control.get()
             if item is None:
                 break
-            start, end, path = item
+            start, end, path, degrees_of_freedom = item
             try:
                 statistic = np.load(path, allow_pickle=False)
             finally:
@@ -335,7 +335,7 @@ def _clumping_worker(control, done, config):
             rows = prep.rows(
                 int(start),
                 statistic,
-                degrees_of_freedom=config["degrees_of_freedom"],
+                degrees_of_freedom=degrees_of_freedom,
                 gwas_p=config["gwas_p"],
                 n_samples=config["n_samples"],
             )
@@ -405,12 +405,12 @@ class PipelinedClumper:
         output_dir: Path,
         clumping_dir: Path,
         ld_dir: Path,
-        degrees_of_freedom: int,
         n_samples: int,
         n_variants: int,
         gwas_p: float,
         lead_p: float,
         variant_offset: int = 0,
+        degrees_of_freedom: int | None = None,
     ):
         self.context = mp.get_context("fork")
         self.control = self.context.Queue()
@@ -420,12 +420,16 @@ class PipelinedClumper:
         self.counter = 0
         self.finite_rows = 0
         self.variant_offset = int(variant_offset)
+        # JAGWAS keeps the traits its rounding target allows, so the chi-square
+        # df is the kept rank reported by run_linear_gwas(jagwas_rank_callback=
+        # self.set_rank) once the factor is prepared, not the column count.
+        self.degrees_of_freedom = None if degrees_of_freedom is None else int(degrees_of_freedom)
+        self.rank_report = None
         config = {
             "cache_dir": str(cache_dir),
             "output_dir": str(output_dir),
             "clumping_dir": str(clumping_dir),
             "ld_dir": str(ld_dir),
-            "degrees_of_freedom": int(degrees_of_freedom),
             "n_samples": int(n_samples),
             "n_variants": int(n_variants),
             "gwas_p": float(gwas_p),
@@ -438,6 +442,11 @@ class PipelinedClumper:
         )
         self.process.start()
 
+    def set_rank(self, report):
+        """jagwas_rank_callback: adopt the kept rank as the chi-square df."""
+        self.rank_report = report
+        self.degrees_of_freedom = int(report["rank"])
+
     def consume(self, chunk):
         if not self.process.is_alive():
             try:
@@ -446,6 +455,8 @@ class PipelinedClumper:
                 report = None
             detail = "" if not report else "\n" + report.get("traceback", "")
             raise RuntimeError("clumping worker exited during the scan" + detail)
+        if self.degrees_of_freedom is None:
+            raise RuntimeError("JAGWAS degrees of freedom unknown: pass jagwas_rank_callback=clumper.set_rank")
         start, end = int(chunk[0]), int(chunk[1])
         statistic = np.asarray(chunk[3], dtype=np.float64).reshape(-1)
         if len(statistic) != end - start:
@@ -455,7 +466,7 @@ class PipelinedClumper:
         self.counter += 1
         np.save(path, statistic, allow_pickle=False)
         self.control.put(
-            (start + self.variant_offset, end + self.variant_offset, str(path))
+            (start + self.variant_offset, end + self.variant_offset, str(path), self.degrees_of_freedom)
         )
 
     def finish(self, timeout: float = 900.0) -> dict:

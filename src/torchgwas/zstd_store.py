@@ -485,6 +485,18 @@ class ZstdGenotype:
     its slice of the destination.
     """
 
+    @property
+    def chunk_alignment_variants(self) -> int:
+        """Variants per frame, the unit of decompression (as PlinkBedGenotype's hard-call store).
+
+        `read_into` decodes every frame a chunk touches; a frame cut by a chunk
+        boundary is decoded by both chunks, through a scratch buffer: decode
+        work 1 + (F - gcd(C, F)) / C per chunk's worth, 2.22x at C=2048 and 1.61x
+        at C=4096 on a 2,500-variant store, 1x at any multiple of F. The chunk
+        planner (linear.auto_chunk_variants) aligns to it.
+        """
+        return int(self.preferred_chunk_size)
+
     @contextlib.contextmanager
     def native_reader_session(self):
         """Yield `read_into(start, end, destination)` for the pinned loader.
