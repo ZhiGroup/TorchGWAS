@@ -35,6 +35,41 @@ def rounding_target_setting():
     return target
 
 
+def rcond_setting():
+    """Eigen truncation from TORCHGWAS_JAGWAS_RCOND; unset keeps the rounding cutoff.
+
+    Set, T keeps R's eigen-directions with eigenvalue above rcond x the largest
+    (numpy pinv's rule), always within the rounding target as well.
+    """
+    value = os.environ.get('TORCHGWAS_JAGWAS_RCOND')
+    return None if value in (None, '') else checked_rcond(float(value))
+
+
+def checked_rcond(rcond):
+    rcond = float(rcond)
+    if not 0.0 < rcond < 1.0:
+        raise ValueError('the jagwas rcond must be in (0, 1)')
+    return rcond
+
+
+def min_residual_setting():
+    """Trait-dropping threshold from TORCHGWAS_JAGWAS_MIN_RESIDUAL; unset keeps only the rounding cutoff.
+
+    Set, a trait is kept only while at least this fraction of its variance is
+    not explained by the traits kept before it in the greedy pivoted order
+    (its VIF given them at most 1 / min_residual).
+    """
+    value = os.environ.get('TORCHGWAS_JAGWAS_MIN_RESIDUAL')
+    return None if value in (None, '') else checked_min_residual(float(value))
+
+
+def checked_min_residual(fraction):
+    fraction = float(fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError('the jagwas min_residual must be in (0, 1)')
+    return fraction
+
+
 def projection_flops_per_variant(n_traits):
     """FP64 FLOPs one variant's projection issues (2 per multiply-add)."""
     return sum(2 * (end - start) * end for start, end in triangular_blocks(n_traits))

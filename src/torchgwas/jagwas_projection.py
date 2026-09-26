@@ -57,8 +57,10 @@ import warnings
 import numpy as np
 import torch
 
-from .jagwas_blocks import (gram_rows, projection_flops_per_variant,  # noqa: F401
-                            projection_gemm_dimensions, rounding_target_setting, triangular_blocks)
+from .jagwas_blocks import (checked_min_residual, checked_rcond, gram_rows,  # noqa: F401
+                            min_residual_setting, projection_flops_per_variant,
+                            projection_gemm_dimensions, rcond_setting, rounding_target_setting,
+                            triangular_blocks)
 
 _CUDA_LINALG_LOCK = threading.Lock()
 _CUDA_LINALG_READY = False
@@ -121,17 +123,28 @@ class JagwasReduction:
     mode = "jagwas"
     width = 1
 
-    def __init__(self, selection=None, name=None):
+    def __init__(self, selection=None, name=None, rcond=None, min_residual=None):
         self._inverse_cholesky = None
         self._n_traits = None
         self._selection = JagwasRankSelection() if selection is None else selection
         self._kept = None
         self._blocks = None
         self.name = name
+        # Traits are dropped by the rounding cutoff, and also, with min_residual,
+        # while less than that fraction of a trait's variance is its own. rcond
+        # instead drops eigen-directions (_eigen_factor).
+        if rcond is not None and min_residual is not None:
+            raise ValueError("pass rcond (drop eigen-directions) or min_residual (drop traits), not both")
+        self.rcond = checked_rcond(rcond) if rcond is not None else \
+            (None if min_residual is not None else rcond_setting())
+        self.min_residual = checked_min_residual(min_residual) if min_residual is not None else \
+            (None if self.rcond is not None else min_residual_setting())
+        if self.rcond is not None and self.min_residual is not None:
+            raise ValueError("TORCHGWAS_JAGWAS_RCOND and TORCHGWAS_JAGWAS_MIN_RESIDUAL are exclusive")
 
     def spawn(self):
         """A reduction for another device that shares this run's kept-trait decision."""
-        return type(self)(self._selection, self.name)
+        return type(self)(self._selection, self.name, self.rcond, self.min_residual)
 
     def resolved_width(self, n_traits: int) -> int:
         return 1
@@ -170,19 +183,30 @@ class JagwasReduction:
             correlation.addmm_(block.T, block)
         del block
         correlation /= float(samples)
+        if self.rcond is not None:
+            return self._eigen_factor(correlation, samples, traits, matrix.dtype)
         factor, info = torch.linalg.cholesky_ex(correlation)
         identity = torch.eye(traits, dtype=torch.float64, device=correlation.device)
         inverse = torch.linalg.solve_triangular(factor, identity, upper=False)
         # ||L^-1||_F^2 = tr R^-1, read with the Cholesky info in one transfer.
-        check = torch.stack((info.double(), torch.linalg.vector_norm(inverse)))
+        # With min_residual, also the largest VIF given all other traits,
+        # R_jj (R^-1)_jj = R_jj ||L^-1[:, j]||^2: a trait's share of its own
+        # variance given any subset is at least 1 / that.
+        checks = [info.double(), torch.linalg.vector_norm(inverse)]
+        if self.min_residual is not None:
+            checks.append((inverse.square().sum(dim=0) * torch.diagonal(correlation)).max())
+        check = torch.stack(checks)
         if check.device.type == 'meta':
             return self._set_factor(inverse)
-        failed, norm = check.tolist()
+        failed, norm, *largest_vif = check.tolist()
         precision, limit = self._selection.trace_limit(samples, traits, matrix.dtype)
         trace = norm * norm
-        if failed == 0 and math.isfinite(trace) and trace <= limit:
+        if (failed == 0 and math.isfinite(trace) and trace <= limit
+                and (not largest_vif or largest_vif[0] * self.min_residual <= 1.0)):
             record = dict(method='cholesky', traits=traits, rank=traits, kept=None, target=self._selection.target,
                           precision=precision, rounding_error=2.0 * precision * math.sqrt(trace), dropped=[])
+            if self.min_residual is not None:
+                record['min_residual'] = self.min_residual
         else:
             del factor, identity, inverse
             inverse = None
@@ -190,9 +214,11 @@ class JagwasReduction:
         agreed = self._selection.agree(record)
         if agreed is record and record['dropped']:
             label = "jagwas" if self.name is None else f"jagwas group {self.name}"
+            reason = (f"less than {self.min_residual:g} of each one's variance is its own"
+                      if record.get('bound') == 'min_residual' else
+                      f"keeping them would put the rounding error of T above {self._selection.target:g}")
             warnings.warn(f"{label}: {len(record['dropped'])} of {traits} traits are collinear with the others and "
-                          f"were dropped (keeping them would put the rounding error of T above "
-                          f"{self._selection.target:g}); the joint test has {record['rank']} degrees of freedom",
+                          f"were dropped ({reason}); the joint test has {record['rank']} degrees of freedom",
                           stacklevel=3)
         if agreed['kept'] is None and inverse is not None:
             return self._set_factor(inverse)
@@ -214,16 +240,74 @@ class JagwasReduction:
         prefix = np.cumsum(np.square(inverse).sum(axis=1))
         rank = max(1, int(np.searchsorted(prefix, limit, side='right')))
         order = pivots - 1
+        bound = 'rounding'
+        if self.min_residual is not None:
+            # Pivot i is trait order[i]'s variance left after the traits before
+            # it; the greedy order stops at the first below the threshold.
+            share = np.square(np.diag(lower)[:numerical_rank]) / diagonal[order[:numerical_rank]]
+            below = np.flatnonzero(share < self.min_residual)
+            by_share = int(below[0]) if len(below) else numerical_rank
+            if by_share < rank:
+                rank, bound = max(1, by_share), 'min_residual'
         # dpstrf completes columns 0..numerical_rank-1 of L, so the Schur
         # complement diagonal of a dropped trait is R_jj - ||L[j, :rank]||^2.
         residual = diagonal[order[rank:]] - np.square(lower[rank:, :rank]).sum(axis=1)
         dropped = sorted((int(index), float(value / diagonal[index])) for index, value in zip(order[rank:], residual))
-        return dict(method='pivoted_cholesky', traits=traits, rank=rank,
-                    kept=sorted(int(index) for index in order[:rank]), target=self._selection.target,
-                    precision=precision, rounding_error=2.0 * precision * math.sqrt(prefix[rank - 1]),
-                    # Exactly collinear traits have residual 0 up to rounding (either sign): VIF None.
-                    dropped=[dict(index=index, residual_variance=value,
-                                  vif=1.0 / value if value > 0 else None) for index, value in dropped])
+        record = dict(method='pivoted_cholesky', traits=traits, rank=rank,
+                      kept=sorted(int(index) for index in order[:rank]), target=self._selection.target,
+                      precision=precision, rounding_error=2.0 * precision * math.sqrt(prefix[rank - 1]),
+                      # Exactly collinear traits have residual 0 up to rounding (either sign): VIF None.
+                      dropped=[dict(index=index, residual_variance=value,
+                                    vif=1.0 / value if value > 0 else None) for index, value in dropped])
+        if self.min_residual is not None:
+            record.update(min_residual=self.min_residual, bound=bound)
+        return record
+
+    def _eigen_factor(self, correlation, samples, traits, dtype):
+        """Keep R's eigen-directions above rcond x the largest eigenvalue (numpy pinv's rule).
+
+        T = ||Lambda_k^-1/2 U_k' z||^2 over the k kept directions, chi-square on
+        k: the same statistic whatever basis the traits are expressed in, and a
+        kept subspace that rounding cannot reorder unless an eigenvalue sits
+        within rounding of the cutoff. The directions are also kept only while
+        the rounding target allows (the sum of 1/lambda over them plays tr R_S^-1).
+        One dense (k x K) projection replaces the triangular factor.
+        """
+        values, vectors = torch.linalg.eigh(correlation)
+        if values.device.type == 'meta':
+            return self._set_projection(vectors.T, traits)
+        spectrum = values.cpu().numpy()[::-1]  # descending
+        largest = float(spectrum[0])
+        if not largest > 0:
+            raise ValueError("no jagwas trait has nonzero variance")
+        precision, limit = self._selection.trace_limit(samples, traits, dtype)
+        above = int((spectrum > self.rcond * largest).sum())
+        positive = spectrum[spectrum > 0]
+        within = int(np.searchsorted(np.cumsum(1.0 / positive), limit, side='right'))
+        rank = max(1, min(above, within))
+        inverse_sum = float((1.0 / spectrum[:rank]).sum())
+        record = dict(method='eigen', traits=traits, rank=rank, kept=None, target=self._selection.target,
+                      precision=precision, rounding_error=2.0 * precision * math.sqrt(inverse_sum), dropped=[],
+                      rcond=self.rcond, bound='rcond' if above <= within else 'rounding',
+                      largest_eigenvalue=largest, smallest_kept_eigenvalue=float(spectrum[rank - 1]),
+                      largest_dropped_eigenvalue=float(spectrum[rank]) if rank < traits else None)
+        agreed = self._selection.agree(record)
+        rank = agreed['rank']
+        if agreed is record and rank < traits:
+            label = "jagwas" if self.name is None else f"jagwas group {self.name}"
+            warnings.warn(f"{label}: keeping {rank} of {traits} eigen-directions of the trait correlation "
+                          f"(eigenvalue above {self.rcond:g} x the largest); the joint test has {rank} "
+                          f"degrees of freedom", stacklevel=4)
+        # eigh is ascending: the kept directions are the last `rank` columns.
+        top_values, top_vectors = values[-rank:], vectors[:, -rank:]
+        return self._set_projection((top_vectors / top_values.sqrt()).T.contiguous(), traits)
+
+    def _set_projection(self, projection, traits):
+        """A dense (k x K) projection: one block over every trait column."""
+        self._inverse_cholesky = projection
+        self._n_traits = int(projection.shape[0])
+        self._blocks = [(0, self._n_traits, traits, projection)]
+        return self
 
     def _subset_factor(self, correlation, kept):
         """L^-1 of R[kept, kept] in input order, on this device."""
@@ -241,7 +325,8 @@ class JagwasReduction:
         """Adopt L^-1 and its row blocks, which are views: no second K x K copy on the device."""
         self._inverse_cholesky = inverse
         self._n_traits = int(inverse.shape[0])
-        self._blocks = [(start, end, inverse[start:end, :end]) for start, end in triangular_blocks(self._n_traits)]
+        self._blocks = [(start, end, end, inverse[start:end, :end])
+                        for start, end in triangular_blocks(self._n_traits)]
         return self
 
     @property
@@ -260,9 +345,7 @@ class JagwasReduction:
             return None
         dropped = [dict(item, trait=str(trait_names[item['index']])) if trait_names is not None else dict(item)
                    for item in record['dropped']]
-        return dict(method=record['method'], traits=record['traits'], rank=record['rank'],
-                    target=record['target'], precision=record['precision'],
-                    rounding_error=record['rounding_error'], dropped=dropped)
+        return dict({key: value for key, value in record.items() if key != 'kept'}, dropped=dropped)
 
     def host_buffers(self, chunk_size: int, width: int, pin_memory: bool = True):
         return (
@@ -295,11 +378,12 @@ class JagwasReduction:
         scores = scores.double()
         # (L^-1 z')[start:end] = L^-1[start:end, :end] z'[:end], written into
         # contiguous row blocks of one K x chunk buffer: one GEMM per block,
-        # then one square and one column sum (few launches per block).
+        # then one square and one column sum (few launches per block). The
+        # eigen projection is one block over every column.
         transposed = scores.T
         projected = torch.empty((self._n_traits, scores.shape[0]), dtype=scores.dtype, device=scores.device)
-        for start, end, rows in self._blocks:
-            torch.mm(rows, transposed[:end], out=projected[start:end])
+        for start, end, columns, rows in self._blocks:
+            torch.mm(rows, transposed[:columns], out=projected[start:end])
         statistic = projected.square_().sum(dim=0).unsqueeze(1)
         statistic = statistic.masked_fill((degenerate | (status != 0)).unsqueeze(1), float("nan"))
         return (torch.full_like(statistic, float("nan"), dtype=beta.dtype),
@@ -323,22 +407,38 @@ class JagwasGroups:
     an independent JagwasReduction (its own correlation, rank cutoff and
     factor) over its columns of the scanned panel. Groups may overlap.
     The result has one column per group, in order.
+
+    A group is (name, columns) or (name, columns, cutoff): cutoff is a dict of
+    JagwasReduction options (rcond or min_residual) or a bare rcond, and
+    replaces the defaults given here for that group.
     """
 
     mode = "jagwas"
 
-    def __init__(self, groups, reductions=None):
-        groups = list(groups.items()) if isinstance(groups, dict) else list(groups)
+    def __init__(self, groups, reductions=None, rcond=None, min_residual=None):
+        groups = [tuple(group) for group in (groups.items() if isinstance(groups, dict) else groups)]
         if not groups:
             raise ValueError("jagwas groups need at least one group")
-        self.names = [str(name) for name, _ in groups]
+        self.names = [str(group[0]) for group in groups]
         if len(set(self.names)) != len(self.names):
             raise ValueError("jagwas group names must be unique")
-        self.columns = [np.asarray(columns, dtype=np.int64).reshape(-1) for _, columns in groups]
+        self.columns = [np.asarray(group[1], dtype=np.int64).reshape(-1) for group in groups]
         for name, columns in zip(self.names, self.columns):
             if len(columns) == 0 or len(np.unique(columns)) != len(columns):
                 raise ValueError(f"jagwas group {name} needs distinct trait columns")
-        self.reductions = ([JagwasReduction(name=name) for name in self.names]
+        defaults = dict(rcond=rcond, min_residual=min_residual)
+        self.cutoffs = []
+        for group in groups:
+            cutoff = group[2] if len(group) > 2 else None
+            if cutoff is None or cutoff == {}:
+                cutoff = defaults
+            elif not isinstance(cutoff, dict):
+                cutoff = dict(rcond=cutoff)
+            unknown = set(cutoff) - set(defaults)
+            if unknown:
+                raise ValueError(f"jagwas group {group[0]}: unknown cutoff option(s) {sorted(unknown)}")
+            self.cutoffs.append(dict(dict.fromkeys(defaults), **cutoff))
+        self.reductions = ([JagwasReduction(name=name, **cutoff) for name, cutoff in zip(self.names, self.cutoffs)]
                            if reductions is None else list(reductions))
         self.width = len(groups)
 
@@ -351,7 +451,8 @@ class JagwasGroups:
 
     def spawn(self):
         """Groups for another device that share each group's kept-trait decision."""
-        return type(self)(list(zip(self.names, self.columns)), [reduction.spawn() for reduction in self.reductions])
+        return type(self)(list(zip(self.names, self.columns, self.cutoffs)),
+                          [reduction.spawn() for reduction in self.reductions])
 
     def resolved_width(self, n_traits: int) -> int:
         return self.width

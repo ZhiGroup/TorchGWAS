@@ -35,6 +35,30 @@ def test_group_panel_concatenates_and_names_traits(tmp_path):
         wrapper.group_panel([("f", tmp_path / "first.npy"), ("t", tmp_path / "short.npy")])
 
 
+def test_phenotype_outliers_flag_a_sample_extreme_in_any_panel(tmp_path):
+    rng = np.random.default_rng(2)
+    first, second = rng.standard_normal((400, 3)), rng.standard_normal((400, 2))
+    first[7, 1] = 40.0
+    second[123, 0] = -40.0
+    np.save(tmp_path / "first.npy", first)
+    np.save(tmp_path / "second.npy", second)
+    covariates = rng.standard_normal((400, 2))
+    np.save(tmp_path / "covariates.npy", covariates)
+    flagged = wrapper.phenotype_outliers(
+        [tmp_path / "first.npy", tmp_path / "second.npy"], tmp_path / "covariates.npy", 5.0
+    )
+    assert np.flatnonzero(flagged).tolist() == [7, 123]
+    assert wrapper.parse_group_rcond("g=1e-3") == ("g", 1e-3)
+    with pytest.raises(argparse.ArgumentTypeError):
+        wrapper.parse_group_rcond("g=2")
+
+
+def test_group_cutoffs_carry_each_groups_rule():
+    args = argparse.Namespace(group_rcond={"e": 1e-3}, group_min_residual={"t": 1e-2})
+    assert wrapper.group_cutoffs(args, [("e", [0, 1]), ("t", [2]), ("d", [3])]) == [
+        ("e", [0, 1], {"rcond": 1e-3}), ("t", [2], {"min_residual": 1e-2}), ("d", [3], None)]
+
+
 def test_harmonize_keeps_only_eligible_rows_in_position_order():
     marker = np.array(["rs1", "rs2", "id3", "rs4", "rs5", "rs6"])
     chromosome = np.array(["2", "1", "1", "1", "6", "1"])

@@ -302,6 +302,90 @@ def test_groups_match_separate_reductions():
     assert spawned.degrees_of_freedom == [12, 30]
 
 
+def test_eigen_truncation_matches_numpy_pinv():
+    panel = _collinear_panel()
+    p = panel.double().numpy()
+    correlation = p.T @ p / p.shape[0]
+    values = np.linalg.eigvalsh(correlation)
+    reduction = JagwasReduction(rcond=1e-3)
+    with pytest.warns(UserWarning, match='eigen-directions'):
+        reduction.prepare(panel)
+    rank = int((values > 1e-3 * values.max()).sum())
+    report = reduction.rank_report()
+    assert reduction.degrees_of_freedom == rank == report['rank'] < 32
+    assert report['method'] == 'eigen' and report['bound'] == 'rcond' and report['dropped'] == []
+    assert report['rcond'] == 1e-3 and report['largest_eigenvalue'] == pytest.approx(values.max())
+    t = torch.as_tensor(np.random.default_rng(8).standard_normal((64, 32)) * 3, dtype=torch.float32)
+    z = _score(t, _df(64, 2998)).double().numpy()
+    expected = np.einsum('ij,jk,ik->i', z, np.linalg.pinv(correlation, rcond=1e-3, hermitian=True), z)
+    np.testing.assert_allclose(_reduce(reduction, t, 2998).double().numpy(), expected, rtol=1e-5)
+
+
+def test_eigen_truncation_nests_and_stays_within_the_rounding_target():
+    rng = np.random.default_rng(12)
+    base = rng.standard_normal((3000, 30))
+    # One trait within 1e-4 of a combination of two others: an eigenvalue near 1e-8.
+    panel = _standardize(np.column_stack([base, base[:, 0] + base[:, 1] + 1e-4 * rng.standard_normal(3000)]))
+    t = torch.as_tensor(rng.standard_normal((64, 31)) * 3, dtype=torch.float32)
+    statistics = []
+    for rcond in (1e-1, 1e-2, 1e-3):
+        reduction = JagwasReduction(rcond=rcond)
+        reduction.prepare(panel)
+        statistics.append(_reduce(reduction, t, 2998).double())
+    # The same eigenvectors at every level, so a lower cutoff only adds directions.
+    assert all((later >= earlier * (1 - 1e-5)).all() for earlier, later in zip(statistics, statistics[1:]))
+    tiny = JagwasReduction(rcond=1e-15)
+    with pytest.warns(UserWarning, match='keeping 30 of 31'):
+        tiny.prepare(panel)
+    assert tiny.rank_report()['bound'] == 'rounding' and tiny.rank_report()['rounding_error'] <= 0.01
+
+
+def test_min_residual_drops_traits_mostly_explained_by_the_others():
+    rng = np.random.default_rng(21)
+    base = rng.standard_normal((3000, 30))
+    # About 0.0025 of trait 30's variance is its own given trait 0: VIF about 400.
+    panel = _standardize(np.column_stack([base, base[:, 0] + 0.05 * rng.standard_normal(3000)]))
+    loose = JagwasReduction(min_residual=1e-3)
+    loose.prepare(panel)
+    assert loose.degrees_of_freedom == 31 and loose.rank_report()['method'] == 'cholesky'
+    strict = JagwasReduction(min_residual=1e-2)
+    with pytest.warns(UserWarning, match='less than 0.01 of each'):
+        strict.prepare(panel)
+    report = strict.rank_report()
+    assert report['rank'] == 30 and report['bound'] == 'min_residual' and report['min_residual'] == 1e-2
+    (dropped,) = report['dropped']
+    assert dropped['index'] in (0, 30) and dropped['vif'] == pytest.approx(400, rel=0.15)
+    t = torch.as_tensor(rng.standard_normal((64, 31)) * 3, dtype=torch.float32)
+    kept = [index for index in range(31) if index != dropped['index']]
+    expected = _exact_quadratic_form(panel[:, kept], _score(t, _df(64, 2998))[:, kept])
+    torch.testing.assert_close(_reduce(strict, t, 2998).double(), expected, rtol=1e-5, atol=1e-4)
+    with pytest.raises(ValueError, match='not both'):
+        JagwasReduction(rcond=1e-3, min_residual=1e-2)
+    groups = JagwasGroups([('a', range(31), {'min_residual': 1e-2}), ('b', range(31), 1e-3)])
+    assert [(r.min_residual, r.rcond) for r in groups.reductions] == [(1e-2, None), (None, 1e-3)]
+    with pytest.raises(ValueError, match='unknown cutoff'):
+        JagwasGroups([('a', range(3), {'vif': 10})])
+
+
+def test_groups_take_their_own_cutoff():
+    panel = _collinear_panel()
+    groups = JagwasGroups([('rounding', range(32)), ('eigen', range(32), 1e-3)])
+    with pytest.warns(UserWarning):
+        groups.prepare(panel)
+    rounding, eigen = JagwasReduction(), JagwasReduction(rcond=1e-3)
+    with pytest.warns(UserWarning):
+        rounding.prepare(panel)
+        eigen.prepare(panel)
+    t = torch.as_tensor(np.random.default_rng(9).standard_normal((32, 32)) * 3, dtype=torch.float32)
+    statistic = groups.reduce(torch.zeros_like(t), t, torch.zeros(32, dtype=torch.uint8), _df(32, 2998), 2)[1]
+    torch.testing.assert_close(statistic[:, 0], _reduce(rounding, t, 2998), rtol=1e-6, atol=0)
+    torch.testing.assert_close(statistic[:, 1], _reduce(eigen, t, 2998), rtol=1e-6, atol=0)
+    assert [report['method'] for report in groups.rank_report()] == ['pivoted_cholesky', 'eigen']
+    assert groups.spawn().reductions[1].rcond == 1e-3
+    with pytest.raises(ValueError, match='rcond'):
+        JagwasReduction(rcond=1.5)
+
+
 def test_groups_refuse_bad_definitions():
     with pytest.raises(ValueError, match='unique'):
         JagwasGroups([('a', [0]), ('a', [1])])
@@ -431,6 +515,19 @@ def test_groups_are_residualised_as_if_alone():
     for columns in ([0, 1, 2], [5, 6], [3, 4, 7, 8]):  # the last: columns in no group
         alone, _ = residualize_and_standardize(phenotype[:, columns], covariates)
         np.testing.assert_array_equal(grouped[:, columns], alone)
+
+
+def test_api_eigen_truncation_ignores_a_duplicated_trait(tmp_path):
+    genotype, phenotype = _api_inputs()
+    _api_run(genotype, phenotype, tmp_path / 'independent')
+    with pytest.warns(UserWarning, match='keeping 5 of 6 eigen-directions'):
+        result = _api_run(genotype, np.column_stack([phenotype, phenotype[:, 2]]), tmp_path / 'eigen',
+                          jagwas_rcond=1e-3)
+    _, independent = _api_statistic(tmp_path / 'independent')
+    manifest, eigen = _api_statistic(tmp_path / 'eigen')
+    assert manifest['df'] == 5 and manifest['jagwas_rank']['method'] == 'eigen'
+    assert result.run_metadata['jagwas_rcond'] == 1e-3
+    np.testing.assert_allclose(eigen, independent, rtol=1e-8, atol=0)
 
 
 def test_api_refuses_groups_without_jagwas(tmp_path):

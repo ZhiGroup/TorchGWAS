@@ -529,7 +529,17 @@ def run_linear_gwas(
     # for one joint test per group from a single genotype pass (one chi2
     # column and one df per group; see jagwas_projection.JagwasGroups). The
     # rank callback and the manifest's jagwas_rank then carry one report per group.
+    # A group given as (name, columns, cutoff) sets its own cutoff: a dict with
+    # rcond or min_residual, or a bare rcond.
     jagwas_groups=None,
+    # reduce='jagwas' only, one or neither. rcond: eigen truncation, keeping R's
+    # eigen-directions above rcond x the largest eigenvalue. min_residual: drop
+    # traits while less than that fraction of a trait's variance is its own
+    # given the traits kept before it (VIF > 1 / min_residual). Both also stay
+    # within the rounding target, the only cutoff when neither is set.
+    # Defaults: TORCHGWAS_JAGWAS_RCOND, TORCHGWAS_JAGWAS_MIN_RESIDUAL.
+    jagwas_rcond: float | None = None,
+    jagwas_min_residual: float | None = None,
 ) -> GWASResult:
     if sumstats_format not in {"binary", "none"}:
         raise ValueError("sumstats_format must be 'binary' or 'none'; TSV output has been removed")
@@ -539,6 +549,8 @@ def run_linear_gwas(
         raise TypeError("jagwas_rank_callback must be callable and needs reduce='jagwas'")
     if jagwas_groups is not None and reduce != "jagwas":
         raise TypeError("jagwas_groups needs reduce='jagwas'")
+    if (jagwas_rcond is not None or jagwas_min_residual is not None) and reduce != "jagwas":
+        raise TypeError("jagwas_rcond and jagwas_min_residual need reduce='jagwas'")
     sumstats_summary: dict = {}
     requested_reader_workers = reader_workers
     requested_prefetch_chunks = prefetch_chunks
@@ -648,7 +660,9 @@ def run_linear_gwas(
         # Groups factor one at a time and keep each group's inverse factor.
         traits = int(np.asarray(phenotype).shape[1])
         samples = int(np.asarray(phenotype).shape[0])
-        jagwas = JagwasReduction() if jagwas_groups is None else JagwasGroups(jagwas_groups)
+        jagwas = (JagwasReduction(rcond=jagwas_rcond, min_residual=jagwas_min_residual)
+                  if jagwas_groups is None else
+                  JagwasGroups(jagwas_groups, rcond=jagwas_rcond, min_residual=jagwas_min_residual))
         sizes = [traits] if jagwas_groups is None else [len(columns) for columns in jagwas.columns]
         correlation_bytes = (sum(size * size for size in sizes) + 3 * max(sizes) ** 2) * 8
         residual_bytes = samples * traits * 4
@@ -1316,6 +1330,12 @@ def run_linear_gwas(
             else significance.resolved_threshold(len(trait_names))),
         "reduce_top_k": None if reduction is None else reduction.width,
         "jagwas_groups": None if jagwas_groups is None else jagwas.names,
+        "jagwas_rcond": (None if jagwas is None else
+                         jagwas.rcond if jagwas_groups is None
+                         else [reduction.rcond for reduction in jagwas.reductions]),
+        "jagwas_min_residual": (None if jagwas is None else
+                                jagwas.min_residual if jagwas_groups is None
+                                else [reduction.min_residual for reduction in jagwas.reductions]),
         # Recorded because it changes how many passes the run made over the
         # genotypes, which is the first thing to check against a wall time.
         "trait_block": None if trait_block is None else int(trait_block),

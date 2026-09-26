@@ -29,6 +29,7 @@ from scipy import special
 
 from torchgwas.api import run_linear_gwas
 from torchgwas.io import load_genotype
+from torchgwas.preprocess import residualize_and_standardize
 from torchgwas.sumstats_indexed import open_indexed_sumstats
 
 from jagwas_streaming import (
@@ -348,6 +349,10 @@ def common_report(args, maf_path: Path, phenotype: Path | None = None) -> dict:
         "sample_ids": None if args.sample_ids is None else str(args.sample_ids),
         "maf": str(maf_path),
         "variant_range": args.variant_range,
+        "jagwas_rcond": args.jagwas_rcond,
+        "jagwas_min_residual": args.jagwas_min_residual,
+        "phenotype_outlier_sd": args.phenotype_outlier_sd,
+        "excluded_samples": None if args.keep_rows is None else int((~args.keep_rows).sum()),
     }
 
 
@@ -382,6 +387,17 @@ def parse_phenotype_group(value: str) -> tuple[str, Path]:
     return name, Path(path)
 
 
+def parse_group_rcond(value: str) -> tuple[str, float]:
+    name, separator, text = value.partition("=")
+    try:
+        number = float(text)
+    except ValueError:
+        number = None
+    if not separator or number is None or not 0.0 < number < 1.0:
+        raise argparse.ArgumentTypeError("a group cutoff must be NAME=VALUE with 0 < VALUE < 1")
+    return name, number
+
+
 def group_panel(groups) -> tuple[np.ndarray, list[str], list[tuple[str, list[int]]]]:
     """The groups' phenotypes side by side, their trait names, and each group's columns.
 
@@ -413,14 +429,57 @@ def group_panel(groups) -> tuple[np.ndarray, list[str], list[tuple[str, list[int
     return np.concatenate(arrays, axis=1), names, columns
 
 
+def phenotype_outliers(paths, covariates_path, threshold: float) -> np.ndarray:
+    """Rows beyond `threshold` SD in any covariate-residualised, standardised trait of any panel.
+
+    reduce='jagwas' needs complete phenotypes, so an outlying value cannot be
+    masked on its own: its sample leaves the scan. On the colleague's collinear
+    panels these few samples (0.2-0.4% at 5 SD) carry the heavy tails of the
+    low-variance directions. Without them, the kurtosis of directions between
+    1e-3 and 1e-2 of the largest eigenvalue fell from 20-70 to 0.3-2.
+    """
+    covariates = None if covariates_path is None else np.load(covariates_path, allow_pickle=False)
+    flagged = None
+    for path in paths:
+        values = np.load(path, allow_pickle=False).astype(np.float64)
+        standardized, _ = residualize_and_standardize(values, covariates)
+        hit = (np.abs(standardized) > threshold).any(axis=1)
+        flagged = hit if flagged is None else flagged | hit
+    return flagged
+
+
+def group_cutoffs(args, columns):
+    """jagwas_groups entries, with a group's --group-rcond or --group-min-residual where given."""
+    entries = []
+    for name, group_columns in columns:
+        cutoff = {}
+        if name in args.group_rcond:
+            cutoff["rcond"] = args.group_rcond[name]
+        if name in args.group_min_residual:
+            cutoff["min_residual"] = args.group_min_residual[name]
+        entries.append((name, group_columns, cutoff or None))
+    return entries
+
+
+def kept_rows(args, array):
+    """Phenotype rows (or any per-sample array) after the outlier exclusion."""
+    return array if args.keep_rows is None else np.asarray(array)[args.keep_rows]
+
+
 def scan_arguments(args) -> dict:
     """run_linear_gwas arguments shared by every mode."""
+    covariates, sample_ids = args.covariates, args.sample_ids
+    if args.keep_rows is not None:
+        covariates = None if covariates is None else kept_rows(args, np.load(covariates, allow_pickle=False))
+        sample_ids = kept_rows(args, np.load(sample_ids, allow_pickle=False))
     return dict(
         genotype=args.genotype,
         genotype_format=args.genotype_format,
-        covariates=args.covariates,
+        covariates=covariates,
         sample_file=args.sample_file,
-        sample_ids=args.sample_ids,
+        sample_ids=sample_ids,
+        jagwas_rcond=args.jagwas_rcond,
+        jagwas_min_residual=args.jagwas_min_residual,
         bgen_decode_backend=args.bgen_decode_backend,
         genotype_cache_dir=args.genotype_cache_dir,
         device=args.device,
@@ -436,9 +495,10 @@ def scan_arguments(args) -> dict:
 
 def run_groups_overlapped(args, groups, maf_path: Path, started: float) -> dict:
     """One genotype pass for every group, with one overlapped clumping worker per group."""
-    n_samples = int(np.load(groups[0][1], mmap_mode="r", allow_pickle=False).shape[0])
+    all_samples = int(np.load(groups[0][1], mmap_mode="r", allow_pickle=False).shape[0])
+    n_samples = all_samples if args.keep_rows is None else int(args.keep_rows.sum())
     cache_dir = args.clump_cache or (args.output_dir / "clump-cache")
-    cache_manifest, cache_seconds = ensure_clumping_cache(args, maf_path, cache_dir, n_samples)
+    cache_manifest, cache_seconds = ensure_clumping_cache(args, maf_path, cache_dir, all_samples)
     variant_offset, scan_variant_count = scanned_span(
         args.variant_range, int(cache_manifest["n_variants"])
     )
@@ -469,9 +529,9 @@ def run_groups_overlapped(args, groups, maf_path: Path, started: float) -> dict:
         panel, trait_names, columns = group_panel(groups)
         gwas_result = run_linear_gwas(
             **scan_arguments(args),
-            phenotype=panel,
+            phenotype=kept_rows(args, panel),
             trait_columns=trait_names,
-            jagwas_groups=columns,
+            jagwas_groups=group_cutoffs(args, columns),
             sumstats_format="none",
             result_chunk_callback=clumpers.consume,
             jagwas_rank_callback=clumpers.set_rank,
@@ -545,9 +605,9 @@ def run_groups_sequential(args, groups, maf_path: Path, started: float) -> dict:
         panel, trait_names, columns = group_panel(groups)
         run_linear_gwas(
             **scan_arguments(args),
-            phenotype=panel,
+            phenotype=kept_rows(args, panel),
             trait_columns=trait_names,
-            jagwas_groups=columns,
+            jagwas_groups=group_cutoffs(args, columns),
             sumstats_fields="t",
             output_dir=args.output_dir / "torchgwas",
         )
@@ -655,6 +715,46 @@ def main() -> int:
         type=int,
         help="concurrent group clumping processes with --sequential/--reuse-scan (default min(8, groups))",
     )
+    parser.add_argument(
+        "--jagwas-rcond",
+        type=float,
+        help=(
+            "eigen truncation: keep the trait correlation's eigen-directions above "
+            "RCOND x the largest eigenvalue (default: the rounding cutoff over traits)"
+        ),
+    )
+    parser.add_argument(
+        "--group-rcond",
+        type=parse_group_rcond,
+        action="append",
+        default=[],
+        metavar="NAME=RCOND",
+        help="repeatable: one group's eigen truncation, overriding the global cutoff",
+    )
+    parser.add_argument(
+        "--jagwas-min-residual",
+        type=float,
+        help=(
+            "drop traits while less than this fraction of a trait's variance is its "
+            "own given the traits kept before it (VIF above 1/VALUE)"
+        ),
+    )
+    parser.add_argument(
+        "--group-min-residual",
+        type=parse_group_rcond,
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="repeatable: one group's trait-dropping threshold, overriding the global cutoff",
+    )
+    parser.add_argument(
+        "--phenotype-outlier-sd",
+        type=float,
+        help=(
+            "exclude samples beyond this many SD in any covariate-residualised trait "
+            "(of any group); needs --sample-ids"
+        ),
+    )
     parser.add_argument("--covariates", type=Path)
     parser.add_argument("--maf", type=Path, help="aligned .npy, or .npz containing 'maf'")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -702,6 +802,29 @@ def main() -> int:
             parser.error("phenotype group names must be unique")
     if args.clump_workers is not None and args.clump_workers < 1:
         parser.error("clump-workers must be positive")
+    for option in ("jagwas_rcond", "jagwas_min_residual"):
+        value = getattr(args, option)
+        if value is not None and not 0.0 < value < 1.0:
+            parser.error(f"{option.replace('_', '-')} must be in (0, 1)")
+    if args.jagwas_rcond is not None and args.jagwas_min_residual is not None:
+        parser.error("pass --jagwas-rcond or --jagwas-min-residual, not both")
+    groups = {name for name, _path in args.phenotype_group or ()}
+    for option in ("group_rcond", "group_min_residual"):
+        entries = dict(getattr(args, option))
+        if len(entries) != len(getattr(args, option)):
+            parser.error(f"each group takes one --{option.replace('_', '-')}")
+        if set(entries) - groups:
+            parser.error(f"--{option.replace('_', '-')} names no --phenotype-group: {sorted(set(entries) - groups)}")
+        setattr(args, option, entries)
+    if set(args.group_rcond) & set(args.group_min_residual):
+        parser.error("a group takes --group-rcond or --group-min-residual, not both")
+    if args.phenotype_outlier_sd is not None:
+        if not args.phenotype_outlier_sd > 0:
+            parser.error("phenotype-outlier-sd must be positive")
+        if args.sample_ids is None:
+            parser.error("phenotype-outlier-sd needs --sample-ids, to drop the same samples from the genotypes")
+        if args.reuse_scan:
+            parser.error("phenotype-outlier-sd changes the scan; it cannot apply to --reuse-scan")
     default_maf = Path(f"{args.genotype}.maf.npy")
     maf_path = args.maf or default_maf
     if args.genotype_format in {"auto", "zstd"} and not args.genotype.exists():
@@ -734,6 +857,17 @@ def main() -> int:
             raise FileNotFoundError(path)
 
     started = time.perf_counter()
+    args.keep_rows = None
+    if args.phenotype_outlier_sd is not None:
+        flagged = phenotype_outliers(phenotype_paths, args.covariates, args.phenotype_outlier_sd)
+        args.keep_rows = ~flagged
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        excluded = np.load(args.sample_ids, allow_pickle=False)[flagged]
+        (args.output_dir / "excluded_samples.txt").write_text(
+            "".join(f"{sample}\n" for sample in excluded)
+        )
+        print(f"excluding {int(flagged.sum())} of {len(flagged)} samples beyond "
+              f"{args.phenotype_outlier_sd:g} SD in some trait", flush=True)
     if args.phenotype_group is not None:
         run = (
             run_groups_sequential
@@ -753,7 +887,8 @@ def main() -> int:
         else:
             run_linear_gwas(
                 **scan_arguments(args),
-                phenotype=args.phenotype,
+                phenotype=(args.phenotype if args.keep_rows is None
+                           else kept_rows(args, np.load(args.phenotype, allow_pickle=False))),
                 sumstats_fields="t",
                 output_dir=scan_dir,
             )
@@ -794,10 +929,11 @@ def main() -> int:
         ).shape
         if len(phenotype_shape) != 2:
             raise ValueError("phenotype must be a two-dimensional NumPy array")
-        n_samples = int(phenotype_shape[0])
+        all_samples = int(phenotype_shape[0])
+        n_samples = all_samples if args.keep_rows is None else int(args.keep_rows.sum())
         cache_dir = args.clump_cache or (args.output_dir / "clump-cache")
         cache_manifest, cache_seconds = ensure_clumping_cache(
-            args, maf_path, cache_dir, n_samples
+            args, maf_path, cache_dir, all_samples
         )
         variant_offset, scan_variant_count = scanned_span(
             args.variant_range, int(cache_manifest["n_variants"])
@@ -817,7 +953,8 @@ def main() -> int:
         try:
             gwas_result = run_linear_gwas(
                 **scan_arguments(args),
-                phenotype=args.phenotype,
+                phenotype=(args.phenotype if args.keep_rows is None
+                           else kept_rows(args, np.load(args.phenotype, allow_pickle=False))),
                 sumstats_format="none",
                 result_chunk_callback=clumper.consume,
                 jagwas_rank_callback=clumper.set_rank,
