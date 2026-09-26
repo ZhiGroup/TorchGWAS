@@ -530,6 +530,20 @@ def test_api_eigen_truncation_ignores_a_duplicated_trait(tmp_path):
     np.testing.assert_allclose(eigen, independent, rtol=1e-8, atol=0)
 
 
+def test_api_jagwas_takes_missing_phenotype_rows(tmp_path):
+    from torchgwas.preprocess import residualize_and_standardize
+    genotype, phenotype = _api_inputs()
+    masked = phenotype.copy()
+    masked[[3, 50, 200]] = np.nan  # whole rows, as the pipeline drops an outlier's phenotype
+    _api_run(genotype, masked, tmp_path / 'masked')
+    manifest, values = _api_statistic(tmp_path / 'masked')
+    # The scan regresses the mean-imputed panel; its R is that panel's Gram, so
+    # the reference is the ordinary score statistic of the imputed panel.
+    imputed, _ = residualize_and_standardize(masked, None)
+    assert manifest['df'] == 5
+    np.testing.assert_allclose(values, _score_reference(genotype, imputed), rtol=1e-6, atol=1e-9)
+
+
 def test_api_refuses_groups_without_jagwas(tmp_path):
     from test_reduce_modes import _ArrayStream
     from torchgwas.api import run_linear_gwas

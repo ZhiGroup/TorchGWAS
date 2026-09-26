@@ -32,6 +32,54 @@ which fires after the factor is prepared and before the first chunk. So
 p-values use r, never the column count. `pipeline.json` reports `jagwas_df` and
 `jagwas_rank`.
 
+## Standard QC in the wrapper
+
+`run_jagwas_clumping.py` applies two steps to every new scan by default:
+
+- **Phenotype outlier rows (`--phenotype-outlier-sd 5`):** for each phenotype
+  panel (or each `--phenotype-group`), residualize every trait on the
+  covariates and standardize it. Any sample beyond 5 SD in any trait of that
+  panel has its whole row for that panel set to missing.
+  - TorchGWAS's phenotype-missingness path mean-imputes those rows. The
+    genotype and every other group keep the sample, so there is no union of
+    exclusions across groups.
+  - `OUTPUT_DIR[/NAME]/excluded_samples.txt` lists the samples, and
+    `pipeline.json` reports `excluded_samples`.
+- **Trait dropping at VIF > 100 (`--jagwas-min-residual 0.01`):** a trait is
+  kept only while at least 1% of its variance is its own, given the traits kept
+  before it in the greedy pivoted order. The rounding cutoff still applies on
+  top.
+
+Pass `0` to either option to switch it off. `--jagwas-rcond` replaces the trait
+threshold with eigen truncation. `--reuse-scan` applies neither step, because it
+reuses a scan made with its own settings.
+
+Why these are the defaults: the colleague's collinear imaging panels
+(fourier_PE_* and graphunet) looked inflated. They had 662–1,198 loci and hits
+down to P ≈ 1e-1155, against 110–240 loci in the reference JAGWAS.
+
+- **Cause: outlier samples.** About 60–140 samples per panel carry many traits
+  beyond 5 SD, likely failed image processing. They made the panels'
+  low-variance directions heavy-tailed, with median kurtosis 100–1,400. Removing
+  their rows made those directions Gaussian.
+- **The whole row goes, not the one value.** The traits are near-linear
+  combinations of one another, so masking or clipping only the extreme value
+  breaks those relations for the sample. Doing that made the low-variance
+  directions heavier-tailed still.
+- **The raised trait cutoff removes most isolated hits that remain.** In a
+  test run that removed the outlier samples from the scan, the rounding cutoff
+  still left 94–257 isolated hits per panel (P < 5e-8 with no neighbour at
+  P < 1e-5 within 100 kb). VIF ≤ 100 left 18–56, fewer than the reference's
+  56–196.
+- **Result with the standard defaults:** in one pass over all 22 groups, the
+  five collinear panels gave 121–175 loci, top −log10 P of 79–135, and 1–3% of
+  loci resting on a single SNP. The reference has 110–240 loci and top
+  −log10 P of 59–131.
+- **Full-rank panels barely move:** CNN went from 801 to 798 loci, and the
+  mesh and nceq panels changed by up to about 40 loci each.
+- **Library default unchanged:** TorchGWAS's own default (`run_linear_gwas`
+  without `jagwas_min_residual`) is still the rounding cutoff alone.
+
 ## Established discovery inputs
 
 The colleague workflow reads the original BGEN on the network drive:
@@ -149,10 +197,24 @@ Groups on the same samples and covariates can share that pass. Replace
 - **Trait names:** a `NAME.traits.txt` sidecar next to the `.npy`, one name
   per line, names the traits in the rank reports.
 
-**Measured:** all 22 of the colleague's groups (2,655 traits) finished in 497 s
-from one pass: a 447 s scan, then 31 s for the last group's clumping. That was
-on an H100 shared with another user's training job at 99% utilization. The
-same 22 groups as separate runs had taken the colleague 27,076 s of run time.
+**Measured on the H100 host:** all 22 of the colleague's groups (2,655 traits),
+with the standard QC, took 4 min 53 s of wall time for the whole command.
+
+| phase | time |
+|---|---|
+| imports | about 16 s |
+| reading the 22 panels in parallel, plus the outlier screen | 11 s |
+| the one genotype scan | 253 s |
+| clumping after the scan | 13 s |
+
+- **Scan time varies:** across runs, the scan took 191–465 s, depending on how
+  much of the BGEN the busy host still had cached. The GPU was shared with
+  another user's training job at 99% utilization.
+- **Before:** the same groups as separate runs had taken the colleague
+  27,076 s of run time. A single group takes about 11 minutes from a cold file.
+- **Read each panel once:** reading every panel twice, one file after another,
+  had cost 266 s of startup on that host. It is now read once, 8 at a time, with
+  byte-identical results.
 
 A grouped run matches separate runs:
 

@@ -1124,14 +1124,21 @@ def linear_scan_streaming_chunks(
     if np.any(trait_df <= 0):
         raise ValueError("non-positive phenotype-specific residual degrees of freedom")
     phenotype_has_missing = bool(np.any(phenotype_observed_counts != n_samples))
-    if phenotype_has_missing and reduction is not None:
+    # JAGWAS takes the mean-imputed panel's t with the scan's common df as it
+    # is: z = t / sqrt(1 + t^2/df) = sqrt(df) r, whose null correlation is the
+    # Gram of that same panel, i.e. its R, unit diagonal included. Rescaling t
+    # by sqrt(trait_df / df), as full output does, would leave z a null
+    # variance of trait_df / df against R's 1. Other reductions need
+    # pair-specific df and still refuse missingness.
+    jagwas_missing = phenotype_has_missing and getattr(reduction, "mode", None) == "jagwas"
+    if phenotype_has_missing and reduction is not None and not jagwas_missing:
         raise ValueError(
-            "phenotype missingness is supported in full mode; trait reductions "
-            "need pair-specific df and are not yet supported")
+            "phenotype missingness is supported in full mode and for jagwas; other trait "
+            "reductions need pair-specific df and are not yet supported")
     trait_scale = np.sqrt(trait_df / float(df)).astype(np.float32)
 
     def apply_phenotype_missingness(iterator):
-        if not phenotype_has_missing:
+        if not phenotype_has_missing or reduction is not None:
             yield from iterator
             return
         for chunk_result in iterator:

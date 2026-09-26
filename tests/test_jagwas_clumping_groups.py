@@ -35,7 +35,7 @@ def test_group_panel_concatenates_and_names_traits(tmp_path):
         wrapper.group_panel([("f", tmp_path / "first.npy"), ("t", tmp_path / "short.npy")])
 
 
-def test_phenotype_outliers_flag_a_sample_extreme_in_any_panel(tmp_path):
+def test_each_panel_drops_only_its_own_outlier_rows(tmp_path):
     rng = np.random.default_rng(2)
     first, second = rng.standard_normal((400, 3)), rng.standard_normal((400, 2))
     first[7, 1] = 40.0
@@ -43,14 +43,43 @@ def test_phenotype_outliers_flag_a_sample_extreme_in_any_panel(tmp_path):
     np.save(tmp_path / "first.npy", first)
     np.save(tmp_path / "second.npy", second)
     covariates = rng.standard_normal((400, 2))
-    np.save(tmp_path / "covariates.npy", covariates)
-    flagged = wrapper.phenotype_outliers(
-        [tmp_path / "first.npy", tmp_path / "second.npy"], tmp_path / "covariates.npy", 5.0
-    )
-    assert np.flatnonzero(flagged).tolist() == [7, 123]
+    groups = [("f", tmp_path / "first.npy"), ("s", tmp_path / "second.npy")]
+    panels = wrapper.load_panels([path for _name, path in groups])
+    args = argparse.Namespace(panels=panels, outlier_rows={
+        name: wrapper.phenotype_outliers(panels[path], covariates, 5.0) for name, path in groups})
+    assert [np.flatnonzero(args.outlier_rows[name]).tolist() for name in "fs"] == [[7], [123]]
+    panel, _names, columns = wrapper.masked_panel(args, groups)
+    # A group's whole row goes, in its own columns only; the other group keeps the sample.
+    assert np.isnan(panel[7, :3]).all() and np.isfinite(panel[7, 3:]).all()
+    assert np.isnan(panel[123, 3:]).all() and np.isfinite(panel[123, :3]).all()
+    assert int(np.isnan(panel).sum()) == 3 + 2
     assert wrapper.parse_group_rcond("g=1e-3") == ("g", 1e-3)
     with pytest.raises(argparse.ArgumentTypeError):
         wrapper.parse_group_rcond("g=2")
+
+
+def _options(**changes):
+    values = dict(phenotype_outlier_sd=None, jagwas_min_residual=None, jagwas_rcond=None, reuse_scan=False)
+    return argparse.Namespace(**dict(values, **changes))
+
+
+def test_the_pipeline_defaults_to_outlier_rows_and_vif_100():
+    args = _options()
+    wrapper.resolve_defaults(args)
+    assert (args.phenotype_outlier_sd, args.jagwas_min_residual) == (5.0, 1e-2)
+    off = _options(phenotype_outlier_sd=0.0, jagwas_min_residual=0.0)
+    wrapper.resolve_defaults(off)
+    assert (off.phenotype_outlier_sd, off.jagwas_min_residual) == (None, None)
+    eigen = _options(jagwas_rcond=1e-3)
+    wrapper.resolve_defaults(eigen)
+    assert eigen.jagwas_min_residual is None
+    reuse = _options(reuse_scan=True)
+    wrapper.resolve_defaults(reuse)
+    assert (reuse.phenotype_outlier_sd, reuse.jagwas_min_residual) == (None, None)
+    for bad in (_options(reuse_scan=True, phenotype_outlier_sd=4.0), _options(jagwas_min_residual=2.0),
+                _options(jagwas_rcond=1e-3, jagwas_min_residual=1e-2)):
+        with pytest.raises(ValueError):
+            wrapper.resolve_defaults(bad)
 
 
 def test_group_cutoffs_carry_each_groups_rule():
