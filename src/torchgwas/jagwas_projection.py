@@ -1,7 +1,7 @@
-"""JAGWAS: score statistic, FP64 correlation, rank cutoff from a rounding target, block-triangular projection.
+"""JAGWAS: score statistic, FP64 correlation, eigen truncation (or a rank cutoff), block-triangular projection.
 
-One joint statistic per variant, T = z' R^-1 z over the kept traits, chi-square
-on r (the kept count) degrees of freedom. reduce.JagwasReduction is this class.
+One joint statistic per variant, T = z' R^+ z over the kept eigen-directions
+(or traits), chi-square on r (the kept count) degrees of freedom. reduce.JagwasReduction is this class.
 
 Statistic. z_j = sqrt(df) r_j, computed from the scan's t as z = t / sqrt(1 +
 t^2 / df) (r = t / sqrt(df + t^2)). z is linear in the phenotype, so a trait
@@ -19,30 +19,43 @@ blocks from the FP32 values (2 N K^2 FP64 FLOPs once per device). An FP32
 Gram rounds each entry by ~2.4e-7, which on near-singular real panels (cond
 5e7..1e9) moved T by up to 37% (benchmarks/jagwas_rank_error_20260925.py).
 
-Cutoff. With R exact, what a small pivot amplifies is only the rounding of z.
-To first order, under the null the rms rounding error of T over a trait set S
-is 2 eps_z sqrt(tr R_S^-1) (tr R_S^-1 = sum of the VIFs), with eps_z = u
-sqrt(N) the random-rounding bound on each z (u the scan dtype's unit
-roundoff; measured on H100, A100 and 2080 Ti at 0.1-0.2 of it). The kept set
-is the longest prefix of the greedy pivoted-Cholesky order whose error stays
-within a target, TORCHGWAS_JAGWAS_T_ROUNDING (default 0.01, about 0.002 in
--log10 p), and never beyond R's FP64 numerical rank (a pivot at or below
-K eps64 max diag R is zero: with FP64 statistics an exactly collinear trait
-would otherwise pass the rounding target and add a degree of freedom that
-carries no chi-square). tr R_S^-1 does not depend on the order, so a panel whose full set
-meets the target keeps its unpivoted factor: the check is ||L^-1||_F, one
-reduction and one read of two device scalars (Cholesky info, the norm).
-Otherwise host LAPACK dpstrf (its FP64 numerical-rank default) orders the
-traits; the leading block of L^-1 is the inverse of the leading block of L, so
-every prefix's trace is a cumulative row sum. On the 22 real 35k-sample panels
-it keeps every trait of the 17 well-conditioned ones and 76-99 of the five
-near-singular ones, each at an estimated error just under 0.01; dropping traits
-there carried no measurable signal (jagwas_rounding_cutoff_panels_20260926.py).
-Variant shards share one JagwasRankSelection, so every device keeps the same
-traits.
+Cutoff (default): eigen truncation. With R = U Lambda U', T keeps the
+eigen-directions with eigenvalue above rcond x the largest (numpy pinv's rule;
+TORCHGWAS_JAGWAS_RCOND, default 1e-3, the reference JAGWAS pipeline's value),
+and never more than the rounding target below allows (the sum of 1/lambda over
+the kept directions plays tr R_S^-1). df is the kept count. Why not drop
+traits: on collinear imaging panels a one-ulp FP32 perturbation of the
+phenotype (what another device or kernel rounds differently) changed which
+traits greedy pivoting kept, df by 1-2 and T by up to 7% at the rounding
+cutoff and 12% at VIF <= 100, because those panels hold near-exact ties; the
+eigen-directions above 1e-3 kept the same df and T within 1e-7. The directions
+below it were also where a few outlier samples made the panels heavy-tailed.
 
-Projection. L^-1 is lower triangular, so (L^-1 z')[b] = L^-1[b, :end_b] z'[:end_b]:
-one GEMM per row block, about (B+1)/(2B) of the dense work.
+Rounding cutoff (rcond=0 or TORCHGWAS_JAGWAS_RCOND=0). With R exact, what a
+small pivot amplifies is only the rounding of z. To first order, under the
+null the rms rounding error of T over a trait set S is 2 eps_z sqrt(tr R_S^-1)
+(tr R_S^-1 = sum of the VIFs), with eps_z = u sqrt(N) the random-rounding bound
+on each z (u the scan dtype's unit roundoff; measured on H100, A100 and 2080 Ti
+at 0.1-0.2 of it). The kept set is the longest prefix of the greedy
+pivoted-Cholesky order whose error stays within a target,
+TORCHGWAS_JAGWAS_T_ROUNDING (default 0.01, about 0.002 in -log10 p), and never
+beyond R's FP64 numerical rank (a pivot at or below K eps64 max diag R is zero:
+with FP64 statistics an exactly collinear trait would otherwise pass the
+rounding target and add a degree of freedom that carries no chi-square).
+tr R_S^-1 does not depend on the order, so a panel whose full set meets the
+target keeps its unpivoted factor: the check is ||L^-1||_F, one reduction and
+one read of two device scalars (Cholesky info, the norm). Otherwise host LAPACK
+dpstrf (its FP64 numerical-rank default) orders the traits; the leading block
+of L^-1 is the inverse of the leading block of L, so every prefix's trace is a
+cumulative row sum. min_residual (TORCHGWAS_JAGWAS_MIN_RESIDUAL) also stops the
+prefix at the first trait with less than that share of its variance its own.
+Variant shards share one JagwasRankSelection, so every device keeps the same
+count (and, here, the same traits).
+
+Projection. Both factors are cut into row blocks, one GEMM each: the eigen
+R (from Lambda_k^-1/2 U_k' = Q R) is upper trapezoidal, block [s, e) using
+columns [s, K); L^-1 is lower triangular, block [s, e) using [0, e). Either is
+about (B+1)/(2B) of the dense work.
 
 Groups. JagwasGroups runs one such test per trait group from a single scan of
 the groups' concatenated panel, so G panels on the same samples and
@@ -57,10 +70,9 @@ import warnings
 import numpy as np
 import torch
 
-from .jagwas_blocks import (checked_min_residual, checked_rcond, gram_rows,  # noqa: F401
-                            min_residual_setting, projection_flops_per_variant,
-                            projection_gemm_dimensions, rcond_setting, rounding_target_setting,
-                            triangular_blocks)
+from .jagwas_blocks import (checked_min_residual, checked_rcond, cutoff_settings, gram_rows,  # noqa: F401
+                            projection_flops_per_variant, projection_gemm_dimensions,
+                            rounding_target_setting, triangular_blocks)
 
 _CUDA_LINALG_LOCK = threading.Lock()
 _CUDA_LINALG_READY = False
@@ -118,7 +130,7 @@ class JagwasRankSelection:
 
 
 class JagwasReduction:
-    """The joint test over the traits the rounding target keeps."""
+    """The joint test over the eigen-directions (default) or traits the cutoff keeps."""
 
     mode = "jagwas"
     width = 1
@@ -130,21 +142,24 @@ class JagwasReduction:
         self._kept = None
         self._blocks = None
         self.name = name
-        # Traits are dropped by the rounding cutoff, and also, with min_residual,
-        # while less than that fraction of a trait's variance is its own. rcond
-        # instead drops eigen-directions (_eigen_factor).
-        if rcond is not None and min_residual is not None:
+        # rcond (default 1e-3) drops eigen-directions (_eigen_factor); rcond=0
+        # selects the rounding cutoff over traits, which min_residual extends
+        # (drop a trait while less than that fraction of its variance is its own).
+        if rcond not in (None, 0) and min_residual is not None:
             raise ValueError("pass rcond (drop eigen-directions) or min_residual (drop traits), not both")
-        self.rcond = checked_rcond(rcond) if rcond is not None else \
-            (None if min_residual is not None else rcond_setting())
-        self.min_residual = checked_min_residual(min_residual) if min_residual is not None else \
-            (None if self.rcond is not None else min_residual_setting())
-        if self.rcond is not None and self.min_residual is not None:
-            raise ValueError("TORCHGWAS_JAGWAS_RCOND and TORCHGWAS_JAGWAS_MIN_RESIDUAL are exclusive")
+        if rcond == 0:
+            self.rcond = None
+            self.min_residual = None if min_residual is None else checked_min_residual(min_residual)
+        elif rcond is not None:
+            self.rcond, self.min_residual = checked_rcond(rcond), None
+        elif min_residual is not None:
+            self.rcond, self.min_residual = None, checked_min_residual(min_residual)
+        else:
+            self.rcond, self.min_residual = cutoff_settings()
 
     def spawn(self):
         """A reduction for another device that shares this run's kept-trait decision."""
-        return type(self)(self._selection, self.name, self.rcond, self.min_residual)
+        return type(self)(self._selection, self.name, 0 if self.rcond is None else self.rcond, self.min_residual)
 
     def resolved_width(self, n_traits: int) -> int:
         return 1
@@ -271,12 +286,27 @@ class JagwasReduction:
         kept subspace that rounding cannot reorder unless an eigenvalue sits
         within rounding of the cutoff. The directions are also kept only while
         the rounding target allows (the sum of 1/lambda over them plays tr R_S^-1).
-        One dense (k x K) projection replaces the triangular factor.
+
+        The projection is R from Lambda_k^-1/2 U_k' = Q R: T = ||R z||^2, and R
+        (k x K) is upper trapezoidal, so row block [s, e) needs only columns
+        [s, K) and costs what the triangular factor does, about half the dense
+        k x K product. R'R = U_k Lambda_k^-1 U_k' whatever basis eigh chose
+        inside a repeated eigenvalue, so R is fixed by the kept subspace (up to
+        row signs, which T does not see).
         """
         values, vectors = torch.linalg.eigh(correlation)
         if values.device.type == 'meta':
-            return self._set_projection(vectors.T, traits)
-        spectrum = values.cpu().numpy()[::-1]  # descending
+            rank = traits  # the kept count is data; a meta trace takes the full panel
+        else:
+            rank = self._eigen_rank(values.cpu().numpy()[::-1], samples, traits, dtype)
+        # eigh is ascending: the kept directions are the last `rank` columns.
+        top_values, top_vectors = values[-rank:], vectors[:, -rank:]
+        scaled = (top_vectors / top_values.sqrt()).T
+        del values, vectors, top_values, top_vectors
+        return self._set_upper_factor(torch.linalg.qr(scaled, mode='r')[1], traits)
+
+    def _eigen_rank(self, spectrum, samples, traits, dtype):
+        """The kept count from R's descending spectrum (one K-element FP64 read from the device)."""
         largest = float(spectrum[0])
         if not largest > 0:
             raise ValueError("no jagwas trait has nonzero variance")
@@ -292,21 +322,19 @@ class JagwasReduction:
                       largest_eigenvalue=largest, smallest_kept_eigenvalue=float(spectrum[rank - 1]),
                       largest_dropped_eigenvalue=float(spectrum[rank]) if rank < traits else None)
         agreed = self._selection.agree(record)
-        rank = agreed['rank']
-        if agreed is record and rank < traits:
+        if agreed is record and record['rank'] < traits:
             label = "jagwas" if self.name is None else f"jagwas group {self.name}"
-            warnings.warn(f"{label}: keeping {rank} of {traits} eigen-directions of the trait correlation "
-                          f"(eigenvalue above {self.rcond:g} x the largest); the joint test has {rank} "
-                          f"degrees of freedom", stacklevel=4)
-        # eigh is ascending: the kept directions are the last `rank` columns.
-        top_values, top_vectors = values[-rank:], vectors[:, -rank:]
-        return self._set_projection((top_vectors / top_values.sqrt()).T.contiguous(), traits)
+            warnings.warn(f"{label}: keeping {record['rank']} of {traits} eigen-directions of the trait "
+                          f"correlation (eigenvalue above {self.rcond:g} x the largest); the joint test has "
+                          f"{record['rank']} degrees of freedom", stacklevel=5)
+        return agreed['rank']
 
-    def _set_projection(self, projection, traits):
-        """A dense (k x K) projection: one block over every trait column."""
-        self._inverse_cholesky = projection
-        self._n_traits = int(projection.shape[0])
-        self._blocks = [(0, self._n_traits, traits, projection)]
+    def _set_upper_factor(self, factor, traits):
+        """Adopt an upper-trapezoidal (k x K) factor: row block [s, e) multiplies columns [s, K)."""
+        self._inverse_cholesky = factor
+        self._n_traits = int(factor.shape[0])
+        self._blocks = [(start, end, start, traits, factor[start:end, start:])
+                        for start, end in triangular_blocks(self._n_traits)]
         return self
 
     def _subset_factor(self, correlation, kept):
@@ -325,7 +353,7 @@ class JagwasReduction:
         """Adopt L^-1 and its row blocks, which are views: no second K x K copy on the device."""
         self._inverse_cholesky = inverse
         self._n_traits = int(inverse.shape[0])
-        self._blocks = [(start, end, end, inverse[start:end, :end])
+        self._blocks = [(start, end, 0, end, inverse[start:end, :end])
                         for start, end in triangular_blocks(self._n_traits)]
         return self
 
@@ -376,14 +404,15 @@ class JagwasReduction:
         # carry t = 0 and a status, so a non-positive df never reaches T.
         scores.mul_(scores.square().div_(variant_df.unsqueeze(1)).add_(1.0).rsqrt_())
         scores = scores.double()
-        # (L^-1 z')[start:end] = L^-1[start:end, :end] z'[:end], written into
-        # contiguous row blocks of one K x chunk buffer: one GEMM per block,
-        # then one square and one column sum (few launches per block). The
-        # eigen projection is one block over every column.
+        # (F z')[start:end] = F[start:end, first:last] z'[first:last] for the
+        # factor's nonzero columns (the eigen R: [start, K); the rounding
+        # cutoff's L^-1: [0, end)), written into contiguous row blocks of one
+        # k x chunk buffer: one GEMM per block, then one square and one column
+        # sum (few launches per block).
         transposed = scores.T
         projected = torch.empty((self._n_traits, scores.shape[0]), dtype=scores.dtype, device=scores.device)
-        for start, end, columns, rows in self._blocks:
-            torch.mm(rows, transposed[:columns], out=projected[start:end])
+        for start, end, first, last, rows in self._blocks:
+            torch.mm(rows, transposed[first:last], out=projected[start:end])
         statistic = projected.square_().sum(dim=0).unsqueeze(1)
         statistic = statistic.masked_fill((degenerate | (status != 0)).unsqueeze(1), float("nan"))
         return (torch.full_like(statistic, float("nan"), dtype=beta.dtype),

@@ -34,7 +34,7 @@ bash /path/to/TorchGWAS/scripts/run_jagwas_batch.sh \
 ## The joint statistic and its degrees of freedom
 
 `reduce="jagwas"` (`torchgwas.jagwas_projection.JagwasReduction`) computes
-T = z'R⁻¹z over the traits it keeps, chi-square on r degrees of freedom:
+T = z'R⁺z, chi-square on r degrees of freedom:
 
 - **z:** the score form, z = t / sqrt(1 + t²/df) = sqrt(df)·r. It is linear
   in the phenotype, so a trait that is a linear combination of others adds
@@ -42,16 +42,17 @@ T = z'R⁻¹z over the traits it keeps, chi-square on r degrees of freedom:
   On near-collinear panels it overstated strong hits by hundreds of chi-square
   units.
 - **R:** the FP64 Gram matrix of the scanned (residualised, FP32) phenotype.
-- **Kept traits:** the longest greedy pivoted-Cholesky prefix meeting two
-  conditions:
-  - its estimated null rounding error in T, 2·u·sqrt(N)·sqrt(tr R_S⁻¹), is at
-    most `TORCHGWAS_JAGWAS_T_ROUNDING` (default 0.01);
-  - it stays within R's FP64 numerical rank.
-
-  Well-conditioned panels keep every trait. Collinear panels drop the
-  redundant ones with a warning.
+- **Kept directions (default):** R's eigen-directions with eigenvalue above
+  1e-3 of the largest, the reference JAGWAS pipeline's `pinv(R, rcond=1e-3)`
+  rule (`TORCHGWAS_JAGWAS_RCOND`, `run_linear_gwas(jagwas_rcond=...)`). The
+  kept count also never exceeds what an estimated rounding error of 0.01 in T
+  allows. Well-conditioned panels keep every direction.
 - **df = r:** the manifest's `df` is the kept count r, and `jagwas_rank`
-  records the dropped traits with their residual variance and VIF.
+  records the method, the eigenvalues at the cutoff and the rounding estimate.
+- **Rounding cutoff over traits (`jagwas_rcond=0`):** the longest greedy
+  pivoted-Cholesky prefix of traits within the rounding target and R's FP64
+  numerical rank, optionally stopped at a VIF (`jagwas_min_residual`). It
+  names dropped traits, but see below for why it is not the default.
 
 The overlapped wrapper learns r through `run_linear_gwas(jagwas_rank_callback=...)`,
 which fires after the factor is prepared and before the first chunk. So
@@ -71,14 +72,12 @@ p-values use r, never the column count. `pipeline.json` reports `jagwas_df` and
     exclusions across groups.
   - `OUTPUT_DIR[/NAME]/excluded_samples.txt` lists the samples, and
     `pipeline.json` reports `excluded_samples`.
-- **Trait dropping at VIF > 100 (`--jagwas-min-residual 0.01`):** a trait is
-  kept only while at least 1% of its variance is its own, given the traits kept
-  before it in the greedy pivoted order. The rounding cutoff still applies on
-  top.
+- **Eigen truncation at 1e-3 (`--jagwas-rcond 0.001`):** the default above.
 
-Pass `0` to either option to switch it off. `--jagwas-rcond` replaces the trait
-threshold with eigen truncation. `--reuse-scan` applies neither step, because it
-reuses a scan made with its own settings.
+Pass `0` to either option to switch it off; `--jagwas-rcond 0` gives the
+rounding cutoff over traits. `--jagwas-min-residual` drops traits at a VIF
+instead. `--reuse-scan` applies neither step, because it reuses a scan made
+with its own settings.
 
 Why these are the defaults: the colleague's collinear imaging panels
 (fourier_PE_* and graphunet) looked inflated. They had 662–1,198 loci and hits
@@ -92,19 +91,25 @@ down to P ≈ 1e-1155, against 110–240 loci in the reference JAGWAS.
   combinations of one another, so masking or clipping only the extreme value
   breaks those relations for the sample. Doing that made the low-variance
   directions heavier-tailed still.
-- **The raised trait cutoff removes most isolated hits that remain.** In a
-  test run that removed the outlier samples from the scan, the rounding cutoff
-  still left 94–257 isolated hits per panel (P < 5e-8 with no neighbour at
-  P < 1e-5 within 100 kb). VIF ≤ 100 left 18–56, fewer than the reference's
-  56–196.
+- **A raised cutoff removes most isolated hits that remain.** With outlier
+  samples out of the scan, the rounding cutoff still left 94–257 isolated hits
+  per panel (P < 5e-8 with no neighbour at P < 1e-5 within 100 kb). Eigen
+  truncation at 1e-3 left 12–17, and dropping traits at VIF > 100 left 18–56.
+  The reference has 56–196.
+- **Why eigen-directions rather than traits:** a one-ulp FP32 perturbation of
+  a collinear panel, the size of difference another GPU or library version
+  makes, changed which traits greedy pivoting kept. df moved by 1–2 and T by up
+  to 7% at the rounding cutoff and 12% at VIF > 100, because these panels hold
+  near-exact ties such as sine/cosine features of equal variance. With eigen
+  truncation at 1e-3, df stayed fixed and T moved by at most 1e-7.
 - **Result with the standard defaults:** in one pass over all 22 groups, the
-  five collinear panels gave 121–175 loci, top −log10 P of 79–135, and 1–3% of
+  five collinear panels gave 126–176 loci, top −log10 P of 80–136, and 1–2% of
   loci resting on a single SNP. The reference has 110–240 loci and top
   −log10 P of 59–131.
-- **Full-rank panels barely move:** CNN went from 801 to 798 loci, and the
-  mesh and nceq panels changed by up to about 40 loci each.
-- **Library default unchanged:** TorchGWAS's own default (`run_linear_gwas`
-  without `jagwas_min_residual`) is still the rounding cutoff alone.
+- **Full-rank panels barely move:** the CNN_* and mesh panels kept every
+  direction and gave the same loci, except CNN itself (101 of 128 directions,
+  786 loci against 801 before). The nceq panels kept 106–121 of 128 directions,
+  with 860–945 loci.
 
 ## Established discovery inputs
 

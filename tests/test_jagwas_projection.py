@@ -63,7 +63,7 @@ def test_projection_matches_the_dense_quadratic_form(traits, device):
     if device == 'cuda' and not torch.cuda.is_available():
         pytest.skip('CUDA device required')
     panel = _panel(3000, traits)
-    reduction = JagwasReduction().prepare(panel, device=device)
+    reduction = JagwasReduction(rcond=0).prepare(panel, device=device)
     rng = np.random.default_rng(traits)
     t = torch.as_tensor(rng.standard_normal((257, traits)) * 3, dtype=torch.float32)
     t[5, traits // 2] = float('nan')
@@ -87,7 +87,7 @@ def test_projection_matches_the_dense_quadratic_form(traits, device):
 
 
 def test_triangular_blocks_are_views_of_one_factor():
-    reduction = JagwasReduction().prepare(_panel(2000, 1100))
+    reduction = JagwasReduction(rcond=0).prepare(_panel(2000, 1100))
     base = reduction._inverse_cholesky.untyped_storage().data_ptr()
     assert all(rows.untyped_storage().data_ptr() == base for *_, rows in reduction._blocks)
 
@@ -97,7 +97,7 @@ def test_full_rank_panel_keeps_the_unpivoted_factor(device):
     if device == 'cuda' and not torch.cuda.is_available():
         pytest.skip('CUDA device required')
     panel = _panel(9000, 40)  # three FP64 Gram sample blocks
-    reduction = JagwasReduction().prepare(panel, device=device)
+    reduction = JagwasReduction(rcond=0).prepare(panel, device=device)
     exact = panel.double().T @ panel.double() / 9000.
     report = reduction.rank_report()
     assert report['method'] == 'cholesky' and report['rank'] == 40 and report['dropped'] == []
@@ -115,7 +115,7 @@ def test_fast_path_and_pivoted_selection_agree():
     # tr R_S^-1 does not depend on the order: a set that meets the target in
     # input order keeps every trait in the greedy order too, at the same error.
     panel = _panel(4000, 60)
-    reduction = JagwasReduction().prepare(panel)
+    reduction = JagwasReduction(rcond=0).prepare(panel)
     correlation = (panel.double().T @ panel.double()) / 4000.
     precision, limit = reduction._selection.trace_limit(4000, 60, torch.float32)
     pivoted = reduction._pivoted_selection(correlation, limit, precision)
@@ -132,7 +132,7 @@ def test_exactly_collinear_traits_are_dropped(device):
         pytest.skip('CUDA device required')
     panel = _collinear_panel()
     with pytest.warns(UserWarning, match='2 of 32 traits are collinear'):
-        reduction = JagwasReduction().prepare(panel, device=device)
+        reduction = JagwasReduction(rcond=0).prepare(panel, device=device)
     report = reduction.rank_report([f'y{i}' for i in range(32)])
     assert report['method'] == 'pivoted_cholesky' and report['rank'] == 30 == reduction.degrees_of_freedom
     assert report['rounding_error'] <= report['target']
@@ -161,12 +161,12 @@ def test_fp64_statistics_still_drop_exact_collinearity():
     panel = np.column_stack([base, base[:, 5], base[:, 0] + base[:, 1]])
     panel = torch.as_tensor((panel - panel.mean(0)) / panel.std(0), dtype=torch.float64)
     with pytest.warns(UserWarning, match='2 of 32 traits are collinear'):
-        reduction = JagwasReduction().prepare(panel)
+        reduction = JagwasReduction(rcond=0).prepare(panel)
     assert reduction.degrees_of_freedom == 30
     precision, limit = reduction._selection.trace_limit(3000, 32, torch.float64)
     assert limit == pytest.approx(1 / (32 * np.finfo(np.float64).eps))
     # Full rank in FP64 keeps everything with the unpivoted factor.
-    assert JagwasReduction().prepare(panel[:, :30]).rank_report()['method'] == 'cholesky'
+    assert JagwasReduction(rcond=0).prepare(panel[:, :30]).rank_report()['method'] == 'cholesky'
 
 
 def test_residual_variance_matches_explicit_schur_complement():
@@ -174,7 +174,7 @@ def test_residual_variance_matches_explicit_schur_complement():
     base = rng.standard_normal((4000, 12))
     near = base[:, 3] + 1e-4 * rng.standard_normal(4000)  # 1 - R^2 ~ 1e-8: VIF ~ 1e8
     panel = _standardize(np.column_stack([base, near, base[:, :4] @ [1., -2., .5, 3.]]))
-    reduction = JagwasReduction().prepare(panel)
+    reduction = JagwasReduction(rcond=0).prepare(panel)
     report = reduction.rank_report()
     assert report['rank'] == 12 and len(report['dropped']) == 2
     # R is the exact (FP64) Gram of the FP32 panel; LAPACK and the factor read its lower triangle.
@@ -201,23 +201,23 @@ def test_target_moves_the_cutoff(monkeypatch):
     # Residual variances given trait 0: ~1e-2 and ~1e-4, so tr R^-1 ~ 2e4.
     panel = _standardize(np.column_stack([base, base[:, 0] + .1 * noise[:, 0], base[:, 0] + .01 * noise[:, 1]]))
     monkeypatch.delenv('TORCHGWAS_JAGWAS_T_ROUNDING', raising=False)
-    assert JagwasReduction().prepare(panel).degrees_of_freedom == 10  # 2 eps_z sqrt(2e4) ~ 2.4e-3 <= 0.01
+    assert JagwasReduction(rcond=0).prepare(panel).degrees_of_freedom == 10  # 2 eps_z sqrt(2e4) ~ 2.4e-3 <= 0.01
     with pytest.warns(UserWarning):
-        tight = JagwasReduction(JagwasRankSelection(target=1e-3)).prepare(panel)
+        tight = JagwasReduction(JagwasRankSelection(target=1e-3), rcond=0).prepare(panel)
     assert tight.degrees_of_freedom == 9 and tight.rank_report()['rounding_error'] <= 1e-3
     monkeypatch.setenv('TORCHGWAS_JAGWAS_T_ROUNDING', '1e-4')
     with pytest.warns(UserWarning):
-        assert JagwasReduction().prepare(panel).degrees_of_freedom == 8
+        assert JagwasReduction(rcond=0).prepare(panel).degrees_of_freedom == 8
     for bad in ('0', '-1', 'nan'):
         monkeypatch.setenv('TORCHGWAS_JAGWAS_T_ROUNDING', bad)
         with pytest.raises(ValueError, match='T_ROUNDING'):
-            JagwasReduction()
+            JagwasReduction(rcond=0)
 
 
 def test_null_statistic_is_chi_square_on_the_kept_rank():
     panel = _collinear_panel(samples=2000)
     with pytest.warns(UserWarning):
-        reduction = JagwasReduction().prepare(panel)
+        reduction = JagwasReduction(rcond=0).prepare(panel)
     # Null z-scores with exactly the panel correlation: z = Y'g / sqrt(N) for g ~ N(0, I).
     genotypes = torch.as_tensor(np.random.default_rng(21).standard_normal((2000, 20000)), dtype=torch.float32)
     z = (panel.T @ genotypes / np.sqrt(2000.)).T.contiguous()
@@ -246,8 +246,8 @@ def test_score_form_is_invariant_to_redundant_traits_under_a_strong_effect():
 
     assert t_of(independent).abs().max() > 18
     with pytest.warns(UserWarning, match='1 of 7 traits are collinear'):
-        pivoted = JagwasReduction().prepare(redundant)
-    values = {name: _reduce(JagwasReduction().prepare(panel), t_of(panel), df).double()
+        pivoted = JagwasReduction(rcond=0).prepare(redundant)
+    values = {name: _reduce(JagwasReduction(rcond=0).prepare(panel), t_of(panel), df).double()
               for name, panel in (('independent', independent), ('swapped', swapped))}
     values['redundant'] = _reduce(pivoted, t_of(redundant), df).double()
     torch.testing.assert_close(values['swapped'], values['independent'], rtol=2e-5, atol=0)
@@ -260,7 +260,7 @@ def test_score_form_is_invariant_to_redundant_traits_under_a_strong_effect():
 
 def test_devices_share_one_kept_set():
     panel = _collinear_panel()
-    first = JagwasReduction()
+    first = JagwasReduction(rcond=0)
     with pytest.warns(UserWarning):
         first.prepare(panel)
     second = first.spawn()
@@ -270,17 +270,17 @@ def test_devices_share_one_kept_set():
     assert second._kept.tolist() == first._kept.tolist() and second.degrees_of_freedom == 30
     unprepared = first.spawn()
     assert unprepared.degrees_of_freedom == 30
-    assert JagwasReduction().rank_report() is None
+    assert JagwasReduction(rcond=0).rank_report() is None
     with pytest.raises(ValueError, match='not prepared'):
-        JagwasReduction().degrees_of_freedom
+        JagwasReduction(rcond=0).degrees_of_freedom
 
 
 def test_groups_match_separate_reductions():
     independent, collinear = _panel(3000, 12, seed=3), _collinear_panel()
-    groups = JagwasGroups([('a', range(12)), ('b', range(12, 44))])
+    groups = JagwasGroups([('a', range(12)), ('b', range(12, 44))], rcond=0)
     with pytest.warns(UserWarning, match='jagwas group b: 2 of 32 traits'):
         groups.prepare(torch.cat([independent, collinear], dim=1))
-    alone_a, alone_b = JagwasReduction(), JagwasReduction()
+    alone_a, alone_b = JagwasReduction(rcond=0), JagwasReduction(rcond=0)
     alone_a.prepare(independent)
     with pytest.warns(UserWarning, match='^jagwas: 2 of 32'):
         alone_b.prepare(collinear)
@@ -300,6 +300,35 @@ def test_groups_match_separate_reductions():
     spawned = groups.spawn()
     assert all(mine._selection is theirs._selection for mine, theirs in zip(spawned.reductions, groups.reductions))
     assert spawned.degrees_of_freedom == [12, 30]
+
+
+def test_default_cutoff_is_eigen_truncation(monkeypatch):
+    monkeypatch.delenv('TORCHGWAS_JAGWAS_RCOND', raising=False)
+    monkeypatch.delenv('TORCHGWAS_JAGWAS_MIN_RESIDUAL', raising=False)
+    assert (JagwasReduction().rcond, JagwasReduction().min_residual) == (1e-3, None)
+    assert JagwasReduction(rcond=0).rcond is None  # the rounding cutoff over traits
+    monkeypatch.setenv('TORCHGWAS_JAGWAS_RCOND', '0')
+    assert JagwasReduction().rcond is None
+    monkeypatch.delenv('TORCHGWAS_JAGWAS_RCOND')
+    monkeypatch.setenv('TORCHGWAS_JAGWAS_MIN_RESIDUAL', '0.01')
+    assert (JagwasReduction().rcond, JagwasReduction().min_residual) == (None, 0.01)
+    monkeypatch.setenv('TORCHGWAS_JAGWAS_RCOND', '1e-3')
+    with pytest.raises(ValueError, match='exclusive'):
+        JagwasReduction()
+
+
+def test_eigen_factor_is_upper_trapezoidal_and_the_truncated_pseudo_inverse():
+    panel = _collinear_panel()
+    with pytest.warns(UserWarning, match='eigen-directions'):
+        reduction = JagwasReduction(rcond=1e-3).prepare(panel)
+    factor = reduction._inverse_cholesky
+    assert factor.shape == (reduction.degrees_of_freedom, 32)
+    assert torch.equal(factor, torch.triu(factor))
+    p = panel.double()
+    pinv = torch.linalg.pinv(p.T @ p / p.shape[0], rtol=1e-3, hermitian=True)
+    torch.testing.assert_close(factor.T @ factor, pinv, rtol=1e-9, atol=1e-9)
+    # Row block [s, e) of an upper-trapezoidal factor needs only columns [s, K).
+    assert all(first == start and last == 32 for start, _end, first, last, _rows in reduction._blocks)
 
 
 def test_eigen_truncation_matches_numpy_pinv():
@@ -369,10 +398,10 @@ def test_min_residual_drops_traits_mostly_explained_by_the_others():
 
 def test_groups_take_their_own_cutoff():
     panel = _collinear_panel()
-    groups = JagwasGroups([('rounding', range(32)), ('eigen', range(32), 1e-3)])
+    groups = JagwasGroups([('rounding', range(32), {'rcond': 0}), ('eigen', range(32), 1e-3)])
     with pytest.warns(UserWarning):
         groups.prepare(panel)
-    rounding, eigen = JagwasReduction(), JagwasReduction(rcond=1e-3)
+    rounding, eigen = JagwasReduction(rcond=0), JagwasReduction(rcond=1e-3)
     with pytest.warns(UserWarning):
         rounding.prepare(panel)
         eigen.prepare(panel)
@@ -445,16 +474,16 @@ def test_api_matches_an_independent_fp64_score_reference(tmp_path):
     genotype, phenotype = _api_inputs()
     result = _api_run(genotype, phenotype, tmp_path / 'out')
     manifest, values = _api_statistic(tmp_path / 'out')
-    assert manifest['df'] == 5 and manifest['jagwas_rank']['method'] == 'cholesky'
+    assert manifest['df'] == 5 and manifest['jagwas_rank']['method'] == 'eigen'  # the default cutoff
     assert result.run_metadata['sumstats_write']['jagwas_rank'] == manifest['jagwas_rank']
     np.testing.assert_allclose(values, _score_reference(genotype, phenotype), rtol=1e-6, atol=1e-9)
 
 
 def test_api_drops_a_duplicated_trait_and_reports_the_kept_rank(tmp_path):
     genotype, phenotype = _api_inputs()
-    _api_run(genotype, phenotype, tmp_path / 'independent')
+    _api_run(genotype, phenotype, tmp_path / 'independent', jagwas_rcond=0)
     with pytest.warns(UserWarning, match='1 of 6 traits are collinear'):
-        _api_run(genotype, np.column_stack([phenotype, phenotype[:, 2]]), tmp_path / 'duplicated')
+        _api_run(genotype, np.column_stack([phenotype, phenotype[:, 2]]), tmp_path / 'duplicated', jagwas_rcond=0)
     reference, independent = _api_statistic(tmp_path / 'independent')
     manifest, duplicated = _api_statistic(tmp_path / 'duplicated')
     assert reference['df'] == 5 and manifest['df'] == 5 and manifest['shape'][1] == 6
@@ -487,10 +516,11 @@ def test_api_groups_match_separate_scans(tmp_path):
     reports = []
     with pytest.warns(UserWarning, match='jagwas group b: 1 of 4 traits'):
         result = _api_run(genotype, np.column_stack([phenotype[:, :3], duplicated]), tmp_path / 'grouped',
-                          jagwas_groups=[('a', [0, 1, 2]), ('b', [3, 4, 5, 6])], jagwas_rank_callback=reports.append)
-    _api_run(genotype, phenotype[:, :3], tmp_path / 'a')
+                          jagwas_groups=[('a', [0, 1, 2]), ('b', [3, 4, 5, 6])], jagwas_rank_callback=reports.append,
+                          jagwas_rcond=0)
+    _api_run(genotype, phenotype[:, :3], tmp_path / 'a', jagwas_rcond=0)
     with pytest.warns(UserWarning):
-        _api_run(genotype, duplicated, tmp_path / 'b')
+        _api_run(genotype, duplicated, tmp_path / 'b', jagwas_rcond=0)
     manifest, parts = open_indexed_sumstats(tmp_path / 'grouped' / 'sumstats')
     values = np.full((manifest['shape'][0], 2), np.nan)
     for part in parts:

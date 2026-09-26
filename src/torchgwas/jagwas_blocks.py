@@ -1,7 +1,10 @@
 """JAGWAS arithmetic shapes and settings, torch-free for the planners.
 
-The projection (jagwas_projection.JagwasReduction) cuts the lower-triangular
-L^-1 into row blocks; block b multiplies columns [0, e_b).
+The projection (jagwas_projection.JagwasReduction) cuts its factor into row
+blocks: the default eigen factor R is upper trapezoidal (block b multiplies
+columns [s_b, K)), the rounding cutoff's L^-1 lower triangular ([0, e_b)).
+Either costs the same at k = K kept rows, which is what planners price: the
+kept count is known only once the factor is prepared.
 """
 from __future__ import annotations
 
@@ -35,14 +38,19 @@ def rounding_target_setting():
     return target
 
 
-def rcond_setting():
-    """Eigen truncation from TORCHGWAS_JAGWAS_RCOND; unset keeps the rounding cutoff.
+DEFAULT_RCOND = 1e-3
 
-    Set, T keeps R's eigen-directions with eigenvalue above rcond x the largest
+
+def rcond_setting():
+    """Eigen truncation from TORCHGWAS_JAGWAS_RCOND (default 1e-3); 0 selects the rounding cutoff over traits.
+
+    T keeps R's eigen-directions with eigenvalue above rcond x the largest
     (numpy pinv's rule), always within the rounding target as well.
     """
     value = os.environ.get('TORCHGWAS_JAGWAS_RCOND')
-    return None if value in (None, '') else checked_rcond(float(value))
+    if value in (None, ''):
+        return DEFAULT_RCOND
+    return None if float(value) == 0 else checked_rcond(float(value))
 
 
 def checked_rcond(rcond):
@@ -53,7 +61,7 @@ def checked_rcond(rcond):
 
 
 def min_residual_setting():
-    """Trait-dropping threshold from TORCHGWAS_JAGWAS_MIN_RESIDUAL; unset keeps only the rounding cutoff.
+    """Trait-dropping threshold from TORCHGWAS_JAGWAS_MIN_RESIDUAL; unset, none.
 
     Set, a trait is kept only while at least this fraction of its variance is
     not explained by the traits kept before it in the greedy pivoted order
@@ -61,6 +69,22 @@ def min_residual_setting():
     """
     value = os.environ.get('TORCHGWAS_JAGWAS_MIN_RESIDUAL')
     return None if value in (None, '') else checked_min_residual(float(value))
+
+
+def cutoff_settings():
+    """(rcond, min_residual) from the environment: one of them, or neither (the rounding cutoff alone).
+
+    TORCHGWAS_JAGWAS_MIN_RESIDUAL alone selects trait dropping; otherwise
+    TORCHGWAS_JAGWAS_RCOND decides (default 1e-3; 0 for the rounding cutoff,
+    which then takes TORCHGWAS_JAGWAS_MIN_RESIDUAL if that is set too).
+    """
+    min_residual = min_residual_setting()
+    if min_residual is not None and os.environ.get('TORCHGWAS_JAGWAS_RCOND') in (None, ''):
+        return None, min_residual
+    rcond = rcond_setting()
+    if rcond is not None and min_residual is not None:
+        raise ValueError('TORCHGWAS_JAGWAS_RCOND and TORCHGWAS_JAGWAS_MIN_RESIDUAL are exclusive')
+    return rcond, min_residual
 
 
 def checked_min_residual(fraction):
@@ -71,13 +95,14 @@ def checked_min_residual(fraction):
 
 
 def projection_flops_per_variant(n_traits):
-    """FP64 FLOPs one variant's projection issues (2 per multiply-add)."""
-    return sum(2 * (end - start) * end for start, end in triangular_blocks(n_traits))
+    """FP64 FLOPs one variant's projection issues at k = K kept rows (2 per multiply-add)."""
+    return sum(2 * (end - start) * (n_traits - start) for start, end in triangular_blocks(n_traits))
 
 
 def projection_gemm_dimensions(n_traits, markers):
     """(inner, markers, width) per projection GEMM in execution order, as tensor_service.gemm_work takes them.
 
-    Block b writes (w_b x markers) rows of the transposed product with inner e_b.
+    With the default eigen factor at k = K, block b writes (w_b x markers) rows
+    of the transposed product with inner K - s_b.
     """
-    return [(end, end - start, markers) for start, end in triangular_blocks(n_traits)]
+    return [(n_traits - start, end - start, markers) for start, end in triangular_blocks(n_traits)]

@@ -443,7 +443,7 @@ def group_panel(groups, panels=None) -> tuple[np.ndarray, list[str], list[tuple[
 
 
 DEFAULT_OUTLIER_SD = 5.0
-DEFAULT_MIN_RESIDUAL = 1e-2
+DEFAULT_RCOND = 1e-3
 
 
 def phenotype_outliers(values, covariates, threshold: float) -> np.ndarray:
@@ -463,10 +463,17 @@ def phenotype_outliers(values, covariates, threshold: float) -> np.ndarray:
 
 
 def resolve_defaults(args) -> None:
-    """Fill the pipeline's standard QC: 5-SD phenotype rows dropped, traits dropped at VIF > 100.
+    """Fill the pipeline's standard QC: 5-SD phenotype rows dropped, eigen truncation at 1e-3.
 
-    0 switches either off. --reuse-scan scans nothing, so neither applies to it,
-    and --jagwas-rcond replaces the trait-dropping threshold.
+    0 switches either off. --reuse-scan scans nothing, so neither applies to it.
+    --jagwas-min-residual drops traits instead of eigen-directions.
+
+    Why eigen truncation rather than dropping traits: on the collinear imaging
+    panels, a one-ulp FP32 perturbation of the phenotype (what another device
+    or kernel rounds differently) changed which traits greedy pivoting kept,
+    df by 1-2, and T by up to 7% (rounding cutoff) or 12% (VIF <= 100): those
+    panels hold near-exact ties. The eigen-directions above 1e-3 of the
+    largest kept the same df, and T within 1e-7.
     """
     if args.phenotype_outlier_sd is None:
         args.phenotype_outlier_sd = None if args.reuse_scan else DEFAULT_OUTLIER_SD
@@ -476,16 +483,21 @@ def resolve_defaults(args) -> None:
         raise ValueError("phenotype-outlier-sd must be positive, or 0 to keep every row")
     elif args.reuse_scan:
         raise ValueError("phenotype-outlier-sd changes the scan; it cannot apply to --reuse-scan")
-    if args.jagwas_rcond is not None and not 0.0 < args.jagwas_rcond < 1.0:
-        raise ValueError("jagwas-rcond must be in (0, 1)")
-    if args.jagwas_min_residual is None:
-        args.jagwas_min_residual = None if args.reuse_scan or args.jagwas_rcond is not None else DEFAULT_MIN_RESIDUAL
-    elif args.jagwas_min_residual == 0:
+    if args.jagwas_min_residual == 0:
         args.jagwas_min_residual = None
-    elif not 0.0 < args.jagwas_min_residual < 1.0:
-        raise ValueError("jagwas-min-residual must be in (0, 1), or 0 for the rounding cutoff alone")
-    elif args.jagwas_rcond is not None:
+    elif args.jagwas_min_residual is not None and not 0.0 < args.jagwas_min_residual < 1.0:
+        raise ValueError("jagwas-min-residual must be in (0, 1)")
+    if args.jagwas_rcond is None:
+        args.jagwas_rcond = (None if args.reuse_scan or args.jagwas_min_residual is not None
+                             else DEFAULT_RCOND)
+    elif args.jagwas_rcond == 0:
+        args.jagwas_rcond = 0.0  # TorchGWAS's rounding cutoff over traits
+    elif not 0.0 < args.jagwas_rcond < 1.0:
+        raise ValueError("jagwas-rcond must be in (0, 1), or 0 for the rounding cutoff alone")
+    elif args.jagwas_min_residual is not None:
         raise ValueError("pass --jagwas-rcond or --jagwas-min-residual, not both")
+    if args.jagwas_rcond == 0 and args.jagwas_min_residual is not None:
+        args.jagwas_rcond = None
 
 
 def write_excluded(ids, directory: Path, flagged: np.ndarray) -> None:
@@ -791,8 +803,9 @@ def main() -> int:
         "--jagwas-rcond",
         type=float,
         help=(
-            "eigen truncation: keep the trait correlation's eigen-directions above "
-            "RCOND x the largest eigenvalue (default: the rounding cutoff over traits)"
+            f"eigen truncation: keep the trait correlation's eigen-directions above "
+            f"RCOND x the largest eigenvalue (default {DEFAULT_RCOND:g} for a new scan; "
+            f"0 keeps only the rounding cutoff over traits)"
         ),
     )
     parser.add_argument(
@@ -807,9 +820,9 @@ def main() -> int:
         "--jagwas-min-residual",
         type=float,
         help=(
-            f"drop traits while less than this fraction of a trait's variance is its "
-            f"own given the traits kept before it, i.e. VIF above 1/VALUE (default "
-            f"{DEFAULT_MIN_RESIDUAL:g}, VIF <= 100; 0 keeps only the rounding cutoff)"
+            "drop traits instead of eigen-directions: while less than this fraction "
+            "of a trait's variance is its own given the traits kept before it, i.e. "
+            "VIF above 1/VALUE (replaces the default eigen truncation)"
         ),
     )
     parser.add_argument(

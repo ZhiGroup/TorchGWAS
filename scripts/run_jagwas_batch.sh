@@ -16,7 +16,7 @@
 #   -n           print the command instead of running it
 #   EXTRA_OPTIONS  passed to run_jagwas_clumping.py, e.g. --lead-p 1e-9,
 #                  --phenotype-outlier-sd 0 (keep every row),
-#                  --jagwas-min-residual 0 (rounding cutoff only), --sequential
+#                  --jagwas-rcond 0 (rounding cutoff only), --sequential
 #
 # The other inputs default to the 35k fusionN discovery set; override any of
 # them from the environment: GENOTYPE SAMPLE_IDS COVARIATES MAF GENO_CACHE

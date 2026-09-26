@@ -63,20 +63,20 @@ def _options(**changes):
     return argparse.Namespace(**dict(values, **changes))
 
 
-def test_the_pipeline_defaults_to_outlier_rows_and_vif_100():
+def test_the_pipeline_defaults_to_outlier_rows_and_eigen_truncation():
     args = _options()
     wrapper.resolve_defaults(args)
-    assert (args.phenotype_outlier_sd, args.jagwas_min_residual) == (5.0, 1e-2)
-    off = _options(phenotype_outlier_sd=0.0, jagwas_min_residual=0.0)
+    assert (args.phenotype_outlier_sd, args.jagwas_rcond, args.jagwas_min_residual) == (5.0, 1e-3, None)
+    off = _options(phenotype_outlier_sd=0.0, jagwas_rcond=0.0)
     wrapper.resolve_defaults(off)
-    assert (off.phenotype_outlier_sd, off.jagwas_min_residual) == (None, None)
-    eigen = _options(jagwas_rcond=1e-3)
-    wrapper.resolve_defaults(eigen)
-    assert eigen.jagwas_min_residual is None
+    assert (off.phenotype_outlier_sd, off.jagwas_rcond) == (None, 0.0)  # 0: the rounding cutoff
+    traits = _options(jagwas_min_residual=1e-2)
+    wrapper.resolve_defaults(traits)
+    assert (traits.jagwas_rcond, traits.jagwas_min_residual) == (None, 1e-2)
     reuse = _options(reuse_scan=True)
     wrapper.resolve_defaults(reuse)
-    assert (reuse.phenotype_outlier_sd, reuse.jagwas_min_residual) == (None, None)
-    for bad in (_options(reuse_scan=True, phenotype_outlier_sd=4.0), _options(jagwas_min_residual=2.0),
+    assert (reuse.phenotype_outlier_sd, reuse.jagwas_rcond) == (None, None)
+    for bad in (_options(reuse_scan=True, phenotype_outlier_sd=4.0), _options(jagwas_rcond=2.0),
                 _options(jagwas_rcond=1e-3, jagwas_min_residual=1e-2)):
         with pytest.raises(ValueError):
             wrapper.resolve_defaults(bad)
