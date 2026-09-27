@@ -375,10 +375,10 @@ int torchgwas_pgen_decode_range(const uint8_t *records,
  * of a native read. `np.take` with a 256-entry table is a gather, one
  * random-access lookup per element, and it measured 468 ms of a 551 ms read --
  * 85% -- to move 133 MB, which is 0.28 GB/s. Emitting the final value here
- * costs nothing over emitting the category: the shift and mask are already
- * done, and a four-entry table lives in a register. It also removes the wide
- * intermediate array entirely, so the caller allocates one block instead of
- * two.
+ * avoids a separate remapping pass and its wide intermediate array. The
+ * conditional missing-code replacement lets the compiler vectorize the
+ * shifts, masks and stores without per-sample lookup-table loads. The caller
+ * allocates one output block instead of two.
  *
  * Sample subsetting is not handled here; a caller wanting a subset still takes
  * the category path and gathers columns afterwards.
@@ -386,7 +386,6 @@ int torchgwas_pgen_decode_range(const uint8_t *records,
 int torchgwas_pgen_expand_hardcall(const uint8_t *packed, uint64_t count,
                                    uint64_t stride, uint64_t sample_ct,
                                    int8_t *out, int8_t missing) {
-    const int8_t table[4] = {0, 1, 2, missing};
     const uint64_t whole = sample_ct >> 2;
     const uint64_t remainder = sample_ct & 3u;
     for (uint64_t i = 0; i < count; ++i) {
@@ -394,16 +393,21 @@ int torchgwas_pgen_expand_hardcall(const uint8_t *packed, uint64_t count,
         int8_t *dst = out + i * sample_ct;
         for (uint64_t byte = 0; byte < whole; ++byte) {
             const unsigned bits = row[byte];
-            dst[0] = table[bits & 0x03u];
-            dst[1] = table[(bits >> 2) & 0x03u];
-            dst[2] = table[(bits >> 4) & 0x03u];
-            dst[3] = table[(bits >> 6) & 0x03u];
+            const unsigned a = bits & 0x03u;
+            const unsigned b = (bits >> 2) & 0x03u;
+            const unsigned c = (bits >> 4) & 0x03u;
+            const unsigned d = (bits >> 6) & 0x03u;
+            dst[0] = a == 3u ? missing : (int8_t)a;
+            dst[1] = b == 3u ? missing : (int8_t)b;
+            dst[2] = c == 3u ? missing : (int8_t)c;
+            dst[3] = d == 3u ? missing : (int8_t)d;
             dst += 4;
         }
         if (remainder) {
             const unsigned bits = row[whole];
             for (uint64_t k = 0; k < remainder; ++k) {
-                dst[k] = table[(bits >> (2u * k)) & 0x03u];
+                const unsigned code = (bits >> (2u * k)) & 0x03u;
+                dst[k] = code == 3u ? missing : (int8_t)code;
             }
         }
     }

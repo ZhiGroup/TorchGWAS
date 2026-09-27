@@ -1,0 +1,2310 @@
+{
+ "captured_by": "benchmarks/direct_jagwas_geometry_20260921.py (A100, 2026-09-26, eigen truncation, upper-trapezoidal R)",
+ "compute_capability": [
+  8,
+  0
+ ],
+ "device": "NVIDIA A100-SXM4-80GB",
+ "durations_recorded": false,
+ "projection": "upper_trapezoidal_eigen",
+ "projection_source_sha256": {
+  "jagwas_blocks.py": "3ca8c12f929839994ff380ebc9385e0293df3c3f16c15807bb28b887e5195015",
+  "jagwas_projection.py": "6d2bdf6a39672abbf281f88b8dbc534ce891bd9c83db6636d1be299217227c4f"
+ },
+ "reduce_source_sha256": "62a59de58e7e72d4ade608af13aecfe5fe24dbe8e9d64d506eb8d2c778f46ed7",
+ "rows": [
+  {
+   "B": 13,
+   "K": 7,
+   "N": 257,
+   "compute_dtype": "float32",
+   "kernels": [
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, at::detail::Array<char*, 2> >(int, at::native::AbsFunctor<float>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 24,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       4,
+       8,
+       1
+      ],
+      "grid": [
+       2,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 16
+     },
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4> >(at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2> >(int, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2> >(int, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase&, float)::{lambda(float)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase&, float)::{lambda(float)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 19,
+      "shared memory": 0
+     },
+     "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > const&)::{lambda(int)#1})"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, at::detail::Array<char*, 2> >(int, at::native::CUDAFunctorOnSelf_add<float>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 18,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2> >(int, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 22,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 42,
+      "shared memory": 0
+     },
+     "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       8,
+       4,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 16
+     },
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4> >(at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 23,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 24,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3> >(int, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<float>, at::detail::Array<char*, 1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 0
+     },
+     "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<int>, at::detail::Array<char*, 1>)"
+    }
+   ]
+  },
+  {
+   "B": 13,
+   "K": 7,
+   "N": 257,
+   "compute_dtype": "float64",
+   "kernels": [
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<double>, at::detail::Array<char*, 2> >(int, at::native::AbsFunctor<double>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 18,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 28,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       4,
+       8,
+       1
+      ],
+      "grid": [
+       2,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 16
+     },
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4> >(at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2> >(int, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 22,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 0
+     },
+     "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl<at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl<at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > const&)::{lambda(int)#1})"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 22,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<double>, at::detail::Array<char*, 2> >(int, at::native::CUDAFunctorOnSelf_add<double>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 28,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 28,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::MulFunctor<double> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::MulFunctor<double> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       8,
+       4,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 16
+     },
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4> >(at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 23,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 24,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3> >(int, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<double>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<double>, at::detail::Array<char*, 1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<int>, at::detail::Array<char*, 1>)"
+    }
+   ]
+  },
+  {
+   "B": 128,
+   "K": 512,
+   "N": 2049,
+   "compute_dtype": "float32",
+   "kernels": [
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, at::detail::Array<char*, 2> >(int, at::native::AbsFunctor<float>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 24,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       32,
+       16,
+       1
+      ],
+      "grid": [
+       8,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 16
+     },
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4> >(at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2> >(int, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2> >(int, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase&, float)::{lambda(float)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase&, float)::{lambda(float)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       256,
+       1,
+       1
+      ],
+      "registers per thread": 19,
+      "shared memory": 0
+     },
+     "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > const&)::{lambda(int)#1})"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, at::detail::Array<char*, 2> >(int, at::native::CUDAFunctorOnSelf_add<float>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 18,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2> >(int, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 22,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 42,
+      "shared memory": 0
+     },
+     "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       64,
+       1,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       32,
+       4,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 80,
+      "shared memory": 4112
+     },
+     "name": "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4> >(at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 23,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 24,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3> >(int, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<float>, at::detail::Array<char*, 1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 0
+     },
+     "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<int>, at::detail::Array<char*, 1>)"
+    }
+   ]
+  },
+  {
+   "B": 128,
+   "K": 512,
+   "N": 2049,
+   "compute_dtype": "float64",
+   "kernels": [
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<double>, at::detail::Array<char*, 2> >(int, at::native::AbsFunctor<double>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 18,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 28,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       32,
+       16,
+       1
+      ],
+      "grid": [
+       8,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 16
+     },
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4> >(at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2> >(int, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 22,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 0
+     },
+     "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl<at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl<at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > const&)::{lambda(int)#1})"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 22,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<double>, at::detail::Array<char*, 2> >(int, at::native::CUDAFunctorOnSelf_add<double>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 28,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 28,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::MulFunctor<double> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::MulFunctor<double> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       64,
+       1,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       32,
+       4,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 80,
+      "shared memory": 4112
+     },
+     "name": "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4> >(at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 23,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 24,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3> >(int, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<double>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<double>, at::detail::Array<char*, 1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<int>, at::detail::Array<char*, 1>)"
+    }
+   ]
+  },
+  {
+   "B": 512,
+   "K": 2048,
+   "N": 4097,
+   "compute_dtype": "float32",
+   "kernels": [
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, at::detail::Array<char*, 2> >(int, at::native::AbsFunctor<float>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 24,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       32,
+       16,
+       1
+      ],
+      "grid": [
+       32,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 16
+     },
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4> >(at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2> >(int, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2> >(int, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase&, float)::{lambda(float)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase&, float)::{lambda(float)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       4096,
+       1,
+       1
+      ],
+      "registers per thread": 19,
+      "shared memory": 0
+     },
+     "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > const&)::{lambda(int)#1})"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, at::detail::Array<char*, 2> >(int, at::native::CUDAFunctorOnSelf_add<float>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 18,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2> >(int, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#2}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 22,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 42,
+      "shared memory": 0
+     },
+     "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       2,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       2,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       2,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       2,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       32,
+       4,
+       1
+      ],
+      "grid": [
+       4,
+       32,
+       1
+      ],
+      "registers per thread": 80,
+      "shared memory": 4112
+     },
+     "name": "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4> >(at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 23,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 24,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3> >(int, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<float>, at::detail::Array<char*, 1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 0
+     },
+     "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<int>, at::detail::Array<char*, 1>)"
+    }
+   ]
+  },
+  {
+   "B": 512,
+   "K": 2048,
+   "N": 4097,
+   "compute_dtype": "float64",
+   "kernels": [
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<double>, at::detail::Array<char*, 2> >(int, at::native::AbsFunctor<double>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 18,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 28,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<double, double, bool, at::native::(anonymous namespace)::CompareEqFunctor<double> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       32,
+       16,
+       1
+      ],
+      "grid": [
+       32,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 16
+     },
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4> >(at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2> >(int, at::native::bitwise_not_kernel_cuda(at::TensorIteratorBase&)::{lambda(bool)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 22,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::nan_to_num_kernel_cuda(at::TensorIteratorBase&, std::optional<double>, std::optional<double>, std::optional<double>)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 32,
+      "shared memory": 0
+     },
+     "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl<at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl<at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > const&)::{lambda(int)#1})"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 22,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<double>, at::detail::Array<char*, 2> >(int, at::native::CUDAFunctorOnSelf_add<double>, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 28,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 28,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::MulFunctor<double> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::MulFunctor<double> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       2,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       2,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       2,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       128,
+       2,
+       1
+      ],
+      "registers per thread": 56,
+      "shared memory": 40960
+     },
+     "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_tt_align1::Params)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       2048,
+       1,
+       1
+      ],
+      "registers per thread": 20,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<double, double>(at::TensorIteratorBase&, double)::{lambda(double)#1}, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       32,
+       4,
+       1
+      ],
+      "grid": [
+       4,
+       32,
+       1
+      ],
+      "registers per thread": 80,
+      "shared memory": 4112
+     },
+     "name": "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4> >(at::native::ReduceOp<double, at::native::func_wrapper_t<double, at::native::sum_functor<double, double, double>::operator()(at::TensorIterator&)::{lambda(double, double)#1}>, unsigned int, double, 4>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2> >(int, at::native::AUnaryFunctor<unsigned char, unsigned char, bool, at::native::(anonymous namespace)::CompareEqFunctor<unsigned char> >, at::detail::Array<char*, 2>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 23,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::BitwiseOrFunctor<bool> >, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 24,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3> >(int, at::native::(anonymous namespace)::masked_fill_kernel(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(double, bool)#1}, at::detail::Array<char*, 3>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<double>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<double>, at::detail::Array<char*, 1>)"
+    },
+    {
+     "geometry": {
+      "block": [
+       128,
+       1,
+       1
+      ],
+      "grid": [
+       1,
+       1,
+       1
+      ],
+      "registers per thread": 16,
+      "shared memory": 0
+     },
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<int>, at::detail::Array<char*, 1>)"
+    }
+   ]
+  }
+ ],
+ "torch_version": "2.5.1+cu124"
+}

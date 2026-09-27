@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from .io import align_table_to_samples, load_array, load_genotype, load_vector
+from .executor_timing import streaming_timing
 from .linear import linear_scan, linear_scan_streaming, linear_scan_streaming_chunks
 from .pgen import (
     DEFAULT_PGEN_COMPRESSION_WORKERS,
@@ -19,7 +20,8 @@ from .pgen import (
 from .preprocess import prepare_inputs, prepare_inputs_for_prep
 from .streaming import ChunkedGenotype, _resolve_variant_range
 from .types import GWASResult
-from .utils import choose_device, elapsed, mkdir, timestamp, write_json
+from .utils import (choose_device, elapsed, mkdir,
+                    timestamp, upper_tail_log10, write_json)
 
 
 DEFAULT_SUMSTATS_BLOCK_BYTES = 16 << 20
@@ -72,10 +74,12 @@ def _available_host_bytes() -> int:
     return 0
 
 
-def _coerce_array_or_path(value):
+def _coerce_array_or_path(value, *, mmap=False):
     if value is None:
         return None
     if isinstance(value, (str, Path)):
+        if mmap and Path(value).suffix.lower()=='.npy':
+            return np.load(value,mmap_mode='r',allow_pickle=False)
         return load_array(value)
     return np.asarray(value)
 
@@ -117,6 +121,21 @@ def _resolve_linear_compute_dtype(genotype, compute_dtype: str) -> str:
     return "float32" if isinstance(genotype, ChunkedGenotype) else "float64"
 
 
+
+
+
+
+_QUOTE_TRIGGERS = ("\t", "\n", "\r", '"')
+
+
+
+
+
+
+
+
+
+
 def _accumulate(accumulated, order, reduction, chunk, offset, guard=None):
     """Merge one reduced chunk into the running per-variant accumulator."""
     start, end, beta, t, p, index = chunk
@@ -145,7 +164,8 @@ def _accumulate(accumulated, order, reduction, chunk, offset, guard=None):
 
 
 def _trait_blocked_significant_chunks(scan_once, significance, n_traits,
-                                      trait_block, df, devices=None):
+                                      trait_block, df, devices=None, queue_depth=None,
+                                      partition_context=None):
     """Significant (variant, trait) pairs for all K traits, block by block.
 
     `reduce='significant'` cannot use `_trait_blocked_reduced_chunks`: that
@@ -170,17 +190,33 @@ def _trait_blocked_significant_chunks(scan_once, significance, n_traits,
 
     if trait_block < 1:
         raise ValueError("trait_block must be positive")
+    if partition_context is not None and not callable(partition_context):
+        raise ValueError('Callable indexed producer binding required')
     blocks = [(offset, min(trait_block, n_traits - offset))
               for offset in range(0, n_traits, trait_block)]
 
     def emit(offset, width, device):
-        pairs = _significant_pairs_iterator(
-            scan_once(offset, width, device), significance, n_traits, df)
-        for start, end, variant_index, trait_index, beta, t_stat, row_df in pairs:
-            yield (start, end, variant_index,
-                   trait_index.astype(np.int64) + offset,
-                   beta, t_stat, row_df)
-
+        partition=None if partition_context is None else partition_context(offset,width,device)
+        source = scan_once(offset, width, device)
+        pairs = _significant_pairs_iterator(source, significance, n_traits, df)
+        try:
+            for start, end, variant_index, trait_index, beta, t_stat, row_df in pairs:
+                # Keep an owned copy: selected inputs may be views or reused by
+                # their producer. Rebase it in place to avoid a second array.
+                rebased_trait_index=trait_index.astype(np.int64)
+                rebased_trait_index+=offset
+                item=(start,end,variant_index,rebased_trait_index,beta,t_stat,row_df)
+                if partition is not None:
+                    from .sumstats_indexed import PartitionedIndexedChunk
+                    item=PartitionedIndexedChunk(item,partition)
+                yield item
+        finally:
+            try:
+                if hasattr(pairs, "close"):
+                    pairs.close()
+            finally:
+                if hasattr(source, "close"):
+                    source.close()
     if not devices or len(devices) <= 1:
         for offset, width in blocks:
             yield from emit(offset, width, None)
@@ -193,19 +229,47 @@ def _trait_blocked_significant_chunks(scan_once, significance, n_traits,
     import queue
     import threading
 
-    results: queue.Queue = queue.Queue(maxsize=4 * len(devices))
+    if queue_depth is None:
+        queue_depth = 4 * len(devices)
+    if isinstance(queue_depth, bool) or not isinstance(queue_depth, int) or queue_depth < 1:
+        raise ValueError('queue_depth must be a positive integer')
+    results: queue.Queue = queue.Queue(maxsize=queue_depth)
     failures: list[BaseException] = []
     done = object()
+    stop = threading.Event()
+
+    def publish(item):
+        while not stop.is_set():
+            try:
+                results.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                pass
+        return False
 
     def run(device, assigned):
+        iterator = None
         try:
             for offset, width in assigned:
-                for item in emit(offset, width, device):
-                    results.put(item)
-        except BaseException as exc:  # noqa: BLE001 - re-raised below
+                if stop.is_set():
+                    break
+                iterator = emit(offset, width, device)
+                for item in iterator:
+                    if not publish(item):
+                        return
+                iterator.close()
+                iterator = None
+        except BaseException as exc:
             failures.append(exc)
+            stop.set()
         finally:
-            results.put(done)
+            try:
+                if iterator is not None:
+                    iterator.close()
+            except BaseException as exc:
+                failures.append(exc)
+                stop.set()
+            publish(done)
 
     workers = []
     for index, device in enumerate(devices):
@@ -213,19 +277,26 @@ def _trait_blocked_significant_chunks(scan_once, significance, n_traits,
         if not assigned:
             continue
         thread = threading.Thread(target=run, args=(device, assigned),
-                                  name=f"torchgwas-sigshard-{index}",
-                                  daemon=True)
+                                  name=f"torchgwas-sigshard-{index}", daemon=True)
         thread.start()
         workers.append(thread)
     remaining = len(workers)
-    while remaining:
-        item = results.get()
-        if item is done:
-            remaining -= 1
-            continue
-        yield item
-    for thread in workers:
-        thread.join()
+    try:
+        while remaining:
+            if failures:
+                raise failures[0]
+            try:
+                item = results.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if item is done:
+                remaining -= 1
+            else:
+                yield item
+    finally:
+        stop.set()
+        for thread in workers:
+            thread.join()
     if failures:
         raise failures[0]
 
@@ -331,6 +402,17 @@ def _trait_blocked_reduced_chunks(scan_once, reduction, n_traits, trait_block,
                None if p is None else p.numpy(), index.numpy())
 
 
+
+
+
+
+
+
+
+
+
+
+
 def _write_linear_binary_streaming(
     directory: str | Path,
     marker_names: list[str],
@@ -346,8 +428,10 @@ def _write_linear_binary_streaming(
     store_beta: bool = True,
     extra_manifest: dict | None = None,
     borrow_results: bool = False,
+    store_variant_df: bool = False,
+    on_write_progress=None,
 ) -> tuple[int, dict]:
-    """Stream beta/t_stat/-log10(P) chunks into a binary directory.
+    """Stream beta/t_stat chunks into a binary sumstats directory.
 
     Returns the cell count and a timing summary. The iterator is consumed in
     variant order; storage back-pressure reaches the scan through the writer's
@@ -375,13 +459,22 @@ def _write_linear_binary_streaming(
         # writer's staging buffer, which is reused rather than freshly
         # allocated per chunk.
         borrow_chunks=not borrow_results,
+        store_variant_df=store_variant_df,
+        on_write_progress=on_write_progress,
     )
     try:
-        for start, end, beta_chunk, t_chunk, _p_chunk, logp_chunk in chunk_iterator:
-            writer.write_chunk(start, end, beta_chunk, t_chunk, logp_chunk)
+        for chunk in chunk_iterator:
+            start, end, beta_chunk, t_chunk, _p_chunk = chunk[:5]
+            if store_variant_df and len(chunk)!=6:
+                raise ValueError('Per-variant df output requires scan df metadata')
+            writer.write_chunk(start, end, beta_chunk, t_chunk,
+                               variant_df=chunk[5] if store_variant_df else None)
     except BaseException:
         writer.abort()
         raise
+    finally:
+        if hasattr(chunk_iterator,'close'):
+            chunk_iterator.close()
     summary = writer.close()
     if write_variant_ids:
         started = time.perf_counter()
@@ -457,6 +550,10 @@ def _drain_linear_chunks(chunk_iterator) -> tuple[int, dict]:
     return cells, {"discarded": True, "scan_seconds": time.perf_counter() - started}
 
 
+from .initial_chunk_autotune import productive_api_lifecycle
+
+
+@productive_api_lifecycle
 def run_linear_gwas(
     genotype,
     phenotype,
@@ -516,9 +613,107 @@ def run_linear_gwas(
     sumstats_fsync: bool = True,
     sumstats_variant_ids: bool = True,
     sumstats_fields: str = "beta+t",
+    autotune_profile: dict | str | Path | None = None,
+    autotune_config: dict | str | Path | None = None,
+    variant_devices=None,
+    initial_calibration: dict | None = None,
+    autotune: bool | str | None = None,
+    autotune_options: dict | None = None,
+    # reduce='jagwas' only, one or neither. rcond (default 1e-3,
+    # TORCHGWAS_JAGWAS_RCOND): eigen truncation, keeping R's eigen-directions
+    # above rcond x the largest eigenvalue; 0 selects the rounding cutoff over
+    # traits. min_residual: drop traits while less than that fraction of a
+    # trait's variance is its own given the traits kept before it (VIF >
+    # 1 / min_residual). The planner prices TORCHGWAS_JAGWAS_RCOND's method.
+    jagwas_rcond: float | None = None,
+    jagwas_min_residual: float | None = None,
+    # Opt-in: mask phenotype values beyond this many SD of their
+    # covariate-residualised trait before the scan (preprocess.
+    # mask_phenotype_outliers). reduce='jagwas' drops the sample's whole
+    # panel row; per-trait scans drop the value.
+    phenotype_outlier_sd: float | None = None,
 ) -> GWASResult:
+    """Run associations, optionally saving bounded early productive measurements.
+
+    initial_calibration={'cache_dir': ...} enables dependency-bound observation
+    reuse for explicit native hardcall PGEN/CUDA FP32 configurations. Supply
+    chunk_size; this option neither benchmarks nor searches before useful work,
+    and does not automatically change the configuration. See the calibration
+    guide for window budgets and the distinction between spans and capacities.
+
+    autotune=True (or 'empirical') picks GPUs, phenotype tiles or variant
+    shards and reader workers at startup, then tunes the chunk size from the
+    job's own first chunks (see empirical_autotune). Explicit trait_block,
+    trait_devices, variant_devices, reader_workers or a cuda:N device are kept.
+    autotune_options may set chunk_sizes, devices, min_tile_traits,
+    max_tile_traits, cpus_per_device (fixed CPU cap instead of the measured
+    decode demand), shard_setup_seconds (instead of the measured per-GPU
+    setup; 0 ignores setup), min_job_seconds, shared_decode, gpu_fanout,
+    warmup_fraction, trial_fraction, repeats, min_gain, max_utilization,
+    min_free_bytes, tuner, probe_chunks and split.
+    """
+    _api_entered=time.perf_counter()
+    # JAGWAS has one joint statistic over the complete retained phenotype
+    # panel. Only variants may be partitioned, including across GPUs.
+    if reduce == "jagwas" and (trait_block is not None or trait_devices is not None):
+        raise ValueError(
+            "jagwas cannot be trait-blocked: trait_block and trait_devices "
+            "are unsupported. The full phenotype panel and joint-test state "
+            "must fit on every active device. Use variant_devices to shard "
+            "variants; reduce='significant' supports phenotype partitioning.")
+    if variant_devices is not None:
+        if (not isinstance(variant_devices,(list,tuple)) or not variant_devices
+            or len(set(map(str,variant_devices)))!=len(variant_devices)):
+            raise ValueError('variant_devices must be a nonempty unique device list')
+        variant_devices=list(map(str,variant_devices))
+        if (trait_block is not None or trait_devices is not None or reduce not in (None, "jagwas", "significant")
+            or _internal_reduction is not None or pipeline_profile is not None
+            or output_dir is None or sumstats_format!='binary'
+            or p_value_threshold is not None):
+            raise ValueError('variant_devices requires full, significant or jagwas binary output without trait tiling, row filters or coarse profiles')
+    empirical = None
+    empirical_tuner = None
+    if autotune not in (None, False):
+        if autotune not in (True, 'empirical'):
+            raise ValueError("autotune must be True or 'empirical'")
+        if (autotune_profile is not None or autotune_config is not None
+                or initial_calibration is not None or pipeline_profile is not None):
+            raise ValueError("autotune='empirical' cannot be combined with autotune_profile/"
+                             "autotune_config, initial_calibration or pipeline_profile")
+        if output_dir is None:
+            raise ValueError("autotune='empirical' requires output_dir: it tunes the streaming writer path")
+        options = dict(autotune_options or {})
+        unknown = set(options)-{'chunk_sizes', 'devices', 'min_tile_traits', 'max_tile_traits', 'cpus_per_device',
+                                'min_job_seconds', 'shared_decode', 'gpu_fanout',
+                                'warmup_fraction', 'trial_fraction', 'repeats', 'min_gain',
+                                'max_utilization', 'min_free_bytes', 'tuner', 'probe_chunks', 'split',
+                                'shard_setup_seconds'}
+        if unknown:
+            raise ValueError(f'Unknown autotune_options: {sorted(unknown)}')
+        empirical = dict(options=options)
+    elif autotune_options is not None:
+        raise ValueError('autotune_options requires autotune=True')
+    autotuner = None
+    productive = None
+    if (autotune_profile is None) != (autotune_config is None):
+        raise ValueError('Supply autotune_profile and autotune_config together')
+    if autotune_profile is not None:
+        from .detailed_autotune import DetailedAutotune, validate_autotune_request
+        validate_autotune_request(genotype=genotype, phenotype=phenotype,
+                                  output_dir=output_dir, options=locals())
     if sumstats_format not in {"binary", "none"}:
         raise ValueError("sumstats_format must be 'binary' or 'none'; TSV output has been removed")
+    calibrator = None
+    if initial_calibration is not None:
+        from .run_calibration import RunCalibration,validate_initial_calibration
+        from .pgen import resolve_pgen_triplet
+        validate_initial_calibration(initial_calibration,genotype=genotype,options=locals())
+        input_pgen,input_pvar,input_psam=resolve_pgen_triplet(genotype,pvar=pvar,
+            psam=psam if psam is not None else sample_file)
+        calibrator=RunCalibration(initial_calibration,output_path=output_dir,
+            started_perf_counter=_api_entered,
+            inputs=dict(genotype=input_pgen,pvar=input_pvar,psam=input_psam,
+                phenotype=phenotype,covariates=covariates,sample_ids=sample_ids,marker_ids=marker_ids))
     sumstats_summary: dict = {}
     requested_reader_workers = reader_workers
     requested_prefetch_chunks = prefetch_chunks
@@ -529,7 +724,15 @@ def run_linear_gwas(
     # missing phase reads as absent rather than as zero seconds.
     _phase_entered = time.perf_counter()
     _phase_prep_started = _phase_prep_done = write_started = None
-    resolved_device = choose_device(device)
+    autotune_basis = None
+    if autotune_profile is not None:
+        autotuner = DetailedAutotune(autotune_profile, autotune_config,
+                                    input_path=genotype, output_path=output_dir,
+                                    reduction=reduce, significance_threshold=significance_threshold)
+        # A bounded QC width is needed before the execution tile is selected.
+        if reduce != 'jagwas':
+            trait_block = autotuner.qc_trait_block
+    resolved_device = choose_device(autotuner.devices[0] if autotuner else variant_devices[0] if variant_devices else device)
     genotype_meta = {}
     requested_sample_ids = _coerce_vector_or_path(sample_ids)
     if isinstance(genotype, (str, Path)):
@@ -577,7 +780,7 @@ def run_linear_gwas(
             phenotype_table, sample_ids=np.asarray(sample_ids, dtype=object), value_columns=trait_columns, sample_id_column=sample_id_column
         )
     else:
-        phenotype = _coerce_array_or_path(phenotype)
+        phenotype = _coerce_array_or_path(phenotype, mmap=reduce in ("significant", "jagwas") or ((trait_block is not None or variant_devices is not None) and reduce is None))
     if covariates_table is not None:
         if sample_ids is None:
             raise ValueError("tabular covariate input requires genotype sample IDs")
@@ -586,7 +789,174 @@ def run_linear_gwas(
         )
     else:
         covariates = _coerce_array_or_path(covariates)
+    outlier_rows = None
+    if phenotype_outlier_sd is not None:
+        from .preprocess import mask_phenotype_outliers
+        phenotype, outlier_rows = mask_phenotype_outliers(
+            phenotype, None if covariates is None else np.asarray(covariates), float(phenotype_outlier_sd),
+            whole_rows=reduce == "jagwas")
+    if empirical is not None and not isinstance(genotype, ChunkedGenotype):
+        # An in-memory genotype array runs one in-memory scan: nothing to tune.
+        empirical.update(sizes=None, layout=dict(why=['in-memory genotype array: no streaming scan to tune']),
+                         devices_seen=None, tuner_disabled_reason='in-memory genotype array')
+        empirical['in_memory'] = True
+    if empirical is not None and not empirical.get('in_memory'):
+        from .empirical_autotune import (DEFAULT_CHUNK_SIZES, eligible_gpus, gpu_free_bytes,
+                                         plan_layout, usable_cpus)
+        import threading as _threading
+        import torch as _torch
+        # The idle-CPU sample (0.25 s) overlaps the nvidia-smi device query.
+        _cpu_sample = {}
+        _cpu_thread = _threading.Thread(target=lambda: _cpu_sample.setdefault('value', usable_cpus()), daemon=True)
+        _cpu_thread.start()
+        options = empirical['options']
+        first, last = _resolve_variant_range(variant_range, int(genotype.shape[1]))
+        sizes = sorted(set(int(s) for s in (options.get('chunk_sizes')
+                       or ([chunk_size] if chunk_size is not None else DEFAULT_CHUNK_SIZES))))
+        # A framed source decodes whole frames: default candidates become
+        # multiples of its frame when chunks start on a frame boundary.
+        frame = getattr(genotype, 'chunk_alignment_variants', None)
+        if frame and not options.get('chunk_sizes') and chunk_size is None and first % int(frame) == 0:
+            from .empirical_autotune import frame_aligned_sizes
+            sizes = frame_aligned_sizes(sizes, frame)
+        # Keep sizes a job can use; the smallest stays so alignment holds.
+        sizes = [s for s in sizes if s <= max(last-first, 1)] or sizes[:1]
+        explicit_layout = trait_block is not None or trait_devices is not None or variant_devices is not None
+        seen = None
+        if options.get('devices') is not None:
+            devices = [str(d) for d in options['devices']]
+        elif explicit_layout:
+            devices = [str(d) for d in (variant_devices or trait_devices or [choose_device(device)])]
+        elif str(device).startswith('cuda:'):
+            devices = [str(device)]
+        else:
+            devices, seen = eligible_gpus(max_utilization=options.get('max_utilization', 20),
+                                          min_free_bytes=options.get('min_free_bytes', 4 << 30))
+            if not devices:
+                raise ValueError('autotune found no idle GPU (no foreign process, low utilization, free '
+                                 'memory); pass autotune_options={"devices": [...]} to choose explicitly')
+        layout = dict(explicit=True, devices=devices)
+        if not explicit_layout:
+            width = getattr(genotype, "native_row_width", 0)
+            if getattr(genotype, "native_encoding", None) in {"pgen_2bit", "plink_2bit"} and width:
+                per_variant = float(width)
+            elif hasattr(genotype, "iter_packed_chunks"):
+                per_variant = float((int(genotype.shape[0]) + 3) // 4)
+            else:
+                per_variant = float(genotype.shape[0]) * 4.0
+            mode = 'jagwas' if reduce == 'jagwas' else 'significant' if reduce == 'significant' else 'full'
+            _cpu_thread.join()
+            cpus, cpu_detail = _cpu_sample['value']
+            unfiltered = (sumstats_format == 'binary'
+                          and p_value_threshold is None and _internal_reduction is None)
+            # Measured per-variant GPU time and per-shard setup size the
+            # shard count; with decode CPU per variant they also cap GPUs on
+            # a busy host (cpus_per_device overrides that cap).
+            # The same decode/GPU ratio sizes the readers per GPU, so it is
+            # measured on one GPU too (~0.1 s); the setup probe needs a second.
+            from .empirical_autotune import (decode_cpu_seconds_per_variant, gpu_seconds_per_variant,
+                                             shard_setup_seconds)
+            decode_cpu = setup = None
+            gpu_per_variant = gpu_seconds_per_variant(devices[0], mode=mode, n_samples=int(genotype.shape[0]),
+                                                      n_traits=int(np.shape(phenotype)[1]))
+            if len(devices) > 1:
+                setup = (float(options['shard_setup_seconds']) if options.get('shard_setup_seconds') is not None
+                         else shard_setup_seconds(devices[1]))  # a GPU the job uses (at least two are kept)
+            if options.get('cpus_per_device') is None:
+                decode_cpu = decode_cpu_seconds_per_variant(genotype, first, last)
+            output_rates = None
+            if mode == 'full' and unfiltered and output_dir is not None and len(devices) > 1:
+                # Dense output: each variant shard brings its own writer (output_write_rates).
+                if options.get('output_rates') is not None:
+                    output_rates = dict(options['output_rates'])
+                else:
+                    # The probe writes at most 5% of the job's own output; below
+                    # 16 MB per writer it cannot resolve a rate and is skipped.
+                    width = int(np.shape(phenotype)[1])
+                    job_bytes = (last - first) * (width * (8 if sumstats_fields != 't' else 4) + 4)
+                    probe = min(256 << 20, int(0.05 * job_bytes / (1 + len(devices))))
+                    if probe >= 16 << 20:
+                        from .empirical_autotune import output_write_rates
+                        output_rates = output_write_rates(mkdir(output_dir), n_traits=width,
+                                                          store_beta=sumstats_fields != 't', writers=len(devices),
+                                                          probe_bytes=probe)
+            layout = plan_layout(
+                mode=mode, n_samples=int(genotype.shape[0]), n_traits=int(np.shape(phenotype)[1]),
+                covariate_rank=int(0 if covariates is None else np.shape(covariates)[1]),
+                n_variants=last-first, devices=devices, cpus=cpus, capacity=max(sizes), chunk_sizes=sizes,
+                depth=int(prefetch_chunks), transfer_bytes_per_variant=per_variant,
+                device_free_bytes=min(gpu_free_bytes(devices, seen).values()),
+                host_free_bytes=_available_host_bytes(),
+                min_tile_traits=int(options.get('min_tile_traits', 2048)),
+                max_tile_traits=int(options.get('max_tile_traits', 32768)),
+                cpus_per_device=(int(options['cpus_per_device']) if options.get('cpus_per_device') is not None
+                                 else None),
+                decode_cpu_per_variant=decode_cpu, gpu_seconds_per_variant=gpu_per_variant,
+                shard_setup_seconds=setup, cpu_cores=cpu_detail.get('affinity'),
+                cpu_load=cpu_detail.get('load_1min'), allow_partitions=unfiltered, output_rates=output_rates)
+            layout['cpus'] = cpu_detail
+            sizes = layout.get('chunk_sizes') or sizes  # sizes whose rings do not fit are dropped
+            layout['per_variant_transfer_bytes'] = per_variant
+            split = options.get('split', 'auto')
+            if split not in ('auto', 'variants', 'traits'):
+                raise ValueError("autotune_options['split'] must be 'auto', 'variants' or 'traits'")
+            tiled = layout.get('trait_devices') or []
+            if (mode == 'significant' and len(tiled) > 1 and split != 'traits'
+                    and layout.get('fit_traits', 0) >= int(np.shape(phenotype)[1])):
+                # The panel fits every GPU, so either split works; price data
+                # movement with measured bandwidth (layout_pricing).
+                from .empirical_autotune import best_shard_count
+                from .layout_pricing import choose_split, measure_transfer, peak_fp32_flops, split_costs
+                # Tiles keep the tile rule's GPU count; shards take the count
+                # that balances per-GPU setup against the work, over every GPU
+                # the CPU supply allows (full-scale H100: 2 shards 347 s,
+                # 4 shards 106 s). Each layout is priced at its own count.
+                considered = list(layout.get('devices_considered') or tiled)
+                shard_count = len(tiled)
+                if gpu_per_variant and setup:
+                    shard_count = max(2, best_shard_count((last - first) * gpu_per_variant, setup, len(considered)))
+                shard_devices = considered[:shard_count]
+                prices = measure_transfer(list(dict.fromkeys(shard_devices + list(tiled))))
+                common = dict(n_samples=int(genotype.shape[0]), n_traits=int(np.shape(phenotype)[1]),
+                              n_variants=last-first, genotype_bytes_per_variant=per_variant, **prices)
+                costs = dict(
+                    variant_shards=split_costs(devices=shard_devices, flops={d: peak_fp32_flops(d) for d in shard_devices},
+                                               **common)['variant_shards'],
+                    phenotype_tiles=split_costs(devices=list(tiled), flops={d: peak_fp32_flops(d) for d in tiled},
+                                                **common)['phenotype_tiles'])
+                chosen = choose_split(costs) if split == 'auto' else split
+                layout['split_pricing'] = dict(prices=prices, costs=costs, choice=chosen, requested=split,
+                                               shard_devices=shard_devices, tile_devices=list(tiled))
+                if chosen == 'variants':
+                    # reader_workers is a total that shards divide; keep each GPU's readers.
+                    per_device = max(1, int(layout['reader_workers']) // max(1, len(tiled)))
+                    layout.update(variant_devices=shard_devices, trait_devices=None, trait_block=None,
+                                  reader_workers=per_device * len(shard_devices))
+                    layout['why'].append(
+                        f"variant shards over {len(shard_devices)} GPUs: priced {costs['variant_shards']['total']:.2f} s "
+                        f"vs {costs['phenotype_tiles']['total']:.2f} s for {len(tiled)} phenotype tiles")
+                else:
+                    layout['why'].append(
+                        f"phenotype tiles kept: priced {costs['phenotype_tiles']['total']:.2f} s "
+                        f"vs {costs['variant_shards']['total']:.2f} s for variant shards")
+            trait_block, trait_devices, variant_devices = (layout['trait_block'], layout['trait_devices'],
+                                                           layout['variant_devices'])
+            device = layout['device']
+            if requested_reader_workers is None:
+                reader_workers = int(layout['reader_workers'])
+                if hasattr(genotype, 'decode_workers'):
+                    genotype.decode_workers = reader_workers
+            if requested_prefetch_chunks is None:
+                prefetch_chunks = int(layout['prefetch_chunks'])
+        resolved_device = choose_device(variant_devices[0] if variant_devices else
+                                        trait_devices[0] if trait_devices else device)
+        chunk_size = max(sizes)
+        empirical.update(sizes=sizes, layout=layout, devices_seen=seen)
     resolved_compute_dtype = _resolve_linear_compute_dtype(genotype, compute_dtype)
+    if calibrator is not None and resolved_compute_dtype!='float32':
+        raise ValueError('initial_calibration requires resolved float32 computation')
+    if autotuner is not None:
+        autotuner.validate_inputs(genotype, phenotype, covariates)
     if sumstats_fields not in {"beta+t", "t"}:
         raise ValueError(
             f"sumstats_fields must be 'beta+t' or 't', got {sumstats_fields!r}"
@@ -595,58 +965,27 @@ def run_linear_gwas(
         raise ValueError(
             "sumstats_fields='t' applies only to sumstats_format='binary'"
         )
-    if sumstats_format == "none" and p_value_threshold is not None:
+    if sumstats_format == "none" and (p_value_threshold is not None):
         raise ValueError("row selection requires binary output")
     if p_value_threshold is not None and not (0.0 < p_value_threshold <= 1.0):
         raise ValueError("p_value_threshold must be in (0, 1]")
     # A reduction changes what the scan produces, not merely which rows are
     # kept, so every combination that assumes a full (variant x trait) matrix is
     # refused here rather than silently producing a narrower one.
+    if (jagwas_rcond is not None or jagwas_min_residual is not None) and reduce != "jagwas":
+        raise TypeError("jagwas_rcond and jagwas_min_residual need reduce='jagwas'")
     reduction = None
     significance = None
     jagwas = None
     if reduce == "jagwas":
-        from .reduce import JagwasReduction
-
         if output_dir is None:
             raise ValueError(
                 "reduce='jagwas' requires output_dir: it is a streaming "
                 "reduction and the in-memory path returns the full matrix")
         if reduce_top_k is not None:
             raise ValueError("reduce_top_k does not apply to 'jagwas'")
-        if trait_block is not None:
-            raise ValueError(
-                "jagwas cannot be trait-blocked: the statistic is a quadratic "
-                "form over the whole trait correlation, so a block of traits "
-                "does not carry enough information to be merged")
-        # Which makes jagwas feasible only while the WHOLE phenotype fits --
-        # it needs the full K-wide residualised matrix and a K x K correlation
-        # at once, and neither can be tiled. Say so here, with the arithmetic,
-        # rather than letting a voxel-scale K fail somewhere inside the scan:
-        # at K = 2,085,000 the correlation alone is 17 TB.
-        traits = int(np.asarray(phenotype).shape[1])
-        samples = int(np.asarray(phenotype).shape[0])
-        correlation_bytes = traits * traits * 4
-        residual_bytes = samples * traits * 4
-        try:
-            import torch as _torch
-
-            budget = (int(_torch.cuda.mem_get_info(_torch.device(device))[0])
-                      if str(device).startswith("cuda") and _torch.cuda.is_available()
-                      else None)
-        except Exception:  # noqa: BLE001 - a probe failure must not decide this
-            budget = None
-        if budget is not None and correlation_bytes + residual_bytes > budget:
-            raise ValueError(
-                f"reduce='jagwas' needs the whole phenotype at once: a "
-                f"{traits} x {traits} trait correlation is "
-                f"{correlation_bytes / 1e9:.1f} GB and the residualised "
-                f"phenotype is {residual_bytes / 1e9:.1f} GB, against "
-                f"{budget / 1e9:.1f} GB free on {device}. The statistic is a "
-                f"quadratic form over all traits, so it cannot be tiled -- use "
-                f"reduce='significant', which streams and is what scales to "
-                f"this many traits")
-        jagwas = JagwasReduction()
+        from .jagwas_projection import JagwasReduction
+        jagwas = JagwasReduction(rcond=jagwas_rcond, min_residual=jagwas_min_residual)
         reduction = jagwas
         reduce = None
     if reduce == "significant":
@@ -660,7 +999,8 @@ def run_linear_gwas(
         if reduce_top_k is not None:
             raise ValueError("reduce_top_k does not apply to 'significant'")
         significance = SignificantPairs(significance_threshold)
-        # Run the proven fast path and select **after** it, not inside it.
+        # Use the native pipeline. The optional device selector transfers only
+        # passing pairs; the host fallback filters complete result chunks.
         # Two earlier designs are recorded here because each was wrong in its
         # own way. Routing significance to the generic device path measured
         # **307x slower** (1362.75 s against 4.44 s on the same 200,000-variant
@@ -711,19 +1051,28 @@ def run_linear_gwas(
         raise ValueError(
             "reduce_top_k does not apply: the user-facing reductions are "
             "'significant' and 'jagwas', and neither takes a k")
+    full_tiled_output = trait_block is not None and reduction is None and significance is None
+    full_variant_output = variant_devices is not None and jagwas is None and significance is None
+    jagwas_variant_output = variant_devices is not None and jagwas is not None
+    # Significant pairs are selected per (variant, phenotype) cell: variant
+    # shards need no cross-shard state, only the shared indexed writer.
+    significant_variant_output = variant_devices is not None and significance is not None
+    if variant_devices is not None and not isinstance(genotype,ChunkedGenotype):
+        raise ValueError('variant_devices requires a streaming genotype source')
+    if full_tiled_output and pipeline_profile is not None:
+        raise ValueError('The coarse pipeline profile does not model full-output trait tiling')
     if trait_block is not None:
-        # Trait blocking only makes sense with a reduction: without one the
-        # scan emits every (variant, trait) cell anyway, so nothing is saved
-        # and the blocks would just be re-read genotypes.
-        if reduction is None and significance is None:
+        if full_tiled_output and (output_dir is None or sumstats_format!='binary'
+                                  or p_value_threshold is not None
+                                  or not isinstance(genotype,ChunkedGenotype)):
             raise ValueError(
-                "trait_block requires reduce: blocking the traits only helps "
-                "when the result is reduced across them, otherwise every cell "
-                "is emitted regardless and the blocks cost extra passes")
+                'full-output trait_block requires streaming genotype, output_dir and unfiltered binary output')
+        if isinstance(trait_block,bool) or not isinstance(trait_block,(int,np.integer)):
+            raise ValueError('trait_block must be a positive integer')
         if int(trait_block) < 1:
             raise ValueError("trait_block must be positive")
     elif ((reduction is not None or significance is not None)
-          and jagwas is None and str(device).startswith("cuda")):
+          and jagwas is None and str(device).startswith("cuda") and empirical is None):
         # `significance is not None` matters as much as `reduction`, and
         # leaving it out meant the ONE mode the voxel stress test uses was
         # the one mode that never blocked. `reduce='significant'` builds a
@@ -820,18 +1169,6 @@ def run_linear_gwas(
             "trait_devices requires trait_block: the devices are given trait "
             "blocks to work on, so there must be blocks to give")
 
-    # Dense binary output asks the GPU for an additional float64 -log10(P)
-    # matrix before the writer casts it to float32. Resolve that contract
-    # before preflight so its pinned-result estimate includes the extra ring.
-    dense_binary = (
-        output_dir is not None
-        and sumstats_format == "binary"
-        and significance is None
-        and jagwas is None
-        and reduction is None
-        and p_value_threshold is None
-    )
-
     # PREFLIGHT. Refuse an impossible plan here, before a byte is read.
     #
     # Supplementary Methods S3.1 lists as a limitation that "users must
@@ -871,8 +1208,7 @@ def run_linear_gwas(
                                        else np.asarray(covariates).shape[1]),
                     transfer_bytes_per_variant=per_variant,
                     device_memory_bytes=float(free_bytes),
-                    reduced=(reduction is not None or significance is not None),
-                    compute_log10_p=dense_binary)
+                    reduced=(reduction is not None or significance is not None))
         except ImportError:
             pass
         # PlanTooLarge is NOT caught: refusing early with a workable setting is
@@ -915,6 +1251,7 @@ def run_linear_gwas(
         # perf_counter per boundary costs nothing and turns "somewhere in
         # setup" into a number that can be argued with.
         _phase_prep_started = time.perf_counter()
+        import os as _os_env
         phenotype, covariates, qc = prepare_inputs_for_prep(
             genotype.genotype,
             phenotype,
@@ -923,8 +1260,60 @@ def run_linear_gwas(
             validate_genotype=not fused_bed_qc,
             dtype=(np.float32 if resolved_compute_dtype == 'float32'
                    else np.float64),
+            phenotype_block_size=(autotuner.qc_trait_block if autotuner is not None else int(trait_block) if full_tiled_output or (significance is not None and trait_block is not None) else min(4096,phenotype.shape[1]) if full_variant_output or jagwas is not None or significance is not None else None),
+            qc_device=(str(resolved_device) if getattr(resolved_device, 'type', None) == 'cuda'
+                       and _os_env.environ.get('TORCHGWAS_PHENOTYPE_QC', 'device') == 'device' else None),
         )
         _phase_prep_done = time.perf_counter()
+        if jagwas is not None:
+            # Missing values are mean-imputed like full output's; JAGWAS then
+            # takes the imputed panel's t with the common df (linear.py).
+            if phenotype.shape[1] > phenotype.shape[0]-1:
+                raise ValueError('jagwas trait count exceeds the residual phenotype rank')
+            # Blocked QC preserves source precision and lazy column subsets.
+            # The joint preprocessing and factor must use the scan precision.
+            phenotype = np.asarray(phenotype, dtype=np.float32 if resolved_compute_dtype == 'float32' else np.float64)
+        if significance is not None and not qc['phenotype_missing_cells']:
+            significance.prepare_integer_df(int(phenotype.shape[0]), int(phenotype.shape[1]))
+        if autotuner is not None:
+            settings, audit, autotune_basis = autotuner.select(genotype, phenotype, covariates, qc,
+                output=dict(block_bytes=sumstats_block_bytes,
+                    queue_depth=DEFAULT_SUMSTATS_QUEUE_DEPTH if sumstats_queue_depth is None else sumstats_queue_depth,
+                    store_beta=jagwas is None and sumstats_fields!='t', fsync=sumstats_fsync))
+            chunk_size = settings['chunk_size']
+            trait_block = settings.get('trait_block')
+            trait_devices = settings.get('trait_devices')
+            variant_devices = settings.get('variant_devices')
+            jagwas_variant_output = variant_devices is not None and jagwas is not None
+            full_variant_output = variant_devices is not None and jagwas is None and significance is None
+            significant_variant_output = variant_devices is not None and significance is not None
+            full_tiled_output = trait_block is not None and reduction is None and significance is None
+            effective_chunk_size = chunk_size
+            reader_workers = settings['reader_workers']
+            # The path-backed source was opened before the planner chose its
+            # reader budget. Apply that choice to its native decode preference
+            # as well, including choices above the loader's initial default.
+            if hasattr(genotype, 'decode_workers'):
+                genotype.decode_workers = reader_workers
+            prefetch_chunks = settings['prefetch_chunks']
+            resolved_device = choose_device(settings['device'])
+            qc['genotype_qc_chunk_size'] = chunk_size
+            qc['phenotype_qc_trait_block'] = autotuner.qc_trait_block
+            genotype_meta['autotune'] = audit
+            productive = getattr(autotuner,'productive',None)
+        if jagwas is not None:
+            # Check the actual selected devices, after live planner admission.
+            # Every active worker retains the complete phenotype factor.
+            from .reduction_tensor_work import require_jagwas_factor_capacity
+            factor_devices = [str(resolved_device)]
+            if variant_devices is not None:
+                from .linear import multigpu_variant_ranges
+                first, last = _resolve_variant_range(variant_range, int(genotype.shape[1]))
+                active = len(multigpu_variant_ranges(last-first, int(effective_chunk_size), len(variant_devices))) if last > first else 1
+                factor_devices = variant_devices[:max(1,active)]
+            require_jagwas_factor_capacity(int(phenotype.shape[0]), int(phenotype.shape[1]),
+                factor_devices, compute_dtype=resolved_compute_dtype,
+                method='eigen' if jagwas.rcond is not None else 'rounding')
         if pipeline_profile is not None:
             if resolved_device.type != "cuda" or resolved_compute_dtype != "float32":
                 raise ValueError("pipeline profiles currently describe the float32 CUDA scan")
@@ -951,7 +1340,9 @@ def run_linear_gwas(
             if marker_ids is None
             else marker_ids[: genotype.shape[1]]
         )
-        trait_names = trait_columns or [f"trait_{i}" for i in range(phenotype.shape[1])]
+        original_trait_names = trait_columns or [f"trait_{i}" for i in range(qc['phenotype_columns_input'])]
+        trait_names = ([original_trait_names[i] for i in qc['phenotype_kept_column_indices']]
+                       if 'phenotype_kept_column_indices' in qc else original_trait_names)
         genotype_shape = list(genotype.shape)
         # A ranged scan reports on its range, not on the file. The variant count
         # and the marker names both have to be narrowed here, or the sumstats
@@ -962,20 +1353,290 @@ def run_linear_gwas(
             genotype_shape[1] = last - first
             if marker_names is not None:
                 marker_names = marker_names[first:last]
-        if output_dir is not None:
+            if variant_metadata is not None:
+                variant_metadata = {key: np.asarray(value)[first:last] for key, value in variant_metadata.items()}
+        if calibrator is not None:
+            calibration_devices=variant_devices or trait_devices or [str(resolved_device)]
+            calibrator.prepare(genotype,devices=calibration_devices,request=dict(
+                capacity=int(chunk_size),prefetch_chunks=int(prefetch_chunks),reader_workers=int(reader_workers),
+                genotype_shape=list(genotype.shape),phenotype_shape=list(phenotype.shape),
+                covariate_shape=None if covariates is None else list(covariates.shape),
+                variant_range=list(_resolve_variant_range(variant_range,int(genotype.shape[1]))),
+                trait_block=trait_block,trait_devices=trait_devices,variant_devices=variant_devices,
+                reduction='jagwas' if jagwas is not None else 'significant' if significance is not None else 'full',
+                significance_threshold=None if significance is None else significance.resolved_threshold(len(trait_names)),
+                p_value_threshold=p_value_threshold,
+                sumstats_fields=sumstats_fields,sumstats_block_bytes=sumstats_block_bytes,
+                sumstats_queue_depth=sumstats_queue_depth,sumstats_fsync=sumstats_fsync,
+                sumstats_variant_ids=sumstats_variant_ids,pgen_decode_workers=pgen_decode_workers,
+                pgen_decode_batch_size=pgen_decode_batch_size,trait_names=list(trait_names),
+                covariate_columns=covariate_columns))
+        if empirical is not None:
+            from .empirical_autotune import EmpiricalChunkTuner
+            from .adaptive_chunks import validate_chunk_control
+            passes = 1 if trait_block is None else -(-int(phenotype.shape[1])//int(trait_block))
+            options, sizes = empirical['options'], empirical['sizes']
+            concurrent = len(variant_devices or trait_devices or [resolved_device])
+            empirical['tuner_disabled_reason'] = None
+            from .adaptive_chunks import chunk_control_path
+            empirical['control_path'] = chunk_control_path(
+                genotype, choose_device((variant_devices or trait_devices or [str(resolved_device)])[0]))
+            if len(sizes) > 1:
+                try:
+                    tuner_kind = options.get('tuner', 'model')
+                    if tuner_kind == 'model':
+                        # Per-chunk samples, load-adjusted, re-planned on drift.
+                        from .model_autotune import ModelChunkTuner
+                        candidate = ModelChunkTuner(
+                            sizes, total_rows=int(genotype_shape[1])*passes,
+                            warmup_fraction=float(options.get('warmup_fraction', 0.02)),
+                            max_probe_share=float(options.get('trial_fraction', 0.3)),
+                            probe_chunks=int(options.get('probe_chunks', 4)),
+                            margin=float(options.get('min_gain', 0.03)),
+                            depth=int(prefetch_chunks), concurrent=concurrent,
+                            min_job_seconds=float(options.get('min_job_seconds', 20.0)))
+                    elif tuner_kind == 'segments':
+                        candidate = EmpiricalChunkTuner(
+                            sizes, total_rows=int(genotype_shape[1])*passes,
+                            warmup_fraction=float(options.get('warmup_fraction', 0.03)),
+                            trial_fraction=float(options.get('trial_fraction', 0.25)),
+                            repeats=int(options.get('repeats', 2)), min_gain=float(options.get('min_gain', 0.02)),
+                            depth=int(prefetch_chunks), concurrent=concurrent,
+                            min_job_seconds=float(options.get('min_job_seconds', 20.0)))
+                    else:
+                        raise ValueError("autotune_options['tuner'] must be 'model' or 'segments'")
+                    for tuned_device in (variant_devices or trait_devices or [str(resolved_device)]):
+                        validate_chunk_control(genotype, choose_device(tuned_device), resolved_compute_dtype,
+                                               int(chunk_size), candidate.control, candidate)
+                    empirical_tuner = candidate
+                except ValueError as error:
+                    empirical['tuner_disabled_reason'] = str(error)
+            else:
+                empirical['tuner_disabled_reason'] = 'single chunk size'
+            if empirical_tuner is None:
+                # Without switchable chunks, use one mid-range size rather
+                # than the largest candidate the ring was sized for.
+                chunk_size = effective_chunk_size = sizes[(len(sizes)-1)//2]
+                qc['genotype_qc_chunk_size'] = chunk_size
+        output_progress = (productive.output_written if productive is not None else
+                           None if calibrator is None else calibrator.output_written)
+        # One decode pass shared by concurrently scanning phenotype tiles
+        # (shared_decode.py): on for autotuned runs, or TORCHGWAS_SHARED_DECODE=1.
+        import os as _os
+        import threading
+        # Autotuned runs select significant pairs on the GPU (layout_profile
+        # 2026-09-24: never slower, 10x faster on a CPU-loaded host); an
+        # explicit TORCHGWAS_SIGNIFICANCE_BACKEND still wins.
+        significance_backend = ('device' if empirical is not None and significance is not None
+                                and 'TORCHGWAS_SIGNIFICANCE_BACKEND' not in _os.environ else None)
+        if empirical is not None and significance is not None:
+            genotype_meta['significance_backend'] = (significance_backend
+                                                     or _os.environ.get('TORCHGWAS_SIGNIFICANCE_BACKEND', 'host'))
+        shared_state = dict(hub=None, enabled=False)
+        # More phenotype tiles than GPUs means rounds, and every round decodes
+        # the genotype again. TORCHGWAS_GENOTYPE_CACHE=1 decodes once into
+        # host memory instead. Opt-in: with hardcall PGEN (cheap decode,
+        # GPU-bound rounds) it measured no gain and cost the cache fills
+        # (docs/autotune_design_20260924.md); it is for expensive decoders.
+        tile_source = genotype
+        if (trait_block is not None and productive is None and calibrator is None
+                and _os.environ.get('TORCHGWAS_GENOTYPE_CACHE', '0') == '1'):
+            tile_count = -(-int(phenotype.shape[1])//int(trait_block))
+            if tile_count > len(trait_devices or [resolved_device]):
+                from .genotype_cache import CachedFillSource, fill_cache_for
+                fill_cache = fill_cache_for(genotype, _resolve_variant_range(variant_range, int(genotype.shape[1])))
+                if fill_cache is not None:
+                    tile_source = CachedFillSource(genotype, fill_cache)
+                    shared_state['genotype_cache'] = fill_cache
+        if trait_block is not None and productive is None and calibrator is None and (
+                (empirical is not None and empirical['options'].get('shared_decode', True))
+                or _os.environ.get('TORCHGWAS_SHARED_DECODE', '0') == '1'):
+            from .shared_decode import shared_decode_eligible
+            shared_devices = trait_devices or [str(resolved_device)]
+            shared_tiles = -(-int(phenotype.shape[1])//int(trait_block))
+            shared_state['enabled'] = shared_decode_eligible(
+                genotype, devices=shared_devices, tiles=shared_tiles, compute_dtype=resolved_compute_dtype)
+            shared_state.update(tiles=shared_tiles, lock=threading.Lock(), fanout=None)
+            if shared_state['enabled']:
+                # GPU fan-out: one PCIe copy to the first tile GPU, then peer
+                # copies. 'auto' and 'pcie' copy from host to every GPU. Fan-out
+                # doubles raw delivery on the A100 host pairs that share a PCIe
+                # uplink (probe: 6.7 versus 3.3 GB/s each), yet end to end it
+                # tied at 2 tiles and lost at 4 there and on the H100 host: host
+                # transfer was not the bottleneck. 'uplink' fans out only over
+                # NVLink between GPUs sharing an uplink; 'nvlink' whenever
+                # NVLink connects them; 'peer' always.
+                from .shared_decode import fanout_root, nvlink_root, root_slots
+                fanout_mode = ((empirical['options'].get('gpu_fanout') if empirical is not None else None)
+                               or _os.environ.get('TORCHGWAS_GPU_FANOUT', 'auto'))
+                if fanout_mode not in ('auto', 'pcie', 'uplink', 'nvlink', 'peer'):
+                    raise ValueError("gpu_fanout must be 'auto', 'pcie', 'uplink', 'nvlink' or 'peer'")
+                tile_devices = shared_devices[:shared_tiles]
+                root = (str(tile_devices[0]) if fanout_mode == 'peer' else
+                        nvlink_root(tile_devices) if fanout_mode == 'nvlink' else
+                        fanout_root(tile_devices) if fanout_mode == 'uplink' else None)
+                shared_state.update(fanout_mode=fanout_mode, fanout_reason=None if root else 'not selected')
+                if root is not None and empirical is not None:
+                    # The root keeps an extra ring of chunks beside its own tile's rings.
+                    from .empirical_autotune import gpu_free_bytes
+                    from .pipeline_model import device_ring_bytes
+                    per_variant = (empirical.get('layout') or {}).get('per_variant_transfer_bytes',
+                                                                      float(genotype.shape[0])*4.0)
+                    slots = root_slots(max(int(prefetch_chunks), min(int(reader_workers), 16)))
+                    need = slots*int(chunk_size)*per_variant + device_ring_bytes(
+                        chunk_variants=int(chunk_size), depth=int(prefetch_chunks), n_samples=int(genotype.shape[0]),
+                        n_traits=int(trait_block), covariate_rank=int(0 if covariates is None else np.shape(covariates)[1]),
+                        transfer_bytes_per_variant=per_variant)
+                    free = gpu_free_bytes([root]).get(root)
+                    if free is not None and need > 0.85*free:
+                        shared_state['fanout_reason'] = (f'root GPU memory: needs {need/2**30:.1f} GiB, '
+                                                         f'{free/2**30:.1f} GiB free')
+                        root = None
+                shared_state['fanout'] = root
+
+        def shared_subscriber(first):
+            """This tile's share of the decode hub, or None when not sharing."""
+            if not shared_state['enabled']:
+                return None
+            from .shared_decode import SharedDecodeHub
+            with shared_state['lock']:
+                if shared_state['hub'] is None:
+                    shared_state['hub'] = SharedDecodeHub(
+                        genotype, int(chunk_size), max(int(prefetch_chunks), min(int(reader_workers), 16)),
+                        int(reader_workers), subscribers=shared_state['tiles'], variant_range=variant_range,
+                        chunk_size_selector=None if empirical_tuner is None else empirical_tuner.control,
+                        record_timing=empirical_tuner is not None, fanout_device=shared_state['fanout'])
+                return shared_state['hub'].subscriber(first//int(trait_block))
+        if full_tiled_output or full_variant_output:
+            from .preprocess import _covariate_basis
+            from .sumstats_tiled import write_trait_tiled_sumstats,ScanSourceView
+            q_matrix = (autotune_basis if autotune_basis is not None else
+                        None if covariates is None or covariates.shape[1]==0 else _covariate_basis(covariates))
+            rank = 0 if q_matrix is None else q_matrix.shape[1]
+            # A panel with missing phenotypes keeps the single-device contract:
+            # t from the mean-imputed panel with per-trait df, no variant df
+            # sidecar. Tiling or sharding must not change the p-value convention.
+            partition_trait_df = (None if not qc['phenotype_missing_cells'] else
+                (np.asarray(qc['phenotype_observed_counts'], dtype=np.int64) - rank - 2).tolist())
+            offset = 0 if variant_range is None else _resolve_variant_range(variant_range,genotype.shape[1])[0]
+            tile_qc = {}
+            tile_observed_counts = np.asarray(qc['phenotype_observed_counts'], dtype=np.int64)
+
+            def scan_tile(first,width,tile_device,workers,_variant_span=None):
+                # Take this tile's decode share first and give it back if setup
+                # fails, so a failing tile cannot hold the shared decoder up.
+                shared=shared_subscriber(first) if _variant_span is None else None
+                try:
+                    yield from _scan_tile(first,width,tile_device,workers,_variant_span,shared)
+                finally:
+                    if shared is not None:shared.close()  # idempotent after a normal finish
+
+            def _scan_tile(first,width,tile_device,workers,_variant_span,shared):
+                # Readers own their handles; metadata and input mappings are
+                # read-only. Isolate per-scan profiles/exclusion counters.
+                source=ScanSourceView(tile_source)
+                if hasattr(source,'decode_workers'):
+                    source.decode_workers=workers
+                tile_phenotype=np.asarray(phenotype[:,first:first+width],
+                                         dtype=np.float32 if resolved_compute_dtype=='float32' else np.float64)
+                iterator,_=linear_scan_streaming_chunks(source,tile_phenotype,covariates,
+                    chunk_size=chunk_size,device=str(tile_device),compute_dtype=resolved_compute_dtype,
+                    reader_workers=workers,prefetch_chunks=prefetch_chunks,compute_p_values=False,
+                    variant_range=variant_range if _variant_span is None else _variant_span,borrow_results=True,return_df=True,_reader_worker_limit=workers,
+                    _prevalidated_observed_counts=tile_observed_counts[first:first+width],
+                    _prevalidated_covariate_basis=q_matrix,
+                    _chunk_size_selector=(empirical_tuner.control if empirical_tuner is not None else
+                        None if productive is None else productive.for_partition(
+                        str(tile_device),_resolve_variant_range(variant_range if _variant_span is None else _variant_span,int(genotype.shape[1])),
+                        (first,first+width))),
+                    _chunk_observer=(empirical_tuner if empirical_tuner is not None else
+                        calibrator.observer(str(tile_device),
+                        variant_range=_resolve_variant_range(variant_range if _variant_span is None else _variant_span,int(genotype.shape[1])),
+                        trait_range=(first,first+width),reader_workers=workers,capacity=chunk_size,depth=prefetch_chunks)
+                        if calibrator is not None else None if productive is None else
+                        productive.stage_observer(str(tile_device),
+                            _resolve_variant_range(variant_range if _variant_span is None else _variant_span,int(genotype.shape[1])),
+                            (first,first+width))),
+                    return_beta=sumstats_fields!='t',
+                    _shared_loader=shared)
+                try:
+                    for chunk in iterator:
+                        chunk_offset=offset if _variant_span is None else _variant_span[0]
+                        yield (chunk[0]-chunk_offset,chunk[1]-chunk_offset,*chunk[2:])
+                    tile_qc[first if _variant_span is None else _variant_span[0]]=dict(getattr(source,'_last_scan_exclusion_counts',{}))
+                finally:
+                    iterator.close()
+
+            out=mkdir(output_dir)
+            tile_metadata={}
+            def finalize_tiles():
+                if tile_qc:
+                    first_qc=tile_qc[min(tile_qc)]
+                    if full_variant_output:
+                        if any(set(value)!=set(first_qc) for value in tile_qc.values()):
+                            raise RuntimeError('Genotype exclusion categories differ across variant shards')
+                        genotype._last_scan_exclusion_counts={key:sum(value[key] for value in tile_qc.values()) for key in first_qc}
+                    else:
+                        if any(value!=first_qc for value in tile_qc.values()):
+                            raise RuntimeError('Genotype exclusion counts differ across phenotype tiles')
+                        genotype._last_scan_exclusion_counts=first_qc
+                if sumstats_variant_ids:
+                    ids_path=out/'sumstats'/'variant_ids.txt'
+                    tile_metadata['variant_id_bytes']=_write_variant_ids(ids_path,marker_names)
+                    if sumstats_fsync:
+                        import os
+                        with ids_path.open('rb') as handle:
+                            os.fsync(handle.fileno())
+            write_started=time.perf_counter()
+            writer_settings=dict(n_variants=genotype_shape[1],trait_names=trait_names,
+                n_samples=genotype_shape[0],df=genotype_shape[0]-rank-2,
+                reader_workers=int(reader_workers),block_bytes=sumstats_block_bytes,
+                queue_depth=sumstats_queue_depth or DEFAULT_SUMSTATS_QUEUE_DEPTH,fsync=sumstats_fsync,
+                store_beta=sumstats_fields!='t',before_publish=finalize_tiles,
+                on_write_progress=output_progress,
+                on_writer_open=None if productive is None else productive.register_writer,
+                trait_df=partition_trait_df)
+            if full_variant_output:
+                from .sumstats_sharded import write_variant_sharded_sumstats
+                def scan_shard(first,last,shard_device,workers):
+                    return scan_tile(0,phenotype.shape[1],shard_device,workers,
+                                     _variant_span=(offset+first,offset+last))
+                sumstats_summary=write_variant_sharded_sumstats(out/'sumstats',
+                    chunk_size=int(effective_chunk_size),devices=variant_devices,scan_factory=scan_shard,**writer_settings)
+            else:
+                sumstats_summary=write_trait_tiled_sumstats(out/'sumstats',trait_block=int(trait_block),
+                    devices=trait_devices or [str(resolved_device)],scan_factory=scan_tile,**writer_settings)
+            sumstats_summary.update(tile_metadata)
+            sumstats_summary.update(streaming_timing(
+                _phase_prep_done, write_started, time.perf_counter()))
+            n_rows=sumstats_summary['cells']
+            table=[]
+            beta=t_stat=p_value=None
+        elif output_dir is not None:
             # Who may borrow the result ring instead of being handed copies.
             # Audited individually, because getting this wrong corrupts output
             # silently rather than raising:
             #   safe   `_drain_linear_chunks`        reads shapes, retains nothing
+            # Significant selection gathers owned arrays before advancing the
+            # source, so it may also borrow the dense native result ring.
             # Discard-only scans may borrow result buffers. Binary writers
             # retain owned arrays until their background writes complete.
-            borrow_results = (sumstats_format == "none"
+            borrow_results = significance is not None or (sumstats_format == "none"
                               and trait_block is None)
+            full_binary_df = (sumstats_format == 'binary' and reduction is None
+                              and significance is None
+                              and p_value_threshold is None and trait_block is None)
 
-            def _scan(trait_slice=None, device=None):
+            def _scan(trait_slice=None, device=None, *, source=None, workers=None,
+                      observed_counts=None, basis=..., shared_loader=None):
+                panel = phenotype if trait_slice is None else phenotype[:, trait_slice]
+                if significance is not None:
+                    # QC can preserve a mmap or lazy column subset. Convert
+                    # only this tile to the actual compute precision.
+                    panel = np.asarray(panel, dtype=np.float32 if resolved_compute_dtype == 'float32' else np.float64)
                 return linear_scan_streaming_chunks(
-                    genotype,
-                    phenotype if trait_slice is None else phenotype[:, trait_slice],
+                    genotype if source is None else source,
+                    panel,
                     covariates,
                     chunk_size=chunk_size,
                     device=str(device or resolved_device),
@@ -989,20 +1650,77 @@ def run_linear_gwas(
                     # 153.6 million p-values per chunk at K = 150,000 -- and
                     # the significance path then throws every one of them
                     # away: `_significant_pairs_iterator` takes that chunk as
-                    # `_p_chunk` and ignores it, and the writer computes
-                    # -log10(P) only for pairs that clear the threshold. It
+                    # `_p_chunk` and ignores it, and the writer recomputes p
+                    # for the handful of pairs that clear the threshold. It
                     # presented as a multi-GPU problem (one core pinned, all
                     # cards idle, disk idle, worse as K grows, unaffected by
                     # running one process per card) and it was not one.
                     compute_p_values=False,
-                    compute_log10_p=dense_binary,
                     variant_range=variant_range,
                     reduction=reduction,
                     borrow_results=borrow_results,
+                    return_df=full_binary_df or significance is not None,
+                    significance=significance,
+                    significance_n_traits=int(phenotype.shape[1]),
+                    _reader_worker_limit=workers,
+                    _prevalidated_observed_counts=observed_counts,
+                    _prevalidated_covariate_basis=basis,
+                    _chunk_size_selector=(empirical_tuner.control if empirical_tuner is not None else
+                        None if productive is None else productive.for_partition(
+                        str(device or resolved_device),_resolve_variant_range(variant_range,int(genotype.shape[1])),
+                        (0,int(phenotype.shape[1])) if trait_slice is None else (trait_slice.start,trait_slice.stop))),
+                    _chunk_observer=(empirical_tuner if empirical_tuner is not None else
+                        calibrator.observer(str(device or resolved_device),
+                        variant_range=_resolve_variant_range(variant_range,int(genotype.shape[1])),
+                        trait_range=(0,int(phenotype.shape[1])) if trait_slice is None else (trait_slice.start,trait_slice.stop),
+                        reader_workers=reader_workers if workers is None else workers,capacity=chunk_size,depth=prefetch_chunks)
+                        if calibrator is not None else None if productive is None else
+                        productive.stage_observer(str(device or resolved_device),
+                            _resolve_variant_range(variant_range,int(genotype.shape[1])),
+                            (0,int(phenotype.shape[1])) if trait_slice is None else (trait_slice.start,trait_slice.stop))),
+                    return_beta=(sumstats_fields!='t' or reduction is not None or p_value_threshold is not None),
+                    _shared_loader=shared_loader,
+                    _significance_backend=significance_backend,
                 )
 
             blocked_significance = False
-            if trait_block is None:
+            finalize_reduced = None
+            if jagwas_variant_output or significant_variant_output:
+                from .linear import linear_scan_multigpu, multigpu_variant_ranges
+                ranges = multigpu_variant_ranges(genotype_shape[1], int(effective_chunk_size), len(variant_devices))
+                active_variant_devices = variant_devices[:len(ranges)]
+                # JAGWAS keeps a joint factor per device; significant pairs are
+                # selected cell by cell on each device (stateless).
+                if jagwas_variant_output:
+                    # Shards share the run's kept-trait decision (collinear traits dropped once).
+                    shard_output = dict(reduction_factory=jagwas.spawn)
+                else:
+                    from .linear import _significant_pairs_iterator
+                    # Select pairs on each shard's thread, as trait tiles do;
+                    # the chunks carry their own df (return_df).
+                    shard_output = dict(significance=significance, significance_n_traits=int(phenotype.shape[1]),
+                                        return_df=True, return_beta=sumstats_fields != 't',
+                                        _significance_backend=significance_backend,
+                                        shard_transform=lambda chunks: _significant_pairs_iterator(
+                                            chunks, significance, len(trait_names), None),
+                                        # Selection copies the passing pairs before the next
+                                        # chunk, so it can read the scan's ring directly.
+                                        transform_borrows=True)
+                chunk_iterator, q_matrix = linear_scan_multigpu(
+                    genotype, phenotype, covariates, devices=variant_devices,
+                    chunk_size=int(effective_chunk_size), compute_dtype=resolved_compute_dtype,
+                    reader_workers=int(reader_workers), prefetch_chunks=prefetch_chunks,
+                    compute_p_values=False, ordered=False, variant_range=variant_range,
+                    **shard_output,
+                    _chunk_size_selector=(empirical_tuner.control if empirical_tuner is not None else
+                        None if productive is None else productive.run),
+                    _chunk_observer=empirical_tuner if empirical_tuner is not None else
+                        calibrator if calibrator is not None else
+                        productive if productive is not None and productive.stage_sample is not None else None,
+                    shared_queue_depth=DEFAULT_SUMSTATS_QUEUE_DEPTH if sumstats_queue_depth is None else sumstats_queue_depth,
+                    result_queue_registration=None if productive is None or not jagwas_variant_output
+                        else productive.register_indexed_result_queue)
+            elif trait_block is None:
                 chunk_iterator, q_matrix = _scan()
             else:
                 # One block's design is resident at a time, so the device never
@@ -1018,18 +1736,72 @@ def run_linear_gwas(
                 q_matrix = (None if covariates is None or covariates.shape[1] == 0
                             else _covariate_basis(covariates))
 
-                def _blocked(offset, width, device=None):
-                    iterator, _ = _scan(slice(offset, offset + width), device)
-                    return iterator
-
                 blocked_significance = significance is not None
                 if blocked_significance:
+                    from .sumstats_tiled import ScanSourceView
+                    from .reduced_output_work import significant_execution_layout
+                    layout = significant_execution_layout(int(phenotype.shape[1]), int(trait_block),
+                        trait_devices or [str(resolved_device)], int(reader_workers),
+                        queue_depth=sumstats_queue_depth)
+                    reader_budgets = dict(zip(layout['devices'], layout['readers_per_device']))
+                    tile_records = {}
+                    observed = np.asarray(qc['phenotype_observed_counts'], dtype=np.int64)
+
+                    def _blocked(offset, width, device=None):
+                        # Take the decode share first; give it back on any exit.
+                        shared = shared_subscriber(offset)
+                        iterator = None
+                        try:
+                            dev = str(device or layout['devices'][0])
+                            source = ScanSourceView(tile_source)
+                            workers = reader_budgets[dev]
+                            if hasattr(source, 'decode_workers'):
+                                source.decode_workers = workers
+                            iterator, _ = _scan(slice(offset, offset + width), dev,
+                                source=source, workers=workers,
+                                observed_counts=observed[offset:offset + width], basis=q_matrix,
+                                shared_loader=shared)
+                            yield from iterator
+                            tile_records[offset] = dict(trait_range=[offset, offset + width],
+                                device=dev, reader_workers=workers,
+                                exclusions=dict(getattr(source, '_last_scan_exclusion_counts', {})),
+                                profile=dict(getattr(source, '_last_scan_profile', {})))
+                        finally:
+                            try:
+                                if iterator is not None:
+                                    iterator.close()
+                            finally:
+                                if shared is not None:
+                                    shared.close()
+
+                    def finalize_reduced():
+                        records = [tile_records[key] for key in sorted(tile_records)]
+                        if len(records) != layout['tiles']:
+                            raise RuntimeError('Incomplete significant phenotype tiles')
+                        counts = records[0]['exclusions']
+                        if any(record['exclusions'] != counts for record in records):
+                            raise RuntimeError('Genotype exclusion counts differ across phenotype tiles')
+                        genotype._last_scan_exclusion_counts = counts
+                        profile = dict(mode='significant_trait_tiles', layout=layout, tiles=records,
+                            scope='Per-tile profiles; durations can overlap and are not total wall time')
+                        if all('result_payload_bytes' in record['profile'] for record in records):
+                            profile['result_payload_bytes'] = sum(record['profile']['result_payload_bytes'] for record in records)
+                        genotype._last_scan_profile = profile
+                else:
+                    def _blocked(offset, width, device=None):
+                        iterator, _ = _scan(slice(offset, offset + width), device)
+                        return iterator
+                if blocked_significance:
+                    from .sumstats_indexed import IndexedOutputPartition
                     chunk_iterator = _trait_blocked_significant_chunks(
                         _blocked, significance, int(phenotype.shape[1]),
                         int(trait_block),
                         genotype_shape[0] - (0 if q_matrix is None
                                              else q_matrix.shape[1]) - 2,
-                        devices=trait_devices)
+                        devices=layout['devices'], queue_depth=layout['queue_depth'],
+                        partition_context=None if calibrator is None and productive is None else lambda first,width,dev: IndexedOutputPartition(
+                            str(dev or layout['devices'][0]),
+                            tuple(_resolve_variant_range(variant_range,int(genotype.shape[1]))),(first,first+width)))
                 else:
                     chunk_iterator = _trait_blocked_reduced_chunks(
                         _blocked, reduction, int(phenotype.shape[1]),
@@ -1051,13 +1823,16 @@ def run_linear_gwas(
                     # absolute variant indices, which needs the same shift as
                     # the bounds. Shifting only the bounds there would name
                     # the wrong marker on every row.
-                    for chunk in source:
-                        if len(chunk) == 7:
-                            yield (chunk[0] - offset, chunk[1] - offset,
-                                   chunk[2] - offset, *chunk[3:])
-                        else:
-                            yield (chunk[0] - offset, chunk[1] - offset,
-                                   *chunk[2:])
+                    from .sumstats_indexed import PartitionedIndexedChunk
+                    try:
+                        for chunk in source:
+                            if len(chunk) == 7:
+                                payload=(chunk[0]-offset,chunk[1]-offset,chunk[2]-offset,*chunk[3:])
+                            else:
+                                payload=(chunk[0]-offset,chunk[1]-offset,*chunk[2:])
+                            yield chunk.with_payload(payload) if isinstance(chunk,PartitionedIndexedChunk) else payload
+                    finally:
+                        if hasattr(source,'close'):source.close()
 
                 chunk_iterator = _rebased(chunk_iterator)
             out = mkdir(output_dir)
@@ -1086,18 +1861,45 @@ def run_linear_gwas(
             write_started = time.perf_counter()
             if sumstats_format == "none":
                 n_rows, sumstats_summary = _drain_linear_chunks(chunk_iterator)
+                if finalize_reduced is not None:
+                    finalize_reduced()
             elif (significance is not None or jagwas is not None or reduction is not None
                   or p_value_threshold is not None):
-                from .sumstats_indexed import write_indexed_sumstats
+                from .sumstats_indexed import write_indexed_sumstats,IndexedOutputPartition,COALESCE_ROWS
                 kind = ("significant" if significance is not None else "jagwas" if jagwas is not None
                         else "reduced" if reduction is not None else "filtered")
+                indexed_observed=output_progress is not None and kind in ('jagwas','significant')
+                source_start,source_stop=_resolve_variant_range(variant_range,int(genotype.shape[1]))
+                partition_for_range=None
+                if indexed_observed and not blocked_significance:
+                    partitions=([IndexedOutputPartition(dev,(source_start+lo,source_start+hi),(0,len(trait_names)))
+                        for dev,(lo,hi) in zip(active_variant_devices,ranges)]
+                        if jagwas_variant_output or significant_variant_output else
+                        [IndexedOutputPartition(str(resolved_device),(source_start,source_stop),(0,len(trait_names)))])
+                    def partition_for_range(start,end):
+                        matches=[p for p in partitions if p.variant_range[0]<=start<end<=p.variant_range[1]]
+                        if len(matches)!=1:raise ValueError('Indexed source range must identify one producer')
+                        return matches[0]
+                indexed_live_progress=None
+                if productive is not None and kind in ('jagwas','significant') and indexed_observed:
+                    from .indexed_writer_progress import IndexedWriterProgress
+                    indexed_live_progress=IndexedWriterProgress(kind)
+                    productive.register_indexed_writer(indexed_live_progress)
                 n_rows, sumstats_summary = write_indexed_sumstats(
                     out / "sumstats", marker_names, trait_names, genotype_shape[0], chunk_iterator,
                     kind=kind, df=residual_df,
-                    chi2_df=jagwas.degrees_of_freedom if jagwas is not None else None,
+                    # The kept rank is known once the factors are prepared, before the manifest.
+                    chi2_df=(lambda: jagwas.degrees_of_freedom) if jagwas is not None else None,
+                    extra_manifest=((lambda: dict(jagwas_rank=jagwas.rank_report(trait_names)))
+                                    if jagwas is not None else None),
                     p_value_threshold=p_value_threshold,
                     variant_metadata=variant_metadata,fsync=sumstats_fsync,
-                    store_beta=sumstats_fields != "t")
+                    store_beta=sumstats_fields != "t", before_publish=finalize_reduced,
+                    on_chunk_written=output_progress if indexed_observed else None,
+                    partition_for_range=partition_for_range,variant_offset=source_start,
+                    live_progress=indexed_live_progress,
+                    # Large parts unless the JIT path observes each chunk's write.
+                    coalesce_rows=None if indexed_observed else COALESCE_ROWS)
             else:
                 n_rows, sumstats_summary = _write_linear_binary_streaming(
                     out / "sumstats",
@@ -1114,8 +1916,23 @@ def run_linear_gwas(
                     store_beta=sumstats_fields != "t",
                     extra_manifest={"genotype_format": genotype_meta.get("format")},
                     borrow_results=borrow_results,
+                    store_variant_df=full_binary_df and bool(np.all(trait_df == residual_df)),
+                    on_write_progress=output_progress,
                 )
-            sumstats_summary["scan_and_write_seconds"] = time.perf_counter() - write_started
+            sumstats_summary.update(streaming_timing(
+                _phase_prep_done, write_started, time.perf_counter()))
+            if blocked_significance:
+                sumstats_summary['execution_layout'] = layout
+            if jagwas is not None:
+                sumstats_summary['jagwas_rank'] = jagwas.rank_report(trait_names)
+            if jagwas_variant_output or significant_variant_output:
+                sumstats_summary.update(devices=active_variant_devices, genotype_passes=1,
+                    execution_layout=dict(partition_axis='variant', variant_ranges=[list(span) for span in ranges],
+                        devices=active_variant_devices, reader_workers=int(reader_workers),
+                        shared_result_queue_depth=(DEFAULT_SUMSTATS_QUEUE_DEPTH if sumstats_queue_depth is None else sumstats_queue_depth)
+                            if len(active_variant_devices) > 1 else 0,
+                        reduction_state=('independent factor per active device' if jagwas_variant_output
+                                         else 'stateless per-cell selection'), writer_workers=1))
             table: list[dict] = []
             p_value = None
             beta = None
@@ -1130,7 +1947,7 @@ def run_linear_gwas(
                 raise ValueError(
                     "variant_range requires output_dir: the in-memory result "
                     "path scans the whole file and would silently ignore it")
-            beta, t_stat, logp, q_matrix = linear_scan_streaming(
+            beta, t_stat, p_value, q_matrix = linear_scan_streaming(
                 genotype,
                 phenotype,
                 covariates,
@@ -1139,8 +1956,8 @@ def run_linear_gwas(
                 compute_dtype=resolved_compute_dtype,
                 reader_workers=reader_workers,
                 prefetch_chunks=prefetch_chunks,
-                return_log10_p=True,
             )
+            logp = upper_tail_log10(p_value)
             table = []
             for marker_index, marker_name in enumerate(marker_names):
                 for trait_index, trait_name in enumerate(trait_names):
@@ -1148,6 +1965,7 @@ def run_linear_gwas(
                         "marker_id": marker_name,
                         "trait": trait_name,
                         "n": int(genotype_shape[0]),
+                        "p_value": float(p_value[marker_index, trait_index]),
                         "-log10_p": float(logp[marker_index, trait_index]),
                     }
                     if return_beta:
@@ -1171,16 +1989,16 @@ def run_linear_gwas(
             qc["n_variants_excluded"] = int(sum(scan_exclusions.values()))
     else:
         genotype, phenotype, covariates, qc = prepare_inputs(genotype, phenotype, covariates)
-        beta, t_stat, logp, q_matrix = linear_scan(
+        beta, t_stat, p_value, q_matrix = linear_scan(
             genotype,
             phenotype,
             covariates,
             chunk_size=chunk_size,
             device=str(resolved_device),
             compute_dtype=resolved_compute_dtype,
-            return_log10_p=True,
         )
         genotype_shape = list(genotype.shape)
+        logp = upper_tail_log10(p_value)
         # Zero-variance columns are dropped by prepare_inputs, so labels follow
         # the retained indices rather than a prefix of the original order.
         kept_markers = qc.get("genotype_kept_column_indices")
@@ -1203,6 +2021,7 @@ def run_linear_gwas(
                     "marker_id": marker_name,
                     "trait": trait_name,
                     "n": int(genotype_shape[0]),
+                    "p_value": float(p_value[marker_index, trait_index]),
                     "-log10_p": float(logp[marker_index, trait_index]),
                 }
                 if return_beta:
@@ -1264,6 +2083,8 @@ def run_linear_gwas(
             None if significance is None
             else significance.resolved_threshold(len(trait_names))),
         "reduce_top_k": None if reduction is None else reduction.width,
+        "phenotype_outlier_sd": phenotype_outlier_sd,
+        "phenotype_outlier_rows": None if outlier_rows is None else int(outlier_rows.sum()),
         # Recorded because it changes how many passes the run made over the
         # genotypes, which is the first thing to check against a wall time.
         "trait_block": None if trait_block is None else int(trait_block),
@@ -1272,6 +2093,8 @@ def run_linear_gwas(
         # nothing else, so "did it use eight cards or one?" could only be
         # argued from the fact that 75,000 is 600,000/8 -- an inference, when
         # the run already knew the answer and simply never wrote it down.
+        "variant_devices": (sumstats_summary.get('devices') if full_variant_output or jagwas_variant_output
+                            or significant_variant_output else None),
         "trait_devices": (None if not trait_devices
                           else [str(d) for d in trait_devices]),
         "genotype_shape": genotype_shape,
@@ -1308,17 +2131,37 @@ def run_linear_gwas(
         "runtime_seconds": elapsed(start),
         "version": "0.1.0",
     }
+    shared = locals().get('shared_state')
+    if shared is not None and shared.get('genotype_cache') is not None:
+        genotype_meta['genotype_cache'] = shared['genotype_cache'].audit()
+    if shared is not None and shared.get('hub') is not None:
+        shared['hub'].abandon_untaken()  # scans are done; release any tile never started
+        genotype_meta['shared_decode'] = dict(shared['hub'].audit(), enabled=True,
+                                              fanout_mode=shared.get('fanout_mode'),
+                                              fanout_reason=shared.get('fanout_reason'))
+    if empirical is not None:
+        genotype_meta['autotune'] = dict(
+            method='empirical', chunk_sizes=empirical.get('sizes'), layout=empirical.get('layout'),
+            devices_seen=empirical.get('devices_seen'),
+            tuner_disabled_reason=empirical.get('tuner_disabled_reason'),
+            control_path=empirical.get('control_path'),
+            chunk=None if empirical_tuner is None else empirical_tuner.audit())
     if hasattr(genotype, 'backend_used'):
         genotype_meta['decode_backend_used'] = genotype.backend_used
         if hasattr(genotype, 'backend_reason'):
             genotype_meta['decode_backend_reason'] = genotype.backend_reason
     run_metadata.update(genotype_meta)
+    if isinstance(genotype, ChunkedGenotype) and 'reader_workers' in genotype_meta:
+        # The loader records the worker count it opened the source with; a
+        # planner (empirical or detailed) may have changed it for the scan.
+        run_metadata['genotype_open_reader_workers'] = genotype_meta['reader_workers']
+        run_metadata['reader_workers'] = int(reader_workers)
     result = GWASResult(table=table, run_metadata=run_metadata, qc_summary=qc)
     if output_dir is not None:
         out = mkdir(output_dir)
         streamed = isinstance(genotype, ChunkedGenotype) and run_metadata["results_streamed"]
         if not streamed:
-            if sumstats_format == "binary" and p_value_threshold is not None:
+            if sumstats_format == "binary" and (p_value_threshold is not None):
                 from .sumstats_indexed import write_indexed_sumstats
                 written, sumstats_summary = write_indexed_sumstats(
                     out / "sumstats", marker_names, trait_names, genotype_shape[0],
@@ -1336,7 +2179,7 @@ def run_linear_gwas(
                     marker_names=marker_names,
                     trait_names=trait_names,
                     n_samples=genotype_shape[0],
-                    chunk_iterator=iter([(0, n_variants, beta, t_stat, None, logp)]),
+                    chunk_iterator=iter([(0, n_variants, beta, t_stat, None)]),
                     n_variants=n_variants,
                     df=genotype_shape[0]
                     - (0 if q_matrix is None else q_matrix.shape[1])
@@ -1350,4 +2193,18 @@ def run_linear_gwas(
                 run_metadata["sumstats_write"] = sumstats_summary
         write_json(run_metadata, out / "run.json")
         write_json(qc, out / "qc.json")
+    if calibrator is not None:
+        # No record is published if the association writer or required run/QC
+        # sidecars fail. Cache I/O failure is reported without losing results.
+        run_metadata['initial_calibration']=calibrator.finish(successful=True)
+        try:
+            write_json(run_metadata,out/'run.json')
+        except OSError as error:
+            run_metadata['initial_calibration']['report_write_error']=str(error)
+    if productive is not None:
+        productive.finish(successful=True)
+        try:
+            write_json(run_metadata,out/'run.json')
+        except OSError as error:
+            genotype_meta['autotune']['productive']['report_write_error']=str(error)
     return result

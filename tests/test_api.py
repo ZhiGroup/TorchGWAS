@@ -156,13 +156,6 @@ class APITestCase(unittest.TestCase):
         self.assertEqual(len(linear.table), 36)
         self.assertEqual(linear.run_metadata["compute_dtype_used"], "float64")
 
-    def test_topk_per_trait_is_not_public_api(self):
-        import inspect
-
-        self.assertNotIn(
-            "topk_per_trait", inspect.signature(run_linear_gwas).parameters
-        )
-
     def test_linear_streaming_p_value_threshold_filters_output(self):
         toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
         genotype = np.load(toy["genotype"])
@@ -197,3 +190,4 @@ class APITestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

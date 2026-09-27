@@ -1,0 +1,1150 @@
+{
+  "device": "cuda:2",
+  "context": {
+    "device": "cuda:2",
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "torch_version": "2.5.1+cu124",
+    "cuda_version": "12.4",
+    "affinity": [
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    "torch_threads": 4,
+    "allow_tf32": false,
+    "boundary": "single_worker_call_then_device_synchronize"
+  },
+  "records": [
+    {
+      "repeat": 0,
+      "phase": "spectrum",
+      "cpu_seconds": 6.34462812499903e-05,
+      "wall_seconds": 6.385782035067677e-05,
+      "non_cpu_seconds": 4.115391006864755e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 0,
+      "phase": "cast",
+      "cpu_seconds": 5.568315624998599e-05,
+      "wall_seconds": 5.5782555136829615e-05,
+      "non_cpu_seconds": 9.939888684362685e-08,
+      "calls": 32
+    },
+    {
+      "repeat": 0,
+      "phase": "correlation",
+      "cpu_seconds": 0.0002361904062500031,
+      "wall_seconds": 0.0002437997900415212,
+      "non_cpu_seconds": 7.609383791518098e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 0,
+      "phase": "scale",
+      "cpu_seconds": 7.276690624996585e-05,
+      "wall_seconds": 7.289019413292408e-05,
+      "non_cpu_seconds": 1.23287882958234e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 0,
+      "phase": "qr",
+      "cpu_seconds": 0.00021646634374999918,
+      "wall_seconds": 0.00021793125779367983,
+      "non_cpu_seconds": 1.464914043680654e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 0,
+      "phase": "upload",
+      "cpu_seconds": 6.752065624998638e-05,
+      "wall_seconds": 6.769932224415243e-05,
+      "non_cpu_seconds": 1.7866599416604956e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 0,
+      "phase": "eigh",
+      "cpu_seconds": 0.0005469461875000081,
+      "wall_seconds": 0.0005482761771418154,
+      "non_cpu_seconds": 1.3299896418073054e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 1,
+      "phase": "spectrum",
+      "cpu_seconds": 5.99378437500242e-05,
+      "wall_seconds": 6.0390011640265584e-05,
+      "non_cpu_seconds": 4.5216789024138393e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 1,
+      "phase": "correlation",
+      "cpu_seconds": 0.00014340318750000192,
+      "wall_seconds": 0.0001447116956114769,
+      "non_cpu_seconds": 1.308508111474982e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 1,
+      "phase": "cast",
+      "cpu_seconds": 5.3950968749993944e-05,
+      "wall_seconds": 5.413321196101606e-05,
+      "non_cpu_seconds": 1.8224321102211505e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 1,
+      "phase": "scale",
+      "cpu_seconds": 6.766159374999026e-05,
+      "wall_seconds": 6.779466639272869e-05,
+      "non_cpu_seconds": 1.330726427384299e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 1,
+      "phase": "upload",
+      "cpu_seconds": 6.214406250004689e-05,
+      "wall_seconds": 6.231846055015922e-05,
+      "non_cpu_seconds": 1.7439805011232323e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 1,
+      "phase": "qr",
+      "cpu_seconds": 0.00021208321874999214,
+      "wall_seconds": 0.0002132969384547323,
+      "non_cpu_seconds": 1.2137197047401571e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 1,
+      "phase": "eigh",
+      "cpu_seconds": 0.0005415561875000141,
+      "wall_seconds": 0.0005428561707958579,
+      "non_cpu_seconds": 1.2999832958437985e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 2,
+      "phase": "cast",
+      "cpu_seconds": 7.242596875001173e-05,
+      "wall_seconds": 7.367864600382745e-05,
+      "non_cpu_seconds": 1.252677253815726e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 2,
+      "phase": "scale",
+      "cpu_seconds": 6.887534374999671e-05,
+      "wall_seconds": 6.89936859998852e-05,
+      "non_cpu_seconds": 1.1834224988849229e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 2,
+      "phase": "spectrum",
+      "cpu_seconds": 5.310315625001172e-05,
+      "wall_seconds": 5.324507947079837e-05,
+      "non_cpu_seconds": 1.4192322078665498e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 2,
+      "phase": "eigh",
+      "cpu_seconds": 0.0005631464687499976,
+      "wall_seconds": 0.0005672775441780686,
+      "non_cpu_seconds": 4.131075428071007e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 2,
+      "phase": "upload",
+      "cpu_seconds": 5.855534375004412e-05,
+      "wall_seconds": 5.866787978447974e-05,
+      "non_cpu_seconds": 1.1253603443561744e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 2,
+      "phase": "correlation",
+      "cpu_seconds": 0.00013098006250000793,
+      "wall_seconds": 0.00013226212467998266,
+      "non_cpu_seconds": 1.28206217997473e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 2,
+      "phase": "qr",
+      "cpu_seconds": 0.0002226172812500038,
+      "wall_seconds": 0.00022299279225990176,
+      "non_cpu_seconds": 3.755110098979664e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 3,
+      "phase": "correlation",
+      "cpu_seconds": 0.00014896318749996196,
+      "wall_seconds": 0.00014967852621339262,
+      "non_cpu_seconds": 7.153387134306577e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 3,
+      "phase": "cast",
+      "cpu_seconds": 7.991131250001393e-05,
+      "wall_seconds": 8.012168109416962e-05,
+      "non_cpu_seconds": 2.1036859415568543e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 3,
+      "phase": "scale",
+      "cpu_seconds": 7.972565625002925e-05,
+      "wall_seconds": 7.99336121417582e-05,
+      "non_cpu_seconds": 2.0795589172895035e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 3,
+      "phase": "spectrum",
+      "cpu_seconds": 5.663718750004154e-05,
+      "wall_seconds": 5.6785414926707745e-05,
+      "non_cpu_seconds": 1.4822742666620314e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 3,
+      "phase": "qr",
+      "cpu_seconds": 0.0002285057499999965,
+      "wall_seconds": 0.00023087052977643907,
+      "non_cpu_seconds": 2.3647797764425604e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 3,
+      "phase": "eigh",
+      "cpu_seconds": 0.0005642736875000054,
+      "wall_seconds": 0.0005646556674037129,
+      "non_cpu_seconds": 3.819799037074745e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 3,
+      "phase": "upload",
+      "cpu_seconds": 6.909718749997795e-05,
+      "wall_seconds": 6.937055150046945e-05,
+      "non_cpu_seconds": 2.733640004914939e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 4,
+      "phase": "qr",
+      "cpu_seconds": 0.00026474228125000776,
+      "wall_seconds": 0.00026527675800025463,
+      "non_cpu_seconds": 5.344767502468706e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 4,
+      "phase": "correlation",
+      "cpu_seconds": 0.00012848475000004633,
+      "wall_seconds": 0.0001311093510594219,
+      "non_cpu_seconds": 2.624601059375564e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 4,
+      "phase": "eigh",
+      "cpu_seconds": 0.0007067221875000085,
+      "wall_seconds": 0.0007166119758039713,
+      "non_cpu_seconds": 9.88978830396281e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 4,
+      "phase": "scale",
+      "cpu_seconds": 0.00039486703125002354,
+      "wall_seconds": 0.0004399519239086658,
+      "non_cpu_seconds": 4.508489265864224e-05,
+      "calls": 32
+    },
+    {
+      "repeat": 4,
+      "phase": "upload",
+      "cpu_seconds": 0.00021038071874995845,
+      "wall_seconds": 0.00021258852211758494,
+      "non_cpu_seconds": 2.207803367626493e-06,
+      "calls": 32
+    },
+    {
+      "repeat": 4,
+      "phase": "cast",
+      "cpu_seconds": 0.0001397969374999919,
+      "wall_seconds": 0.00014037237269803882,
+      "non_cpu_seconds": 5.754351980469252e-07,
+      "calls": 32
+    },
+    {
+      "repeat": 4,
+      "phase": "spectrum",
+      "cpu_seconds": 0.0001519791562499817,
+      "wall_seconds": 0.0001523869577795267,
+      "non_cpu_seconds": 4.0780152954500437e-07,
+      "calls": 32
+    }
+  ],
+  "geometry": {
+    "upload": {
+      "kernels": [],
+      "cuda_runtime": [
+        "cudaMemcpyAsync",
+        "cudaStreamSynchronize",
+        "cudaDeviceSynchronize",
+        "cudaDeviceSynchronize"
+      ],
+      "transfers": [
+        "Memcpy HtoD (Pageable -> Device)"
+      ]
+    },
+    "correlation": {
+      "kernels": [
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<double>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<double>, at::detail::Array<char*, 1>)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              2,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_32x32_16x5_nt_align1>(cutlass_80_tensorop_d884gemm_32x32_16x5_nt_align1::Params)",
+          "geometry": {
+            "registers per thread": 56,
+            "shared memory": 40960,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<double, double, double, at::native::binary_internal::MulFunctor<double> >, at::detail::Array<char*, 2> >(int, at::native::BUnaryFunctor<double, double, double, at::native::binary_internal::MulFunctor<double> >, at::detail::Array<char*, 2>)",
+          "geometry": {
+            "registers per thread": 20,
+            "shared memory": 0,
+            "grid": [
+              2,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        }
+      ],
+      "cuda_runtime": [
+        "cudaLaunchKernel",
+        "cudaDeviceGetAttribute",
+        "cudaLaunchKernel",
+        "cudaDeviceSynchronize",
+        "cudaDeviceSynchronize"
+      ],
+      "transfers": []
+    },
+    "cast": {
+      "kernels": [
+        {
+          "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)",
+          "geometry": {
+            "registers per thread": 42,
+            "shared memory": 0,
+            "grid": [
+              5,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        }
+      ],
+      "cuda_runtime": [
+        "cudaLaunchKernel",
+        "cudaDeviceSynchronize",
+        "cudaDeviceSynchronize"
+      ],
+      "transfers": []
+    },
+    "eigh": {
+      "kernels": [
+        {
+          "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1} const&)::{lambda(int)#1})",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              4,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<int>, at::detail::Array<char*, 1>)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "copy_info_kernel(int, int*)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              1,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void lansy_M_stage1<double, double, 8>(long, double const*, unsigned long, double*, int)",
+          "geometry": {
+            "registers per thread": 30,
+            "shared memory": 2048,
+            "grid": [
+              32,
+              1,
+              1
+            ],
+            "block": [
+              256,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void lansy_M_stage2<double, 8>(long, double*)",
+          "geometry": {
+            "registers per thread": 32,
+            "shared memory": 2048,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              256,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "copy_info_kernel(int, int*)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              1,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "xx_set_info_ker(int, int*)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              1,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void sytrd4_cta<sytrd_params<double, 16, 32, 32, 32, 0, 1, 2>, 1>(int, sytrd_params<double, 16, 32, 32, 32, 0, 1, 2>::data_type*, int, sytrd_params<double, 16, 32, 32, 32, 0, 1, 2>::pod_type*, sytrd_params<double, 16, 32, 32, 32, 0, 1, 2>::pod_type*, sytrd_params<double, 16, 32, 32, 32, 0, 1, 2>::data_type*, int)",
+          "geometry": {
+            "registers per thread": 41,
+            "shared memory": 4864,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              512,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void epilogue<sytrd_params<double, 32, 8, 512, 32, 16, 1, 2>, 128, 1, 1>(int, int, sytrd_params<double, 32, 8, 512, 32, 16, 1, 2>::data_type*, int, sytrd_params<double, 32, 8, 512, 32, 16, 1, 2>::pod_type*, sytrd_params<double, 32, 8, 512, 32, 16, 1, 2>::pod_type*, sytrd_params<double, 32, 8, 512, 32, 16, 1, 2>::data_type*, sytrd_params<double, 32, 8, 512, 32, 16, 1, 2>::data_type*, int, int)",
+          "geometry": {
+            "registers per thread": 20,
+            "shared memory": 0,
+            "grid": [
+              5,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void scale_max<double, 32, 32, 1>(long, long, double*, double*, double*, int*)",
+          "geometry": {
+            "registers per thread": 36,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              32,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void steqr_ker<stedc_params_<double, 8, 16>, double, 0>(long, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, double*, long, int*, int*, long, long, stedc_params_<double, 8, 16>::data_type, stedc_params_<double, 8, 16>::data_type, int*)",
+          "geometry": {
+            "registers per thread": 57,
+            "shared memory": 768,
+            "grid": [
+              4,
+              1,
+              1
+            ],
+            "block": [
+              8,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed2_par<stedc_params_<double, 8, 16> >(int, int, int, int*, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, int, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, int*, int*, int*, int*, int*, stedc_params_<double, 8, 16>::data_type*, int*, stedc_params_<double, 8, 16>::data_type*, int)",
+          "geometry": {
+            "registers per thread": 53,
+            "shared memory": 912,
+            "grid": [
+              2,
+              1,
+              1
+            ],
+            "block": [
+              16,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed2_copy<double, 128>(int, int, double*, int, int*, int*, double*, int)",
+          "geometry": {
+            "registers per thread": 32,
+            "shared memory": 0,
+            "grid": [
+              2,
+              2,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed4_par<stedc_params_<double, 8, 16> >(int, int, int, int*, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, int, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, int, int*)",
+          "geometry": {
+            "registers per thread": 94,
+            "shared memory": 416,
+            "grid": [
+              16,
+              2,
+              1
+            ],
+            "block": [
+              16,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed3_epi1<stedc_params_<double, 8, 16> >(int, int, int, int*, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, int, stedc_params_<double, 8, 16>::data_type*, int*, int*, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, int*, int)",
+          "geometry": {
+            "registers per thread": 32,
+            "shared memory": 160,
+            "grid": [
+              17,
+              2,
+              1
+            ],
+            "block": [
+              16,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed3_epi2<stedc_params_<double, 8, 16> >(int, int, int, int*, stedc_params_<double, 8, 16>::data_type*, int, int*, stedc_params_<double, 8, 16>::data_type*, int*, stedc_params_<double, 8, 16>::data_type*, stedc_params_<double, 8, 16>::data_type*, int)",
+          "geometry": {
+            "registers per thread": 64,
+            "shared memory": 160,
+            "grid": [
+              16,
+              2,
+              1
+            ],
+            "block": [
+              16,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed2_par<stedc_params_<double, 8, 32> >(int, int, int, int*, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, int, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, int*, int*, int*, int*, int*, stedc_params_<double, 8, 32>::data_type*, int*, stedc_params_<double, 8, 32>::data_type*, int)",
+          "geometry": {
+            "registers per thread": 51,
+            "shared memory": 1808,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              32,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed2_copy<double, 128>(int, int, double*, int, int*, int*, double*, int)",
+          "geometry": {
+            "registers per thread": 32,
+            "shared memory": 0,
+            "grid": [
+              8,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed4_par<stedc_params_<double, 8, 32> >(int, int, int, int*, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, int, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, int, int*)",
+          "geometry": {
+            "registers per thread": 92,
+            "shared memory": 800,
+            "grid": [
+              32,
+              1,
+              1
+            ],
+            "block": [
+              32,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed3_epi1<stedc_params_<double, 8, 32> >(int, int, int, int*, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, int, stedc_params_<double, 8, 32>::data_type*, int*, int*, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, int*, int)",
+          "geometry": {
+            "registers per thread": 32,
+            "shared memory": 288,
+            "grid": [
+              33,
+              1,
+              1
+            ],
+            "block": [
+              32,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void laed3_epi2<stedc_params_<double, 8, 32> >(int, int, int, int*, stedc_params_<double, 8, 32>::data_type*, int, int*, stedc_params_<double, 8, 32>::data_type*, int*, stedc_params_<double, 8, 32>::data_type*, stedc_params_<double, 8, 32>::data_type*, int)",
+          "geometry": {
+            "registers per thread": 64,
+            "shared memory": 288,
+            "grid": [
+              32,
+              1,
+              1
+            ],
+            "block": [
+              32,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void scale_max<double, 32, 128, 0>(long, long, double*, double*, double*, int*)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void merge_ker<double, double, 128, 0, 0, 1>(long, long, double*, double*, long, int*, double*, double*, long, int)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              8,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void merge_ker<double, double, 128, 1, 0, 1>(long, long, double*, double*, long, int*, double*, double*, long, int)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              8,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "copy_info_kernel(int, int*)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              1,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void ormqr_cta_kernel<double, 5, 1>(long, long, long, double const*, unsigned long, double const*, double*, unsigned long, long, long, long, int)",
+          "geometry": {
+            "registers per thread": 28,
+            "shared memory": 17408,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              32,
+              32,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void lacpy_kernel<double, double, 5, 3>(long, long, double const*, long, double*, long, int, int)",
+          "geometry": {
+            "registers per thread": 18,
+            "shared memory": 0,
+            "grid": [
+              1,
+              4,
+              1
+            ],
+            "block": [
+              32,
+              8,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#11}::operator()() const::{lambda(bool)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1> >(int, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#11}::operator()() const::{lambda(bool)#1}, at::detail::Array<char*, 2>, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, at::native::memory::LoadWithCast<1>, at::native::memory::StoreWithCast<1>)",
+          "geometry": {
+            "registers per thread": 32,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        }
+      ],
+      "cuda_runtime": [
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaMemcpyAsync",
+        "cudaStreamSynchronize",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaMemsetAsync",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaMemcpyAsync",
+        "cudaMemcpyAsync",
+        "cudaStreamSynchronize",
+        "cudaDeviceSynchronize",
+        "cudaDeviceSynchronize"
+      ],
+      "transfers": [
+        "Memcpy DtoH (Device -> Pageable)",
+        "Memset (Device)",
+        "Memcpy DtoD (Device -> Device)",
+        "Memcpy DtoH (Device -> Pinned)"
+      ]
+    },
+    "spectrum": {
+      "kernels": [],
+      "cuda_runtime": [
+        "cudaMemcpyAsync",
+        "cudaStreamSynchronize",
+        "cudaDeviceSynchronize",
+        "cudaDeviceSynchronize"
+      ],
+      "transfers": [
+        "Memcpy DtoH (Device -> Pageable)"
+      ]
+    },
+    "scale": {
+      "kernels": [
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::sqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2> >(int, at::native::sqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::operator()() const::{lambda()#1}::operator()() const::{lambda(double)#1}, at::detail::Array<char*, 2>)",
+          "geometry": {
+            "registers per thread": 32,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<double, double, double, at::native::binary_internal::DivFunctor<double> > const&)::{lambda(int)#1})",
+          "geometry": {
+            "registers per thread": 27,
+            "shared memory": 0,
+            "grid": [
+              4,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        }
+      ],
+      "cuda_runtime": [
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaDeviceSynchronize",
+        "cudaDeviceSynchronize"
+      ],
+      "transfers": []
+    },
+    "qr": {
+      "kernels": [
+        {
+          "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#6}::operator()() const::{lambda(double)#1} const&)::{lambda(int)#1})",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              4,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, at::detail::Array<char*, 1> >(int, at::native::FillFunctor<int>, at::detail::Array<char*, 1>)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "copy_info_kernel(int, int*)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              1,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "copy_info_kernel(int, int*)",
+          "geometry": {
+            "registers per thread": 16,
+            "shared memory": 0,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              1,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void geqr2_smem<double, double, 8, 5, 5>(int, int, double*, unsigned long, double*, int)",
+          "geometry": {
+            "registers per thread": 58,
+            "shared memory": 11008,
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "block": [
+              256,
+              1,
+              1
+            ]
+          }
+        },
+        {
+          "name": "void at::native::triu_tril_kernel<double, int, true, 1, true>(at::cuda::detail::TensorInfo<double, int>, at::cuda::detail::TensorInfo<double const, int>, long, long, int)",
+          "geometry": {
+            "registers per thread": 28,
+            "shared memory": 0,
+            "grid": [
+              8,
+              1,
+              1
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ]
+          }
+        }
+      ],
+      "cuda_runtime": [
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaLaunchKernel",
+        "cudaDeviceSynchronize",
+        "cudaDeviceSynchronize"
+      ],
+      "transfers": []
+    }
+  },
+  "prices_nonnegative": true,
+  "source_sha256": {
+    "jagwas_projection.py": "6d2bdf6a39672abbf281f88b8dbc534ce891bd9c83db6636d1be299217227c4f",
+    "jagwas_blocks.py": "3ca8c12f929839994ff380ebc9385e0293df3c3f16c15807bb28b887e5195015"
+  },
+  "reference_shape": [
+    65,
+    32
+  ],
+  "compute_dtype": "float32",
+  "method": "eigen",
+  "boundary": "call_then_device_synchronize",
+  "phases": {
+    "upload": {
+      "cpu_seconds": 6.752065624998638e-05,
+      "non_cpu_seconds": 1.7866599416604956e-07
+    },
+    "correlation": {
+      "cpu_seconds": 0.00014340318750000192,
+      "non_cpu_seconds": 1.308508111474982e-06
+    },
+    "cast": {
+      "cpu_seconds": 7.242596875001173e-05,
+      "non_cpu_seconds": 2.1036859415568543e-07
+    },
+    "eigh": {
+      "cpu_seconds": 0.0005631464687499976,
+      "non_cpu_seconds": 1.3299896418073054e-06
+    },
+    "spectrum": {
+      "cpu_seconds": 5.99378437500242e-05,
+      "non_cpu_seconds": 4.0780152954500437e-07
+    },
+    "scale": {
+      "cpu_seconds": 7.276690624996585e-05,
+      "non_cpu_seconds": 1.330726427384299e-07
+    },
+    "qr": {
+      "cpu_seconds": 0.0002226172812500038,
+      "non_cpu_seconds": 1.2137197047401571e-06
+    }
+  },
+  "transfer_qualified": false,
+  "prediction_complete": false
+}

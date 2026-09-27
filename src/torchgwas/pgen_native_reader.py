@@ -22,8 +22,8 @@ reason named.
 
 **LD-compressed records force a replay.** Forms 2 and 3 are expressed against
 the most recent record that was not itself LD-compressed, so a read entering the
-file at an arbitrary variant backs up to that record, decodes forward, and
-discards the rows before the one it wanted. Variant blocks never open with an
+file at an arbitrary variant backs up to that record and decodes the base once.
+Intervening LD rows do not update the base and need not be decoded. Variant blocks never open with an
 LD-compressed record, so the walk is bounded and in practice is a few variants.
 """
 
@@ -38,6 +38,7 @@ from .pgen_reader import (
     _bytes_per_sample_id,
     file_scope,
     ld_safe_start,
+    PgenHeader,
     read_header,
 )
 
@@ -62,9 +63,17 @@ class NativePgenReader:
     """
 
     def __init__(self, path, raw_sample_ct=None, variant_ct=None,
-                 sample_subset=None):
+                 sample_subset=None, _prepared_header=None):
         self.path = os.fsdecode(path)
-        self.header = read_header(self.path)
+        if _prepared_header is None:
+            self.header = read_header(self.path)
+        else:
+            from .analytical_plan_cache import input_identity
+            if (not isinstance(_prepared_header, tuple) or len(_prepared_header) != 2
+                    or _prepared_header[0] != input_identity(self.path)
+                    or not isinstance(_prepared_header[1], PgenHeader)):
+                raise ValueError('Prepared PGEN header differs from current input')
+            self.header = _prepared_header[1]
         self.sample_ct = int(self.header.sample_ct)
         self.variant_ct = int(self.header.variant_ct)
         if raw_sample_ct is not None and int(raw_sample_ct) != self.sample_ct:
@@ -85,7 +94,14 @@ class NativePgenReader:
         # One descriptor per reader, read positionally: readers are created per
         # worker thread, and preadv carries its own offset so no seek is shared.
         self._fd = os.open(self.path, os.O_RDONLY)
+        if _prepared_header is not None:
+            from .analytical_plan_cache import input_identity
+            if input_identity(self.path) != _prepared_header[0]:
+                os.close(self._fd)
+                self._fd = None
+                raise ValueError('PGEN changed while opening native reader')
         self._blob = None
+        self._packed_workspace = None
 
     # -- pgenlib surface -------------------------------------------------
 
@@ -100,6 +116,8 @@ class NativePgenReader:
         if fd is not None:
             os.close(fd)
             self._fd = None
+        self._packed_workspace = None
+        self._blob = None
 
     def __enter__(self) -> "NativePgenReader":
         return self
@@ -219,12 +237,11 @@ class NativePgenReader:
 
         `out` rows may be wider than a genovec; the decoder zeroes the padding.
 
-        The LD prefix is handled separately rather than by decoding it into the
-        caller's buffer and slicing it off afterwards, because the caller's
-        buffer has room for the requested variants only. Records before `start`
-        exist solely to rebuild the LD base, so they go to a scratch row that is
-        thrown away; `decode_range` is built to resume from a base it was
-        handed, which is exactly what that needs.
+        The most recent non-LD record alone establishes the base. Every
+        intervening form-2/3 record refers to that same base without changing
+        it, so none needs decoding into the caller's buffer or scratch. Keep
+        the existing single contiguous payload read; decode the base into one
+        scratch row, then decode only the requested records.
         """
         if not 0 <= start <= end <= self.variant_ct:
             raise IndexError(
@@ -238,9 +255,9 @@ class NativePgenReader:
         have_base = False
         prefix = start - safe
         if prefix:
-            scratch = np.empty((prefix, self.genovec_bytes), dtype=np.uint8)
+            scratch = np.empty((1, self.genovec_bytes), dtype=np.uint8)
             have_base = pgen_native.decode_range(
-                blob, offsets[:prefix], lengths[:prefix], vrtypes[:prefix],
+                blob, offsets[:1], lengths[:1], vrtypes[:1],
                 self.sample_ct, self._id_bytes, scratch, base,
                 have_ld_base=False, first_variant=safe)
         pgen_native.decode_range(
@@ -250,13 +267,26 @@ class NativePgenReader:
         return out
 
     def _decode_packed(self, start: int, end: int) -> np.ndarray:
-        """Packed rows for `[start, end)`, replaying any LD prefix first.
+        """Temporary packed rows, valid until this reader's next decode/close.
 
         `np.empty` rather than `np.zeros`: every record form writes the whole
         genovec, and a decode that fails raises rather than returning a
         partially filled array.
+
+        Readers belong to individual loader workers. Expansion into the caller's
+        output completes before the next read, so one grow-only workspace avoids
+        allocating, faulting and freeing a large packed array on every chunk.
+        Public results remain caller-owned; this private view never escapes
+        read_range. Like the existing record buffer, it is not thread-shared.
         """
-        out = np.empty((end - start, self.genovec_bytes), dtype=np.uint8)
+        if not 0 <= start <= end <= self.variant_ct:
+            raise IndexError(
+                f"PGEN variant range [{start}, {end}) is outside "
+                f"[0, {self.variant_ct})")
+        count = end - start
+        if self._packed_workspace is None or self._packed_workspace.shape[0] < count:
+            self._packed_workspace = np.empty((count, self.genovec_bytes), dtype=np.uint8)
+        out = self._packed_workspace[:count]
         return self._decode_into(start, end, out)
 
 

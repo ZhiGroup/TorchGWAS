@@ -24,7 +24,6 @@ from torchgwas.linear import (
     linear_scan_streaming_chunks,
 )
 from torchgwas.preprocess import residualize_and_standardize
-from torchgwas.tails import upper_tail_log10_from_t
 from torchgwas.utils import choose_device
 
 
@@ -52,21 +51,6 @@ def _write_bed(prefix: Path, dosage_a1: np.ndarray) -> Path:
 
 
 class ExactLinearStatisticsTestCase(unittest.TestCase):
-    def test_optional_log10_p_matches_exact_student_tail(self):
-        rng = np.random.default_rng(20260918)
-        n_samples = 101
-        genotype = rng.integers(0, 3, size=(n_samples, 7)).astype(np.float64)
-        genotype[:3] = np.arange(3)[:, None]
-        phenotype = rng.normal(size=(n_samples, 4))
-        covariates = rng.normal(size=(n_samples, 2))
-
-        beta, t_stat, logp, _q = linear_scan(
-            genotype, phenotype, covariates, chunk_size=3,
-            device="cpu", compute_dtype="float64", return_log10_p=True)
-        expected = upper_tail_log10_from_t(t_stat, n_samples - 2 - 2)
-        np.testing.assert_allclose(logp, expected, rtol=1e-12, atol=1e-12)
-        self.assertEqual(beta.shape, t_stat.shape)
-
     def test_missing_phenotypes_match_mean_imputed_ols_with_trait_df(self):
         """Phenotype NaNs use the same mean-impute/df rule as genotype NaNs."""
         rng = np.random.default_rng(20260917)
@@ -156,7 +140,7 @@ class ExactLinearStatisticsTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             bed = _write_bed(Path(tmpdir) / "fixture", genotype)
             packed = PlinkBedGenotype(bed, reader_workers=2, prefetch_chunks=2)
-            beta, t_stat, logp, _ = linear_scan_streaming(
+            beta, t_stat, p_value, _ = linear_scan_streaming(
                 packed,
                 phenotype,
                 covariates,
@@ -164,9 +148,8 @@ class ExactLinearStatisticsTestCase(unittest.TestCase):
                 device="cuda:0",
                 compute_dtype="float32",
                 reader_workers=2,
-                return_log10_p=True,
             )
-            output_dir = Path(tmpdir) / "binary"
+            output_dir = Path(tmpdir) / "full"
             streamed = run_linear_gwas(
                 genotype=bed,
                 phenotype=phenotype,
@@ -178,15 +161,10 @@ class ExactLinearStatisticsTestCase(unittest.TestCase):
                 reader_workers=2,
                 output_dir=output_dir,
             )
-            output_rows = binary_rows(output_dir)
         np.testing.assert_allclose(beta, beta_ref, rtol=2e-4, atol=2e-5)
         np.testing.assert_allclose(t_stat, t_ref, rtol=2e-4, atol=2e-5)
-        np.testing.assert_allclose(
-            logp, upper_tail_log10_from_t(
-                t_stat, n_samples - np.linalg.matrix_rank(covariates) - 2),
-            rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(p_value, p_ref, rtol=2e-4, atol=1e-7)
         self.assertEqual(streamed.qc_summary["genotype_qc_mode"], "fused_gpu_scan")
-        self.assertEqual(len(output_rows), genotype.shape[1] * phenotype.shape[1])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the packed BED scan")
     def test_packed_bed_cuda_subset_matches_float64_reference(self):
@@ -993,10 +971,10 @@ class TraitBlockedScanTestCase(unittest.TestCase):
                         self.assertEqual(row["trait"], want["trait"])
                         self.assertAlmostEqual(float(row["t_stat"]),
                                                float(want["t_stat"]), places=9)
-                        # -log10(P) must come from the winning trait's own per-variant
+                        # p must come from the winning trait's own per-variant
                         # df, carried through the merge rather than recomputed.
-                        self.assertAlmostEqual(float(row["-log10_p"]),
-                                               float(want["-log10_p"]), places=6)
+                        self.assertAlmostEqual(float(row["p_value"]),
+                                               float(want["p_value"]), places=12)
 
     def test_blocked_matches_unblocked_for_top_k(self):
         rng = np.random.default_rng(42)
@@ -1025,14 +1003,14 @@ class TraitBlockedScanTestCase(unittest.TestCase):
                         np.testing.assert_allclose(scores, want[marker],
                                                    rtol=1e-9)
 
-    def test_trait_block_without_a_reduction_is_refused(self):
+    def test_trait_block_requires_a_streaming_output_and_valid_reduction(self):
         rng = np.random.default_rng(43)
         dosage = rng.integers(0, 3, size=(32, 10)).astype(float)
         phenotype = rng.normal(size=(32, 4))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bed = _write_bed(root / "norev", dosage)
-            for kwargs in ({"trait_block": 2},
+            for kwargs in ({"trait_block": 2, "sumstats_format": "none"},
                            {"trait_block": 0, "reduce": "max-abs-t"}):
                 with self.subTest(**kwargs), self.assertRaises(ValueError):
                     run_linear_gwas(str(bed), phenotype, device="cpu",
@@ -1082,7 +1060,7 @@ class StreamingReductionTestCase(unittest.TestCase):
         for row in full:
             score = abs(float(row["t_stat"]))
             if row["marker_id"] not in best or score > best[row["marker_id"]][0]:
-                best[row["marker_id"]] = (score, row["trait"], row["-log10_p"])
+                best[row["marker_id"]] = (score, row["trait"], row["p_value"])
         self.assertEqual(len(reduced), len(best))
         for row in reduced:
             want_score, want_trait, want_p = best[row["marker_id"]]
@@ -1090,7 +1068,7 @@ class StreamingReductionTestCase(unittest.TestCase):
             self.assertAlmostEqual(abs(float(row["t_stat"])), want_score, places=9)
             # min-P and max-|t| must agree, which is only true because df is
             # per variant and therefore shared across a variant's traits.
-            self.assertAlmostEqual(float(row["-log10_p"]), float(want_p), places=6)
+            self.assertAlmostEqual(float(row["p_value"]), float(want_p), places=12)
 
     def test_top_k_keeps_k_rows_per_variant_in_descending_order(self):
         rng = np.random.default_rng(102)

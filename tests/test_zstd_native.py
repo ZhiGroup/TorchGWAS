@@ -412,6 +412,19 @@ class ZstdDirectFillTestCase(unittest.TestCase):
             getattr(ZstdGenotype, "allows_direct_native_fill", False),
             "PinnedDosageLoader will fall back to copying every decoded byte")
 
+    def test_the_store_reports_its_frame_for_chunk_alignment(self):
+        from torchgwas.empirical_autotune import decode_cpu_seconds_per_variant, frame_aligned_sizes
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store, _ = self._store(tmpdir)
+            self.assertEqual(store.chunk_alignment_variants, 128)
+            # 128 divides every default candidate: nothing moves.
+            self.assertEqual(frame_aligned_sizes((512, 1024, 2048, 4096), store.chunk_alignment_variants),
+                             [512, 1024, 2048, 4096])
+            # The probe times one whole frame of the real store.
+            self.assertGreaterEqual(decode_cpu_seconds_per_variant(store, 0, 700), 0)
+            self.assertIsNone(decode_cpu_seconds_per_variant(store, 500, 700))  # no two whole frames left
+
     def test_direct_fill_matches_iter_chunks_byte_for_byte(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store, codes = self._store(tmpdir)

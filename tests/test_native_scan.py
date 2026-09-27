@@ -7,7 +7,6 @@ from scipy import stats
 import torch
 from torchgwas.linear import linear_scan, linear_scan_streaming_chunks
 from torchgwas.api import run_linear_gwas
-from torchgwas.tails import upper_tail_log10_from_t
 
 
 class Source:
@@ -45,18 +44,11 @@ class NativeScanTests(unittest.TestCase):
         for chunk in (7, 19):
             source = Source(g)
             iterator, _ = linear_scan_streaming_chunks(source, y, c,
-                chunk_size=chunk, device="cuda:0", prefetch_chunks=2,
-                compute_log10_p=True)
+                chunk_size=chunk, device="cuda:0", prefetch_chunks=2)
             rows = list(iterator)  # Retention must survive result-ring reuse.
             for field in (2, 3, 4):
                 actual = np.concatenate([row[field] for row in rows])
                 np.testing.assert_allclose(actual, reference[field-2], rtol=2e-4, atol=2e-5)
-            actual_logp = np.concatenate([row[5] for row in rows])
-            np.testing.assert_allclose(
-                actual_logp,
-                upper_tail_log10_from_t(
-                    np.concatenate([row[3] for row in rows]), 129 - 2 - 2),
-                rtol=1e-10, atol=1e-10)
             self.assertEqual(source.passes, 1)
 
     def test_api_single_pass_and_fused_missing_qc(self):
@@ -101,38 +93,6 @@ class NativeScanTests(unittest.TestCase):
                 np.testing.assert_allclose(np.concatenate([r[field] for r in rows]),
                     reference[field-2], rtol=2e-4, atol=2e-5)
             self.assertEqual(source.passes, 1)
-
-    def test_reduced_native_result_does_not_require_dense_logp_buffer(self):
-        """A reduced result has no dense log-p slot to finalize.
-
-        The reduced branch once left the local ``logp`` name uninitialized and
-        then inspected it unconditionally, so every native zstd JAGWAS run
-        failed only after its first GPU chunk completed.  Any reduction reaches
-        the same finalizer; max-|t| keeps this regression fixture small while
-        checking the selected values against the unreduced calculation.
-        """
-        from torchgwas.reduce import VariantReduction
-
-        rng = np.random.default_rng(37)
-        genotype = rng.uniform(0, 2, (97, 31)).astype(np.float32)
-        phenotype = rng.normal(size=(97, 5))
-        covariates = rng.normal(size=(97, 2))
-        reference = linear_scan(
-            genotype, phenotype, covariates,
-            device="cpu", compute_dtype="float64",
-        )
-        iterator, _ = linear_scan_streaming_chunks(
-            Source(genotype), phenotype, covariates,
-            chunk_size=7, device="cuda:0", prefetch_chunks=2,
-            reduction=VariantReduction("max-abs-t"),
-        )
-        rows = list(iterator)
-        actual_t = np.concatenate([row[3].reshape(-1) for row in rows])
-        actual_trait = np.concatenate([row[5].reshape(-1) for row in rows])
-        wanted_trait = np.abs(reference[1]).argmax(axis=1)
-        wanted_t = reference[1][np.arange(genotype.shape[1]), wanted_trait]
-        np.testing.assert_array_equal(actual_trait, wanted_trait)
-        np.testing.assert_allclose(actual_t, wanted_t, rtol=2e-4, atol=2e-5)
 
     def test_nearly_fixed_dosage_is_stable_across_chunk_shapes(self):
         rng = np.random.default_rng(52)

@@ -176,3 +176,4 @@ def upper_tail_log10(p_values: np.ndarray, t=None, df=None) -> np.ndarray:
     result[underflowed] = upper_tail_log10_from_t(t_array[underflowed],
                                                   df_array[underflowed])
     return result
+

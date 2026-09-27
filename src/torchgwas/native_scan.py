@@ -1,6 +1,7 @@
 """One CUDA association pipeline for decoded host or device-native inputs."""
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import math
 import os
 import sys
@@ -41,15 +42,40 @@ def _scan_streams(device):
     return streams
 
 
+def resolve_reader_workers(source, requested=None, limit=None):
+    """Preserve source preference while enforcing an aggregate driver's cap."""
+    workers = getattr(source, "decode_workers", requested)
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("reader worker limit must be a positive integer")
+        workers = limit if workers is None else min(int(workers), limit)
+    return workers
+
 def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                          reader_workers=None, prefetch_chunks=None,
-                         compute_p_values=True, compute_log10_p=False,
-                         variant_range=None,
-                         reduction=None):
+                         compute_p_values=True, variant_range=None,
+                         reduction=None, reader_worker_limit=None,
+                         borrow_results=False, return_df=False, significance=None, significance_n_traits=None,
+                         chunk_size_selector=None, chunk_observer=None, return_beta=True,
+                         shared_loader=None):
+    """shared_loader: a SharedDecodeHub subscriber used instead of this scan's
+    own PinnedDosageLoader, so several tile scans share one decode pass."""
     from .linear import _dosage_statistics, _two_sided_t_pvalue
-    from .tails import upper_tail_log10_from_t_torch
 
+    if type(return_beta) is not bool or (not return_beta and reduction is not None):
+        raise ValueError('Beta omission requires an unreduced scan and a boolean return_beta')
+
+    measurement_window = None
+    if chunk_size_selector is not None or chunk_observer is not None:
+        from .adaptive_chunks import (validate_chunk_control, _ChunkDelivery,
+                                      InitialChunkMeasurements, ChunkDeviceTiming)
+        validate_chunk_control(source, torch.device(device), 'float32', chunk_size,
+                               chunk_size_selector, chunk_observer)
+        if isinstance(chunk_observer, InitialChunkMeasurements):
+            measurement_window = chunk_observer
+    measure_cuda = measurement_window is not None and measurement_window.record_cuda
     profiling = os.environ.get('TORCHGWAS_SCAN_PROFILE', '0') != '0'
+    timed_gpu = profiling or measure_cuda
     blocking_events = os.environ.get('TORCHGWAS_BLOCKING_EVENTS', '0') != '0'
     from .scan_gpu import resolve_statistics_backend
     statistics_backend = resolve_statistics_backend()
@@ -68,6 +94,8 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                    chunks=0)
     timings['statistics_backend'] = statistics_backend
     timings['native_encoding'] = native_encoding
+    timings['return_beta'] = return_beta
+    timings['result_payload_bytes'] = 0
     timings['conversion_fused_into_statistics'] = native_statistics
     source._last_scan_profile = timings
 
@@ -75,13 +103,22 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
+    if measurement_window is not None and str(device) not in measurement_window.devices:
+        raise ValueError('Measurement device is outside the configured window')
     n, traits = phenotype.shape
     rank = 0 if q_matrix is None else q_matrix.shape[1]
     df = n - rank - 2
     # Offset rather than a df: each variant adds its own observed count.
     df_offset = float(-rank - 2)
+    if significance is not None and reduction is not None:
+        raise ValueError('Significance and joint reduction are mutually exclusive')
+    if significance is not None:
+        from .reduce import device_significance_critical, device_significant_pairs
+        critical=device_significance_critical(significance,n,significance_n_traits or traits,device)
+        timings['result_selection']='device_significant'
+        timings['result_payload_bytes']=0
     depth = max(2, int(prefetch_chunks or 3))
-    reader_workers = getattr(source, "decode_workers", reader_workers)
+    reader_workers = resolve_reader_workers(source, reader_workers, reader_worker_limit)
     intercept = torch.full((n, 1), 1 / math.sqrt(n), device=device)
     covariates = intercept if q_matrix is None else torch.cat((intercept,
         torch.as_tensor(q_matrix, dtype=torch.float32, device=device)), dim=1)
@@ -104,12 +141,15 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     # slice can stage a contiguous copy of the whole thing, and
     # `(A * A).sum(0)` allocates another n x K. Each is now one block wide.
     phenotype_ss = torch.empty(traits, dtype=torch.float32, device=device)
-    column_block = max(1, min(traits, (1 << 28) // max(n * 4, 1)))
+    column_block = design_column_block(n, traits)
     for begin in range(0, traits, column_block):
         stop = min(begin + column_block, traits)
         columns = phenotype_t[:, begin:stop]
-        columns.copy_(torch.as_tensor(
-            np.ascontiguousarray(phenotype[:, begin:stop]), dtype=torch.float32))
+        if isinstance(phenotype, torch.Tensor):
+            columns.copy_(phenotype[:, begin:stop])  # device to device (variant shards)
+        else:
+            columns.copy_(torch.as_tensor(
+                np.ascontiguousarray(phenotype[:, begin:stop]), dtype=torch.float32))
         torch.sum(columns * columns, dim=0, out=phenotype_ss[begin:stop])
     copy_stream, result_stream = _scan_streams(device)
     compute_stream = torch.cuda.current_stream(device)
@@ -117,6 +157,9 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                         if hasattr(source, "resolve_decode_backend") else
                         getattr(source, "decode_backend", "gpu"))
     device_source = hasattr(source, "iter_device_chunks") and selected_backend != "cpu"
+    if shared_loader is not None and (device_source or shared_loader.capacity != int(chunk_size)):
+        raise ValueError('A shared decode loader needs host decoding and the same chunk capacity')
+    timings['shared_decode'] = shared_loader is not None
     loader = None
     native_dtype = np.dtype(getattr(source, "native_transfer_dtype",
                                    getattr(source, "native_dtype", np.float32)))
@@ -128,7 +171,9 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     # them here nothing downstream can check a predicted ring against the real
     # one -- which is the whole point of having a model that both predicts and
     # chooses.
-    timings['chunk_variants'] = int(chunk_size)
+    timings['chunk_variants'] = int(chunk_size)  # Allocated capacity if adaptive.
+    timings['adaptive_chunk_sizes'] = chunk_size_selector is not None
+    timings['chunk_observer_enabled'] = chunk_observer is not None
     timings['depth'] = int(depth)
     timings['decode_on_gpu'] = bool(device_source)
     transfer_dtype = {np.dtype(np.int8): torch.int8, np.dtype(np.uint8): torch.uint8}.get(
@@ -150,31 +195,42 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     # transfer may overtake work already queued on the compute stream.
     copy_stream.wait_stream(compute_stream)
     result_stream.wait_stream(compute_stream)
-    copy_done = [torch.cuda.Event(blocking=blocking_events) for _ in range(depth)]
-    compute_done = [torch.cuda.Event(enable_timing=profiling) for _ in range(depth)]
-    result_done = [torch.cuda.Event(enable_timing=profiling, blocking=blocking_events) for _ in range(depth)]
-    compute_start = [torch.cuda.Event(enable_timing=True) for _ in range(depth)] if profiling else []
-    conversion_start = [torch.cuda.Event(enable_timing=True) for _ in range(depth)] if profiling else []
-    result_start = [torch.cuda.Event(enable_timing=True) for _ in range(depth)] if profiling else []
+    copy_done = [torch.cuda.Event(enable_timing=measure_cuda, blocking=blocking_events) for _ in range(depth)]
+    compute_done = [torch.cuda.Event(enable_timing=timed_gpu) for _ in range(depth)]
+    result_done = [torch.cuda.Event(enable_timing=timed_gpu, blocking=blocking_events) for _ in range(depth)]
+    copy_start = [torch.cuda.Event(enable_timing=True) for _ in range(depth)] if measure_cuda else []
+    compute_start = [torch.cuda.Event(enable_timing=True) for _ in range(depth)] if timed_gpu else []
+    conversion_start = [torch.cuda.Event(enable_timing=True) for _ in range(depth)] if timed_gpu else []
+    result_start = [torch.cuda.Event(enable_timing=True) for _ in range(depth)] if timed_gpu else []
     # A reduced scan stages `chunk x k`, not `chunk x K`. That is the point of
     # the mode: at K = 10^5 each of these slots would otherwise be 205 MB of
     # pinned memory per buffer per slot, which is where a high-trait scan dies
     # before it ever reaches the writer.
     reduction_width = None if reduction is None else reduction.resolved_width(traits)
-    if reduction is None:
-        result_buffers = [(torch.empty((chunk_size, traits), pin_memory=True),
-                           torch.empty((chunk_size, traits), pin_memory=True),
-                           torch.empty(chunk_size, dtype=torch.uint8, pin_memory=True),
-                           # One residual df per variant, not per test.
-                           torch.empty(chunk_size, pin_memory=True),
-                           *(tuple([torch.empty((chunk_size, traits),
-                                                dtype=torch.float64,
-                                                pin_memory=True)])
-                             if compute_log10_p else tuple()))
-                          for _ in range(depth)]
+    if significance is not None:
+        make_result = None
+    elif reduction is None:
+        def make_result(rows):
+            return ((torch.empty((rows, traits), pin_memory=True) if return_beta else None),
+                    torch.empty((rows, traits), pin_memory=True),
+                    torch.empty(rows, dtype=torch.uint8, pin_memory=True),
+                    # One residual df per variant, not per test.
+                    torch.empty(rows, pin_memory=True))
     else:
-        result_buffers = [reduction.host_buffers(chunk_size, reduction_width)
-                          for _ in range(depth)]
+        def make_result(rows):
+            return reduction.host_buffers(rows, reduction_width)
+    # Pinned on a slot's first chunk and grown once to the capacity, like the
+    # input ring (streaming.PinnedDosageLoader); dense output at K = 512 and
+    # depth 32 pins 537 MB per GPU at chunk 4096.
+    result_buffers = [] if make_result is None else [None] * depth
+    result_rows = [0] * depth
+
+    def result_slot(slot, rows):
+        """This slot's pinned results. Its previous chunk was resolved before this iteration, so they are free."""
+        if result_buffers[slot] is None or result_rows[slot] < rows:
+            size = rows if result_buffers[slot] is None else chunk_size
+            result_buffers[slot], result_rows[slot] = make_result(size), size
+        return result_buffers[slot]
     pending = deque()
     release_pool = None if device_source else ThreadPoolExecutor(
         max_workers=1, thread_name_prefix='torchgwas-copy-release')
@@ -186,16 +242,72 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
 
     pool = ThreadPoolExecutor(max_workers=depth, thread_name_prefix="torchgwas-result")
     source._last_scan_exclusion_counts = {"missing": 0, "invariant": 0}
+    # Significant pairs: select on a separate stream, one chunk behind, so the
+    # host collects chunk i's pairs while chunk i+1 already runs.
+    select_stream = torch.cuda.Stream(device) if significance is not None else None
+    pending_selection = deque()
+    selection_lag = 0
+    if significance is not None:
+        lag_setting = os.environ.get('TORCHGWAS_SELECTION_LAG', 'auto')
+        if lag_setting == 'auto':
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            # beta, t and the product of one extra chunk stay resident.
+            selection_lag = int(3 * chunk_size * traits * 4 < 0.2 * free_bytes)
+        else:
+            selection_lag = max(0, min(1, int(lag_setting)))
+        timings['selection_lag'] = selection_lag
 
-    def finish(slot, start, end):
+    def select(entry):
+        """Collect one chunk's significant pairs (host side), then yield them."""
+        slot, start, end, beta, t, status, variant_df, delivery = entry
+        with torch.cuda.stream(select_stream):
+            select_stream.wait_event(compute_done[slot])
+            status_host = status.cpu().numpy()
+            malformed = np.flatnonzero(status_host == 3)
+            if malformed.size:
+                raise ValueError(f"invalid native ALT1 dosage at variant {start+int(malformed[0])}")
+            source._last_scan_exclusion_counts['missing'] += int((status_host == 1).sum())
+            source._last_scan_exclusion_counts['invariant'] += int((status_host == 2).sum())
+            timings['result_payload_bytes'] += status_host.nbytes
+            # Gather before yielding: the stream context must not stay active
+            # while the consumer runs.
+            blocks = list(device_significant_pairs(beta, t, status, variant_df, critical, start=start))
+        del beta, t, status, variant_df
+        for selected in blocks:
+            timings['result_payload_bytes'] += sum(a.nbytes for a in selected[2:])
+            if delivery is None:
+                yield selected
+            else:
+                yield from delivery.deliver(selected)
+        if delivery is not None:
+            if delivery.record_cuda:
+                delivery.cuda = device_timing(slot, result_transfer=False)
+            delivery.complete()
+        if profiling:
+            compute_done[slot].synchronize()
+            timings['gpu_compute_milliseconds'] += compute_start[slot].elapsed_time(compute_done[slot])
+            timings['chunks'] += 1
+
+    def device_timing(slot, *, result_transfer):
+        return ChunkDeviceTiming(
+            copy_start[slot].elapsed_time(copy_done[slot]) / 1000.,
+            conversion_start[slot].elapsed_time(compute_start[slot]) / 1000.,
+            compute_start[slot].elapsed_time(compute_done[slot]) / 1000.,
+            result_start[slot].elapsed_time(result_done[slot]) / 1000. if result_transfer else None)
+
+    def finish(slot, start, end, delivery=None):
         result_done[slot].synchronize()
+        if delivery is not None and delivery.record_cuda:
+            delivery.cuda = device_timing(slot, result_transfer=True)
         count = end - start
-        # Return owned arrays: callers may retain results beyond ring reuse.
-        staged = [value[:count].numpy().copy() for value in result_buffers[slot]]
-        logp = None
+        # The loop yields this slot before reusing it. Borrowed views are valid
+        # until the caller requests another chunk; owned results may be kept.
+        if borrow_results:
+            staged = [None if value is None else value[:count].numpy() for value in result_buffers[slot]]
+        else:
+            staged = [None if value is None else value[:count].numpy().copy() for value in result_buffers[slot]]
         if reduction is None:
-            beta, t, status, variant_df = staged[:4]
-            logp = staged[4] if compute_log10_p else None
+            beta, t, status, variant_df = staged
             trait_index = None
         else:
             beta, t, trait_index, status, variant_df = staged
@@ -203,25 +315,19 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         if malformed.size:
             raise ValueError(f"invalid native ALT1 dosage at variant {start + int(malformed[0])}")
         invalid = status != 0
-        beta[invalid] = np.nan
+        if beta is not None:beta[invalid] = np.nan
         t[invalid] = np.nan
-        if logp is not None:
-            logp[invalid] = np.nan
         # df is per variant either way; a reduced chunk broadcasts it across the
         # k traits it kept, so the p-values match the unreduced scan exactly.
         df_for_p = variant_df[:, None] if reduction is not None else variant_df
-        if logp is not None and compute_p_values:
-            with np.errstate(under="ignore"):
-                p = np.power(10.0, -logp)
-        else:
-            p = (_two_sided_t_pvalue(t, df_for_p) if compute_p_values else None)
+        p = (_two_sided_t_pvalue(t, df_for_p) if compute_p_values else None)
         gpu_times = (compute_start[slot].elapsed_time(compute_done[slot]),
                      result_start[slot].elapsed_time(result_done[slot]),
                      0.0 if device_source else conversion_start[slot].elapsed_time(compute_start[slot])) if profiling else None
-        emitted = ((start, end, beta, t, p, logp)
-                   if reduction is None and compute_log10_p else
-                   (start, end, beta, t, p) if reduction is None
+        emitted = ((start, end, beta, t, p) if reduction is None
                    else (start, end, beta, t, p, trait_index))
+        if return_df:
+            emitted = (*emitted, variant_df[:, None])
         return emitted, int((status == 1).sum()), int((status == 2).sum()), gpu_times
 
     def resolve(future):
@@ -237,6 +343,15 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         source._last_scan_exclusion_counts["invariant"] += invariant
         return result
 
+    def emit_observed(item):
+        future, delivery = item
+        result = resolve(future)
+        if delivery is None:
+            yield result
+        else:
+            yield from delivery.deliver(result)
+            delivery.complete()
+
     try:
         # Both branches must carry the variant range. The pinned loader accepts
         # and honours it, but this call omitted it, so a ranged scan of a
@@ -244,12 +359,17 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         # range asked for -- no error, just the wrong extent, and a plausible
         # runtime. Same failure the multi-GPU duplicate-coverage check exists to
         # catch; here it would have had every shard scan every variant.
-        loader = (source.iter_device_chunks(chunk_size=chunk_size, device=device,
+        loader = (shared_loader if shared_loader is not None else
+                  source.iter_device_chunks(chunk_size=chunk_size, device=device,
                   reader_workers=reader_workers, prefetch_chunks=depth,
-                  variant_range=variant_range)
+                  variant_range=variant_range,
+                  **({} if chunk_size_selector is None else {'chunk_size_selector': chunk_size_selector}))
                   if device_source else PinnedDosageLoader(source, chunk_size, depth,
                                                            reader_workers,
-                                                           variant_range=variant_range))
+                                                           variant_range=variant_range,
+                                                           chunk_size_selector=chunk_size_selector,
+                                                           record_timing=(lambda start, end: measurement_window.reserve_read(start, end, str(device)))
+                                                               if measurement_window is not None else chunk_observer is not None))
         if profiling:
             timings['setup_seconds'] = time.perf_counter() - setup_started
         def timed_items():
@@ -265,15 +385,25 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                 yield item
         for iteration, item in enumerate(timed_items() if profiling else loader):
             if len(pending) >= depth:
-                yield resolve(pending.popleft())
+                if chunk_observer is None:
+                    yield resolve(pending.popleft())
+                else:
+                    yield from emit_observed(pending.popleft())
             slot = iteration % depth
+            delivery = None
             if device_source:
                 start, end, genotype_t = item
                 if genotype_t.device != device or genotype_t.shape != (end - start, n):
                     raise ValueError("device decoder returned the wrong device or shape")
                 genotype_t.record_stream(compute_stream)
+                if chunk_observer is not None:
+                    from .adaptive_chunks import MinimalDelivery
+                    delivery = MinimalDelivery(start, end, chunk_size, device, chunk_observer)
             else:
-                buffer_index, host, start, end = item
+                buffer_index, host, start, end = item[:4]
+                if chunk_observer is not None and len(item) > 4 and item[4] is not None:
+                    delivery = _ChunkDelivery(start, end, chunk_size, device,
+                                              item[4], chunk_observer, record_cuda=measure_cuda)
                 # Complete the previous lease before recording this slot's event again.
                 if release_futures[slot] is not None:
                     copy_wait_started = time.perf_counter() if profiling else 0
@@ -282,11 +412,23 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                         timings['copy_wait_seconds'] += time.perf_counter() - copy_wait_started
                 if iteration >= depth:
                     copy_stream.wait_event(compute_done[slot])
-                with torch.cuda.stream(copy_stream):
-                    device_buffers[slot][:end-start].copy_(host, non_blocking=True)
-                    copy_done[slot].record(copy_stream)
+                # Shared decode with GPU fan-out: `host` is the chunk already in
+                # the root GPU's ring. Wait for that copy, then pull it GPU to GPU
+                # (NVLink peer copy). PyTorch runs a cross-device copy on the
+                # source GPU's current stream, so give it a dedicated one there.
+                fanout_ready = item[5] if len(item) > 5 else None
+                if fanout_ready is not None:
+                    copy_stream.wait_event(fanout_ready)
+                peer = (loader.peer_stream(device) if fanout_ready is not None and host.device != device
+                        else None)
+                with (torch.cuda.stream(peer) if peer is not None else contextlib.nullcontext()):
+                    with torch.cuda.stream(copy_stream):
+                        if delivery is not None and delivery.record_cuda:
+                            copy_start[slot].record(copy_stream)
+                        device_buffers[slot][:end-start].copy_(host, non_blocking=True)
+                        copy_done[slot].record(copy_stream)
                 compute_stream.wait_event(copy_done[slot])
-                if profiling:
+                if profiling or (delivery is not None and delivery.record_cuda):
                     conversion_start[slot].record(compute_stream)
                 genotype_t = device_buffers[slot][:end-start]
                 if not native_statistics and transfer_dtype == torch.int8:
@@ -298,7 +440,7 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                       getattr(source, 'native_missing_value', None) is not None):
                     genotype_t = torch.where(genotype_t == source.native_missing_value,
                                              torch.nan, genotype_t)
-            if profiling:
+            if profiling or (delivery is not None and delivery.record_cuda):
                 compute_start[slot].record(compute_stream)
             if native_statistics:
                 scale = (float(source.native_scale)
@@ -321,6 +463,19 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                     genotype_t, design, phenotype_ss, traits, df,
                     getattr(source, "validate_native_range", False),
                     covariate_rank=rank)
+            if significance is not None:
+                # Release the input lease after its own H2D event, independently
+                # of how long selection and the downstream writer take.
+                if not device_source:
+                    release_futures[slot] = release_pool.submit(release_after_copy, slot, buffer_index)
+                compute_done[slot].record(compute_stream)
+                for tensor in (beta, t, status, variant_df):
+                    tensor.record_stream(select_stream)  # read there, allocated here
+                pending_selection.append((slot, start, end, beta, t, status, variant_df, delivery))
+                del beta, t, status, variant_df
+                while len(pending_selection) > selection_lag:
+                    yield from select(pending_selection.popleft())
+                continue
             if reduction is not None:
                 # Reduce on the compute stream, before compute_done is recorded,
                 # so the narrow result is what the copy stream waits for and the
@@ -329,26 +484,30 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                     beta, t, status, variant_df, reduction_width)
                 staged_values = (beta, t, index_t, status, variant_df)
             else:
-                logp = (upper_tail_log10_from_t_torch(
-                    t, variant_df[:, None]) if compute_log10_p else None)
-                staged_values = (beta, t, status, variant_df)
-                if logp is not None:
-                    staged_values += (logp,)
+                staged_values = (beta if return_beta else None, t, status, variant_df)
+            timings['result_payload_bytes'] += sum(value.numel()*value.element_size() for value in staged_values if value is not None)
             compute_done[slot].record(compute_stream)
             with torch.cuda.stream(result_stream):
                 result_stream.wait_event(compute_done[slot])
-                if profiling:
+                if profiling or (delivery is not None and delivery.record_cuda):
                     result_start[slot].record(result_stream)
-                for destination, value in zip(result_buffers[slot], staged_values):
+                for destination, value in zip(result_slot(slot, end - start), staged_values):
+                    if destination is None:continue
                     destination[:end-start].copy_(value, non_blocking=True)
                     value.record_stream(result_stream)
                 result_done[slot].record(result_stream)
             if not device_source:
                 # Return pinned storage only after DMA, without serializing submission.
                 release_futures[slot] = release_pool.submit(release_after_copy, slot, buffer_index)
-            pending.append(pool.submit(finish, slot, start, end))
+            future = pool.submit(finish, slot, start, end, delivery)
+            pending.append(future if chunk_observer is None else (future, delivery))
+        while pending_selection:
+            yield from select(pending_selection.popleft())
         while pending:
-            yield resolve(pending.popleft())
+            if chunk_observer is None:
+                yield resolve(pending.popleft())
+            else:
+                yield from emit_observed(pending.popleft())
     finally:
         # A CUDA error must not skip producer/reader shutdown. Preserve the primary
         # exception while still checking asynchronous errors in the final slots.
@@ -359,7 +518,8 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                 operation()
             except BaseException as error:
                 cleanup_errors.append(error)
-        for stream in (copy_stream, result_stream, compute_stream):
+        pending_selection.clear()
+        for stream in (copy_stream, result_stream, compute_stream) + ((select_stream,) if select_stream is not None else ()):
             cleanup(stream.synchronize)
         if release_pool is not None:
             cleanup(lambda: release_pool.shutdown(wait=True))
@@ -386,3 +546,10 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         del result_buffers[:]
         if cleanup_errors and not primary_error:
             raise cleanup_errors[0]
+
+
+def design_column_block(n_samples, traits):
+    """Source design upload/square workspace cap: 256 MiB per trait block."""
+    if n_samples < 1 or traits < 1:
+        raise ValueError('Positive design dimensions required')
+    return max(1, min(traits, (1 << 28) // max(n_samples * 4, 1)))

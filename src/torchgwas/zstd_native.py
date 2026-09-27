@@ -138,3 +138,5 @@ def contiguous_frame_batches(path, offsets, sizes, *, target_bytes=16 << 20, pre
                 yield pending.popleft().result()
     finally:
         os.close(fd)
+
+

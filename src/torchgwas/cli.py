@@ -32,7 +32,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     prep = subparsers.add_parser("prep", help="Validate and preprocess phenotype/covariates")
     prep.add_argument("--genotype", required=True)
-    prep.add_argument("--genotype-format", default="auto", choices=["auto", "plink", "bgen", "pgen", "zstd"])
+    prep.add_argument("--genotype-format", default="auto", choices=["auto", "npy", "plink", "bgen", "pgen", "zstd"])
     prep.add_argument("--phenotype", default=None)
     prep.add_argument("--phenotype-table", default=None)
     prep.add_argument("--covariates", default=None)
@@ -65,7 +65,7 @@ def _build_parser() -> argparse.ArgumentParser:
              ".bed. The .bim/.fam are still used, so this is a transport swap "
              "only. Measured 2.15x faster at K=1 and no faster at K=512, "
              "where the write and the GEMM set the floor.")
-    linear.add_argument("--genotype-format", default="auto", choices=["auto", "plink", "bgen", "pgen", "zstd"])
+    linear.add_argument("--genotype-format", default="auto", choices=["auto", "npy", "plink", "bgen", "pgen", "zstd"])
     linear.add_argument("--phenotype", default=None)
     linear.add_argument("--phenotype-table", default=None)
     linear.add_argument("--covariates", default=None)
@@ -94,6 +94,15 @@ def _build_parser() -> argparse.ArgumentParser:
     linear.add_argument("--chunk-size", type=int, default=None)
     linear.add_argument("--pipeline-profile", default=None,
                         help="JSON with explicit hardware and input costs for the shared calculator")
+    linear.add_argument('--autotune-profile', default=None,
+                        help='bound independent component profile for guarded detailed autotune')
+    linear.add_argument('--autotune-config', default=None,
+                        help='JSON with finite bounds, resource/scenario joint settings and qc_trait_block')
+    linear.add_argument('--autotune', action='store_true',
+                        help='empirical autotune: choose GPUs/tiles/shards at startup and tune the chunk '
+                             'size from the first chunks of this job')
+    linear.add_argument('--autotune-options', default=None,
+                        help='JSON object for --autotune (chunk_sizes, devices, min_tile_traits, ...)')
     linear.add_argument("--p-value-threshold", type=float, default=None)
     # TWO MODES, and the CLI previously offered NEITHER of them: it exposed
     # only the internal top-k spellings, so the reduction a user actually wants
@@ -118,16 +127,20 @@ def _build_parser() -> argparse.ArgumentParser:
     linear.add_argument(
         "--trait-block", type=int, default=None,
         help="process the traits in blocks of this many columns, so the device "
-             "never holds the full (samples x traits) design. Requires "
-             "--reduce. Costs one extra pass over the genotypes per block",
+             "never holds the full design. Full binary output uses contiguous "
+             "trait tiles; each block reads the genotypes once",
     )
+    linear.add_argument('--variant-devices',nargs='+',default=None,
+                        help='devices for disjoint variant ranges with independent durable writers')
+    linear.add_argument('--trait-devices',nargs='+',default=None,
+                        help='explicit devices for independent trait tiles, e.g. cuda:0 cuda:1')
     linear.add_argument(
         "--sumstats-format",
         default="binary",
         choices=["binary", "none"],
         help=(
-            "binary writes tiled float32 beta/t_stat/-log10(P) "
-            "arrays under sumstats/ (12 bytes per marker-trait cell); "
+            "binary writes a tiled float32 beta/t_stat "
+            "store under sumstats/ (8 bytes per marker-trait cell); "
             "none runs the scan and discards results, isolating scan cost"
         ),
     )
@@ -136,9 +149,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default="beta+t",
         choices=["beta+t", "t"],
         help=(
-            "binary store contents: 'beta+t' (default, 12 bytes per cell) keeps "
-            "effect size, statistic and -log10(P); 't' writes t and -log10(P) at "
-            "8 bytes per cell but is screening-only, with no effect size or standard error, so "
+            "binary store contents: 'beta+t' (default, 8 bytes per cell) keeps "
+            "effect size and statistic; 't' halves the output to 4 bytes per cell "
+            "but is screening-only, with no effect size and no standard error, so "
             "it cannot be meta-analysed"
         ),
     )
@@ -411,10 +424,16 @@ def _run_linear(args) -> int:
         device=args.device,
         chunk_size=args.chunk_size,
         pipeline_profile=args.pipeline_profile,
+        autotune_profile=args.autotune_profile,
+        autotune_config=args.autotune_config,
+        autotune=True if args.autotune else None,
+        autotune_options=None if args.autotune_options is None else json.loads(args.autotune_options),
         p_value_threshold=args.p_value_threshold,
         reduce=args.reduce,
         significance_threshold=args.significance_threshold,
         trait_block=args.trait_block,
+        trait_devices=args.trait_devices,
+        variant_devices=args.variant_devices,
         sumstats_format=args.sumstats_format,
         sumstats_block_bytes=args.sumstats_block_bytes,
         sumstats_queue_depth=args.sumstats_queue_depth,
@@ -464,9 +483,9 @@ def _run_demo(args) -> int:
     out = mkdir(args.output_dir)
     linear_out = out / "linear"
     linear_result = run_linear_gwas(
-        genotype=np.load(toy["genotype"], allow_pickle=False),
-        phenotype=np.load(toy["phenotype"], allow_pickle=False),
-        covariates=np.load(toy["covariates"], allow_pickle=False),
+        genotype=toy["genotype"],
+        phenotype=toy["phenotype"],
+        covariates=toy["covariates"],
         marker_ids=toy["marker_ids"],
         sample_ids=toy["sample_ids"],
         chunk_size=4,

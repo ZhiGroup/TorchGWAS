@@ -1,0 +1,237 @@
+{
+  "device": "cuda:2",
+  "device_name": "NVIDIA A100-SXM4-80GB",
+  "torch_version": "2.5.1+cu124",
+  "cuda_version": "12.4",
+  "affinity": [
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "torch_threads": 4,
+  "library": {
+    "path": "/opt/conda/lib/python3.11/site-packages/nvidia/cublas/lib/libcublasLt.so.12",
+    "bytes": 441938896,
+    "mtime_ns": 1730487495621102923,
+    "sha256": "44a813aa2da08830f9083f81d0eb73f1ae4052a4d9b0b0de480a8f6cd9eb3078"
+  },
+  "rows": [
+    {
+      "repeat": 0,
+      "arithmetic": "scalar",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.04077952575683594,
+      "flops_per_second": 3370293080197.503,
+      "submit_cpu_seconds": 4.5594374999957665e-05,
+      "wall_seconds": 0.04081279312958941
+    },
+    {
+      "repeat": 0,
+      "arithmetic": "tensor",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.008290541648864747,
+      "flops_per_second": 16577801462564.271,
+      "submit_cpu_seconds": 0.00015368131249982042,
+      "wall_seconds": 0.008369882474653423
+    },
+    {
+      "repeat": 1,
+      "arithmetic": "scalar",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.03727520370483398,
+      "flops_per_second": 3687141579703.1963,
+      "submit_cpu_seconds": 9.517437499995118e-05,
+      "wall_seconds": 0.03732046502409503
+    },
+    {
+      "repeat": 1,
+      "arithmetic": "tensor",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.008302767753601075,
+      "flops_per_second": 16553390092405.03,
+      "submit_cpu_seconds": 5.6870687499932515e-05,
+      "wall_seconds": 0.008333669567946345
+    },
+    {
+      "repeat": 2,
+      "arithmetic": "tensor",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.008599419593811036,
+      "flops_per_second": 15982352293975.074,
+      "submit_cpu_seconds": 5.51687500001119e-05,
+      "wall_seconds": 0.008629807212855667
+    },
+    {
+      "repeat": 2,
+      "arithmetic": "scalar",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.039112289428710936,
+      "flops_per_second": 3513958284710.1494,
+      "submit_cpu_seconds": 0.00010439568749998074,
+      "wall_seconds": 0.039150679600425065
+    },
+    {
+      "repeat": 3,
+      "arithmetic": "scalar",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.040747337341308594,
+      "flops_per_second": 3372955447880.7124,
+      "submit_cpu_seconds": 7.72731874998378e-05,
+      "wall_seconds": 0.04078056709840894
+    },
+    {
+      "repeat": 3,
+      "arithmetic": "tensor",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.007748315811157227,
+      "flops_per_second": 17737913221618.312,
+      "submit_cpu_seconds": 5.535631250008777e-05,
+      "wall_seconds": 0.007803422340657562
+    },
+    {
+      "repeat": 4,
+      "arithmetic": "scalar",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.03475604248046875,
+      "flops_per_second": 3954390191266.2866,
+      "submit_cpu_seconds": 6.287568750007466e-05,
+      "wall_seconds": 0.03481027897214517
+    },
+    {
+      "repeat": 4,
+      "arithmetic": "tensor",
+      "loops": 16,
+      "dimension": 4096,
+      "useful_flops": 137438953472,
+      "gpu_seconds": 0.008138409614562988,
+      "flops_per_second": 16887691819549.7,
+      "submit_cpu_seconds": 5.2775062500121095e-05,
+      "wall_seconds": 0.008183210622519255
+    }
+  ],
+  "kernels": {
+    "scalar": [
+      {
+        "name": "void scal_kernel<double, double, 1, true, 6, 4, 4, 4>(cublasTransposeParams<double>, double const*, double*, double const*)",
+        "geometry": {
+          "registers per thread": 16,
+          "shared memory": 0,
+          "grid": [
+            64,
+            256,
+            1
+          ],
+          "block": [
+            256,
+            1,
+            1
+          ]
+        }
+      },
+      {
+        "name": "void dgemm_largek<false, false, 6, 3, 4, 5, 2, 64>(double*, double const*, double const*, int, int, int, int, int, int, double const*, double const*, double, double, int, int, int*, int*)",
+        "geometry": {
+          "registers per thread": 56,
+          "shared memory": 9476,
+          "grid": [
+            64,
+            512,
+            4
+          ],
+          "block": [
+            32,
+            4,
+            1
+          ]
+        }
+      }
+    ],
+    "tensor": [
+      {
+        "name": "void cutlass::Kernel2<cutlass_80_tensorop_d884gemm_64x64_16x4_nn_align1>(cutlass_80_tensorop_d884gemm_64x64_16x4_nn_align1::Params)",
+        "geometry": {
+          "registers per thread": 128,
+          "shared memory": 65536,
+          "grid": [
+            512,
+            8,
+            1
+          ],
+          "block": [
+            128,
+            1,
+            1
+          ]
+        }
+      }
+    ]
+  },
+  "selections": {
+    "scalar": {
+      "instruction_flags": 1049601,
+      "preference_mask": 18446744073709551361,
+      "workspace_bytes": 262144,
+      "waves_count": 134.8477325439453,
+      "algorithm_data": [
+        42949672970,
+        17179869184,
+        1,
+        0,
+        517135537274881,
+        4294967297,
+        300647776257,
+        1
+      ],
+      "selection": "First vendor heuristic; no algorithm timing search"
+    },
+    "tensor": {
+      "instruction_flags": 1049608,
+      "preference_mask": 18446744073709551368,
+      "workspace_bytes": 0,
+      "waves_count": 18.962963104248047,
+      "algorithm_data": [
+        64424509462,
+        4294967300,
+        0,
+        0,
+        517135928852481,
+        4294967297,
+        300647776257,
+        1
+      ],
+      "selection": "First vendor heuristic; no algorithm timing search"
+    }
+  },
+  "max_abs_cpu_reference_error": {
+    "scalar": 4.121147867408581e-13,
+    "tensor": 1.1368683772161603e-13
+  },
+  "resources": {
+    "fp64_flops_per_second": 3513958284710.1494,
+    "fp64_tensor_flops_per_second": 16577801462564.271
+  },
+  "calibration_transfer_qualified": false
+}
