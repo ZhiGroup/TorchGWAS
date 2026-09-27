@@ -187,7 +187,10 @@ def native(monkeypatch):
 
 # Three sizes and a shallow ring keep the trial schedule, including the rows
 # that drain after each switch, inside half of an 8,192-variant job.
-OPTIONS = dict(chunk_sizes=[16, 32, 64], warmup_fraction=.02, trial_fraction=.2, min_job_seconds=0)
+# start_chunk=16: these tests exercise probing and switching; the default
+# start is the largest size (api.py), which probes nothing above itself.
+OPTIONS = dict(chunk_sizes=[16, 32, 64], warmup_fraction=.02, trial_fraction=.2, min_job_seconds=0,
+               start_chunk=16)
 RING = dict(prefetch_chunks=2, reader_workers=4)
 # cpus_per_device=1 in multi-GPU tests: they test partitioning, not how busy the host is.
 
@@ -298,6 +301,15 @@ def test_jagwas_two_gpu_variant_shards_match_single_fixed(tmp_path, native):
     expected, actual = _pairs(tmp_path/'fixed', 'chi2'), _pairs(tmp_path/'tuned', 'chi2')
     assert actual.keys() == expected.keys() and len(expected) == 8192
     np.testing.assert_allclose([actual[k] for k in expected], list(expected.values()), rtol=2e-4, atol=2e-4)
+
+
+def test_the_default_start_is_the_largest_fitting_size(tmp_path, native):
+    path = _fixture(tmp_path)
+    options = {key: value for key, value in OPTIONS.items() if key != 'start_chunk'}
+    _, _, run = _run(tmp_path, 'tuned', path, device='cuda:0', reduce='min-p', autotune=True,
+                     autotune_options=options, **RING)
+    chunk = run['autotune']['chunk']
+    assert chunk['initial'] == chunk['choice'] == 64 and chunk['reason'] == 'no_larger_size_to_probe'
 
 
 def test_min_p_two_gpu_variant_shards_match_single_fixed(tmp_path, native):
@@ -563,6 +575,7 @@ def test_grouped_jagwas_is_priced_by_its_groups(monkeypatch):
                 **dict(BASE, device_free_bytes=8*GIB))
     # GPU time: each group's projection, not one 30,000-wide one.
     monkeypatch.setattr(autotune, 'measured_gemm_rate', lambda device, dtype: 1e12)
+    monkeypatch.setattr(autotune, 'scan_device_seconds_per_variant', lambda *args, **kwargs: None)
     single = autotune.gpu_seconds_per_variant('cuda:0', mode='jagwas', n_samples=1000, n_traits=30_000)
     grouped = autotune.gpu_seconds_per_variant('cuda:0', mode='jagwas', n_samples=1000, n_traits=30_000,
                                               group_sizes=groups)
@@ -572,6 +585,22 @@ def test_grouped_jagwas_is_priced_by_its_groups(monkeypatch):
     assert autotune.jagwas_projection_flops(30_000, groups) == 30 * projection_flops_per_variant(1000)
     assert autotune.jagwas_projection_flops(30_000) / autotune.jagwas_projection_flops(30_000, groups) > 10
     assert single / grouped > 5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('mode', ['full', 'min-p', 'significant', 'jagwas'])
+def test_scan_device_time_prices_more_than_the_gemm(mode, monkeypatch):
+    import torchgwas.empirical_autotune as autotune
+    monkeypatch.delenv('TORCHGWAS_NATIVE_STATS', raising=False)
+    device = f'cuda:{torch.cuda.device_count() - 1}'
+    narrow = autotune.scan_device_seconds_per_variant(device, mode=mode, n_samples=4000, n_traits=64)
+    wide = autotune.scan_device_seconds_per_variant(device, mode=mode, n_samples=4000, n_traits=4096)
+    # Per-variant passes and a K-linear part: the wide panel costs more, not 64x.
+    assert 0 < narrow < wide < 64 * narrow
+    gemm = 2.0 * 4000 * 4096 / autotune.measured_gemm_rate(device, torch.float32)
+    assert autotune.gpu_seconds_per_variant(device, mode=mode, n_samples=4000, n_traits=4096) >= gemm
+    monkeypatch.setenv('TORCHGWAS_NATIVE_STATS', '1')
+    assert autotune.scan_device_seconds_per_variant(device, mode=mode, n_samples=4000, n_traits=64) is None
 
 
 def test_output_write_rates_uses_the_real_writer_and_cleans_up(tmp_path):

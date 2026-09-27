@@ -434,17 +434,110 @@ def jagwas_factor_bytes(n_traits, group_sizes=None):
 
 
 def gpu_seconds_per_variant(device, *, mode, n_samples, n_traits, group_sizes=None):
-    """GEMM time one GPU spends per variant: FP32 scoring, plus the FP64 projection for JAGWAS.
+    """GPU time one variant costs: the scan's device work, plus the FP64 projection for JAGWAS.
 
-    A floor: statistics and selection kernels add to it, so CPU demand
-    derived from it errs toward fewer GPUs. group_sizes (JAGWAS groups)
-    prices each group's own projection.
+    The larger of the FP32 GEMM alone and the scan's own per-chunk device
+    work, timed (scan_device_seconds_per_variant). The GEMM alone was the
+    price until 2026-09-27 and is 3.4x short at K = 512 (0.47 against 1.6 us
+    per variant), which made CPU demand per GPU 3.4x too high: a K = 512
+    min-p job was held to 2 GPUs (14.6 cores each) and ran 18-21 s against
+    9.6-10.3 s on four. group_sizes (JAGWAS groups) prices each group's own
+    projection.
     """
     import torch
     seconds = 2.0 * n_samples * n_traits / measured_gemm_rate(device, torch.float32)
+    measured = scan_device_seconds_per_variant(device, mode=mode, n_samples=n_samples, n_traits=n_traits)
+    if measured is not None:
+        seconds = max(seconds, measured)
     if mode == 'jagwas':
         seconds += jagwas_projection_flops(n_traits, group_sizes) / measured_gemm_rate(device, torch.float64)
     return seconds
+
+
+def scan_device_seconds_per_variant(device, *, mode, n_samples, n_traits, repeats=3):
+    """GPU seconds per variant of the scan's own per-chunk device work, timed; None if not measurable.
+
+    Times, with CUDA events on a synthetic chunk, what the torch statistics
+    backend does to every chunk: the uint8-to-float conversion, the
+    statistics (linear._dosage_statistics: missing mask, range, centring, the
+    GEMM against an n x (K + 1) design, residual sums), and the mode's own
+    step -- the -log10 P tail over every cell (full output), the min-p
+    reduction and its winners' tail, or the significance selection. JAGWAS's
+    reduction is priced by its projection FLOPs instead (gpu_seconds_per_variant).
+
+    Panels wider than 2,048 traits are timed at 256 and 2,048 and extended
+    linearly in K: the GEMM and every per-cell pass are linear in K, the
+    per-variant passes constant. The chunk is 1,024 variants (fewer for large
+    n, at most 2^27 genotype cells). About 50 ms.
+
+    H100, 22,250 samples, K = 512, timed in the scan itself (TORCHGWAS_SCAN_PROFILE,
+    benchmarks/gpu_pipeline_profile_20260927.py): 1.58-1.65 us per variant of
+    GPU compute for min-p, 1.85 us for dense output; the GEMM alone 0.47.
+    The native fused backend (TORCHGWAS_NATIVE_STATS=1) is not timed here: None.
+    """
+    import torch
+    from .scan_gpu import resolve_statistics_backend
+    device = torch.device(device)
+    if device.type != 'cuda' or resolve_statistics_backend() != 'torch':
+        return None
+    chunk = int(max(64, min(1024, (1 << 27) // max(1, int(n_samples)))))
+    widths = sorted({min(int(n_traits), 256), min(int(n_traits), 2048)})
+    timed = {width: _device_chunk_seconds(device, mode, int(n_samples), width, chunk, repeats)
+             for width in widths}
+    if len(widths) == 1 or int(n_traits) <= widths[-1]:
+        seconds = timed[widths[-1]]
+    else:
+        low, high = widths
+        seconds = timed[high] + (timed[high] - timed[low]) / (high - low) * (int(n_traits) - high)
+    return seconds / chunk
+
+
+def _device_chunk_seconds(device, mode, n_samples, width, chunk, repeats):
+    """CUDA-event seconds of one synthetic chunk's device work (scan_device_seconds_per_variant)."""
+    import torch
+    from .linear import _dosage_statistics
+    with torch.cuda.device(device):
+        generator = torch.Generator(device=device).manual_seed(20260927)
+        codes = torch.randint(0, 3, (chunk, n_samples), generator=generator, device=device, dtype=torch.uint8)
+        design = torch.randn(n_samples, width + 1, generator=generator, device=device) / n_samples ** 0.5
+        phenotype_ss = torch.ones(width, device=device)
+        step = None
+        if mode == 'full':
+            from .tails import neg_log10_p_device
+
+            def step(beta, t, status, variant_df):
+                neg_log10_p_device(t, variant_df.reshape(-1, 1))
+        elif mode == 'min-p':
+            from .min_p import MinPReduction
+            reduction = MinPReduction()
+
+            def step(beta, t, status, variant_df):
+                reduction.reduce(beta, t, status, variant_df, 1, log10_p=(None, None, torch.float32))
+        elif mode == 'significant':
+            from .reduce import SignificantPairs, device_significance_critical, device_significant_pairs
+            critical = device_significance_critical(SignificantPairs(), n_samples, width, device)
+
+            def step(beta, t, status, variant_df):
+                for _ in device_significant_pairs(beta, t, status, variant_df.float(), critical):
+                    pass
+
+        def once():
+            beta, t, status, variant_df = _dosage_statistics(codes.float(), design, phenotype_ss, width,
+                                                             n_samples - 3, False, covariate_rank=1)
+            if step is not None:
+                step(beta, t, status, variant_df)
+
+        once()
+        torch.cuda.synchronize(device)
+        seconds = []
+        for _ in range(repeats):
+            start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            once()
+            stop.record()
+            stop.synchronize()
+            seconds.append(start.elapsed_time(stop) / 1e3)
+        return min(seconds)
 
 
 def shard_setup_seconds(device):
@@ -861,9 +954,13 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
             if best < usable:
                 why.append(f'{best} shards minimize {shard_setup_seconds:.2f} s setup per GPU + {work:.1f} s GPU work / GPUs')
             usable = best
-        if n_traits < 2*min_tile_traits and not (mode == 'full' and output_rates):
-            # Without a write measurement: the lab-2080ti rule above; min-p
-            # output is as small as JAGWAS's.
+        measured = (bool(output_rates) if mode == 'full'
+                    else bool(gpu_seconds_per_variant and shard_setup_seconds))
+        if n_traits < 2*min_tile_traits and not measured:
+            # Without measurements (for dense output, of the writer): the
+            # lab-2080ti rule above; min-p output is as small as JAGWAS's.
+            # With them the setup/work model decides: at K = 512 on the H100,
+            # min-p ran 9.6-10.3 s on four shards against 13.5 on two.
             usable = min(usable, 2) if mode in ('jagwas', 'min-p') else 1
         if usable > 1:
             result['variant_devices'] = devices[:usable]

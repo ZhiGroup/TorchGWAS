@@ -637,7 +637,8 @@ def run_linear_gwas(
     decode demand), shard_setup_seconds (instead of the measured per-GPU
     setup; 0 ignores setup), min_job_seconds, shared_decode, gpu_fanout,
     warmup_fraction, trial_fraction, repeats, min_gain, max_utilization,
-    min_free_bytes, tuner, probe_chunks and split.
+    min_free_bytes, tuner, probe_chunks, split and start_chunk (the tuner's
+    first size; default the largest candidate whose rings fit).
     """
     _api_entered=time.perf_counter()
     if isinstance(reduce, str) and reduce.replace("_", "-").lower() == "min-p":
@@ -681,7 +682,7 @@ def run_linear_gwas(
                                 'min_job_seconds', 'shared_decode', 'gpu_fanout',
                                 'warmup_fraction', 'trial_fraction', 'repeats', 'min_gain',
                                 'max_utilization', 'min_free_bytes', 'tuner', 'probe_chunks', 'split',
-                                'shard_setup_seconds'}
+                                'shard_setup_seconds', 'start_chunk'}
         if unknown:
             raise ValueError(f'Unknown autotune_options: {sorted(unknown)}')
         empirical = dict(options=options)
@@ -1460,6 +1461,16 @@ def run_linear_gwas(
                 genotype, choose_device((variant_devices or trait_devices or [str(resolved_device)])[0]))
             if len(sizes) > 1:
                 try:
+                    # Start at the largest size whose rings fit. With a
+                    # per-chunk cost a >= 0 the per-row time a/c + b cannot
+                    # fall as the chunk shrinks, and the only counter-cost,
+                    # pinning the larger slots, is paid once and bounded by
+                    # the ring check. A start at 1024 (the lab-2080ti choice)
+                    # was 4x slower per row than 4096 in the host-bound H100
+                    # regime (K = 512 min-p on four GPUs: a 27.9 s job
+                    # estimate against 7.1 s fixed at 4096), and a job
+                    # estimated under min_job_seconds never probed away.
+                    start = int(options['start_chunk']) if options.get('start_chunk') is not None else max(sizes)
                     tuner_kind = options.get('tuner', 'model')
                     if tuner_kind == 'model':
                         # Per-chunk samples, load-adjusted, re-planned on drift.
@@ -1471,7 +1482,7 @@ def run_linear_gwas(
                             probe_chunks=int(options.get('probe_chunks', 4)),
                             margin=float(options.get('min_gain', 0.03)),
                             depth=int(prefetch_chunks), concurrent=concurrent,
-                            min_job_seconds=float(options.get('min_job_seconds', 20.0)))
+                            min_job_seconds=float(options.get('min_job_seconds', 20.0)), initial=start)
                     elif tuner_kind == 'segments':
                         candidate = EmpiricalChunkTuner(
                             sizes, total_rows=int(genotype_shape[1])*passes,
@@ -1479,7 +1490,7 @@ def run_linear_gwas(
                             trial_fraction=float(options.get('trial_fraction', 0.25)),
                             repeats=int(options.get('repeats', 2)), min_gain=float(options.get('min_gain', 0.02)),
                             depth=int(prefetch_chunks), concurrent=concurrent,
-                            min_job_seconds=float(options.get('min_job_seconds', 20.0)))
+                            min_job_seconds=float(options.get('min_job_seconds', 20.0)), initial=start)
                     else:
                         raise ValueError("autotune_options['tuner'] must be 'model' or 'segments'")
                     for tuned_device in (variant_devices or trait_devices or [str(resolved_device)]):

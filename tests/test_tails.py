@@ -215,14 +215,21 @@ class ScanDeviceTailTestCase(unittest.TestCase):
         from torchgwas import tails
 
         key = object()
-        # H100-like: whole 0.085 ms a call and 0.83 ns a cell, blocks 0.46 ms and 0.39 ns.
-        tails._FORM_COSTS[key] = dict(whole=(8.5e-5, 8.3e-10), blocks=(4.6e-4, 3.9e-10))
+        # H100-like: host seconds at the (2048, 2) and (512, 8192) probes, GPU seconds a cell.
+        tails._FORM_COSTS[key] = dict(whole=((9.5e-5, 9.5e-5), 8.3e-10), blocks=((4.7e-4, 1.41e-3), 3.8e-10))
+        before = dict(tails._STAGES)
         try:
+            tails._STAGES.clear()  # one scanning device: nothing shares the GIL
             self.assertEqual(tails._choose_form(key, 4096), "whole")         # min-p winners
-            self.assertEqual(tails._choose_form(key, 8_388_608), "blocks")   # a 1024 x 8192 strip
+            self.assertEqual(tails._choose_form(key, 4_194_304), "blocks")   # a 512 x 8192 strip
             self.assertEqual(tails._choose_form(object(), 4096), "blocks")   # nothing measured
+            import torch
+            tails._STAGES.update({torch.device("cuda", i): (None, None) for i in range(4)})
+            self.assertEqual(tails._choose_form(key, 4_194_304), "whole")    # four shards on one GIL
         finally:
             del tails._FORM_COSTS[key]
+            tails._STAGES.clear()
+            tails._STAGES.update(before)
 
     @unittest.skipUnless(__import__("torch").cuda.is_available(), "CUDA required")
     def test_preparing_keeps_this_threads_subnormals(self):
