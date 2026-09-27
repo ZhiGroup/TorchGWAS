@@ -14,7 +14,10 @@ import pytest
 import torch
 
 N, M, K = 96, 6144, 12
-OPTIONS = dict(chunk_sizes=[16, 32, 64], warmup_fraction=.02, trial_fraction=.2, min_job_seconds=0)
+# start_chunk=16: these tests exercise probing and switching; the default
+# start is the largest size (api.py), which probes nothing above itself.
+OPTIONS = dict(chunk_sizes=[16, 32, 64], warmup_fraction=.02, trial_fraction=.2, min_job_seconds=0,
+               start_chunk=16)
 RING = dict(prefetch_chunks=2, reader_workers=4)
 
 

@@ -357,12 +357,17 @@ def _evaluate(stages, t, df, starts):
     return epilogue(df, x, y, reflect, h)
 
 
-def _form_costs(device, blocks, whole, starts):
-    """(host seconds per call, GPU seconds per cell) of each form, timed on `device`.
+_FORM_PROBES = ((2048, 2), (512, 8192))
 
-    Host time from a (2048, 2) call, whose GPU work is negligible; GPU time
-    from a (512, 8192) strip, where it dominates (the host side overlaps).
-    About 30 ms per device, once.
+
+def _form_costs(device, blocks, whole, starts):
+    """Each form's measured costs on `device`: host seconds at the two probe sizes, GPU seconds per cell.
+
+    Host time is the time to issue one call (no synchronization), at a
+    (2048, 2) and a (512, 8192) strip: the block form's grows with the strip
+    (H100: 0.47, 0.82 and 1.41 ms at 4K, 2M and 4M cells), the whole graph's
+    stays ~0.1 ms. GPU time is CUDA-event time on the larger strip. About
+    40 ms per device, once.
     """
     import time
 
@@ -370,18 +375,25 @@ def _form_costs(device, blocks, whole, starts):
 
     costs = {}
     for name, stages in (('blocks', blocks), ('whole', whole)):
-        seconds = []
-        for shape, calls in (((2048, 2), 5), ((512, 8192), 3)):
+        host, gpu = [], None
+        for shape in _FORM_PROBES:
             t = torch.full(shape, 3.0, dtype=torch.float64, device=device)
             df = torch.full(shape, 22_238.0, dtype=torch.float64, device=device)
             _evaluate(stages, t, df, starts)
             torch.cuda.synchronize(device)
-            started = time.perf_counter()
-            for _ in range(calls):
+            issued, elapsed = [], []
+            for _ in range(3):
+                start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                started = time.perf_counter()
+                start.record()
                 _evaluate(stages, t, df, starts)
-            torch.cuda.synchronize(device)
-            seconds.append((time.perf_counter() - started) / calls)
-        costs[name] = (seconds[0], seconds[1] / (512 * 8192))
+                stop.record()
+                issued.append(time.perf_counter() - started)
+                stop.synchronize()
+                elapsed.append(start.elapsed_time(stop) / 1e3)
+            host.append(min(issued))
+            gpu = min(elapsed) / (shape[0] * shape[1])
+        costs[name] = (tuple(host), gpu)
     return costs
 
 
@@ -391,15 +403,22 @@ def _choose_form(device, cells):
     A strip holds the GIL for its host time, and every CUDA device with a
     tail in this process (a shard thread each) needs the same GIL, while its
     GPU time is its own device's. The chosen form minimizes host seconds
-    times those devices plus GPU seconds per cell times `cells`: min-p's
-    winner column is host-bound (whole), a dense strip GPU-bound (blocks on
-    one GPU, the whole graph from about 3.4M cells down on four).
+    (interpolated in cells between the two probe sizes) times those devices,
+    plus GPU seconds per cell times `cells`: min-p's winner column is
+    host-bound (whole); a dense strip takes the blocks on one GPU and the
+    whole graph once several shards share the GIL.
     """
     costs = _FORM_COSTS.get(device)
     if costs is None:
         return 'blocks'
     sharing = max(1, sum(1 for key in _STAGES if getattr(key, 'type', None) == 'cuda'))
-    price = {name: host * sharing + per_cell * cells for name, (host, per_cell) in costs.items()}
+    small, large = (rows * columns for rows, columns in _FORM_PROBES)
+
+    def host_seconds(points):
+        low, high = points
+        return max(low, low + (high - low) * (cells - small) / (large - small))
+
+    price = {name: host_seconds(host) * sharing + per_cell * cells for name, (host, per_cell) in costs.items()}
     return min(price, key=price.get)
 
 
