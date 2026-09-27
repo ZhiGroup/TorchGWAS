@@ -10,6 +10,7 @@ from torchgwas.bed import PlinkBedGenotype
 from torchgwas.sumstats import open_binary_sumstats,open_binary_df,read_manifest
 from torchgwas.sumstats_tiled import write_trait_tiled_sumstats,TiledSumstatsArray
 from test_statistics import _write_bed
+from torchgwas.variant_source import store_variant_ids
 
 
 def test_cli_full_output_tiling_runs_and_preserves_trait_tail(tmp_path):
@@ -124,7 +125,7 @@ def test_full_api_tiling_matches_untiled_with_genotype_missingness_and_tails(tmp
         np.testing.assert_allclose(np.asarray(actual),expected,rtol=3e-5,atol=3e-6,equal_nan=True)
     np.testing.assert_array_equal(np.asarray(open_binary_df(tmp_path/'tiled'/'sumstats')),
                                  np.broadcast_to(open_binary_df(tmp_path/'whole'/'sumstats'),tile_t.shape))
-    assert (tmp_path/'tiled'/'sumstats'/'variant_ids.txt').read_bytes()==(tmp_path/'whole'/'sumstats'/'variant_ids.txt').read_bytes()
+    np.testing.assert_array_equal(store_variant_ids(tmp_path/'tiled'/'sumstats'),store_variant_ids(tmp_path/'whole'/'sumstats'))
 
 
 def test_blocked_input_qc_never_materializes_whole_filtered_panel(tmp_path):

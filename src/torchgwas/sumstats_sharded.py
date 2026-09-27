@@ -21,7 +21,7 @@ from .sumstats import BinarySumstatsWriter,FORMAT_VERSION,MANIFEST_NAME,read_man
 def write_variant_sharded_sumstats(directory, *, n_variants, trait_names, n_samples,
         df, chunk_size, devices, reader_workers, scan_factory, block_bytes=None,
         queue_depth=3, fsync=True, store_beta=True, before_publish=None, on_write_progress=None, on_writer_open=None,
-        trait_df=None):
+        trait_df=None, extra_manifest=None):
     """scan_factory(start,end,device,workers) must yield shard-local row indices.
 
     trait_df: per-trait df for a panel with missing phenotypes, the
@@ -113,7 +113,8 @@ def write_variant_sharded_sumstats(directory, *, n_variants, trait_names, n_samp
            dict(df=trait_df,p_value='not stored; two-sided Student t on t_stat with per-trait df')),
         excluded_convention='NaN marks an excluded variant in stored beta/t arrays',
         genotype_passes=1,reader_workers=reader_workers,
-        scope='Disjoint variant ranges, whole phenotype panel per device. No full-matrix gather or cross-device result queue.')
+        scope='Disjoint variant ranges, whole phenotype panel per device. No full-matrix gather or cross-device result queue.',
+        **(extra_manifest or {}))
     write_manifest(directory,manifest,fsync=fsync)
     return dict(directory=str(directory),cells=n_variants*len(trait_names),
         payload_bytes=sum(row['write']['payload_bytes'] for row in completed),

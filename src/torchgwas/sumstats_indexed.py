@@ -70,7 +70,12 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
                            *,kind,df,chi2_df=None,extra_manifest=None,
                            p_value_threshold=None,variant_metadata=None,fsync=True,store_beta=True,before_publish=None,
                            on_chunk_written=None,partition_for_range=None,variant_offset=0,live_progress=None,
-                           coalesce_rows=None):
+                           coalesce_rows=None,variant_source=None,embed_variant_ids=None):
+ """variant_source (variant_source.variant_source_record): rows keep their
+ variant_index and the manifest records the input they index; the IDs and
+ variant metadata are then the genotype's own and are not rewritten.
+ embed_variant_ids forces variant_ids.npy (and variant_metadata.npz) into the
+ store; the default embeds only when no source is recorded."""
  if on_chunk_written is not None and (not callable(on_chunk_written) or kind not in ('jagwas','significant')):
   raise ValueError('Indexed chunk completion requires a callback and streaming jagwas/significant output')
  if live_progress is not None:
@@ -193,15 +198,25 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
  if live_progress is not None:live_progress.begin_finalization()
  # Per-chunk mode (the JIT calculator's write model; observed runs have also
  # reported their files) keeps parts as written and only orders the list.
+ # Publication steps are timed: they follow the scan, so their fsyncs are
+ # exposed to other writers' data on the same filesystem (ext4 data=ordered).
+ publication={};step=time.perf_counter()
  parts,ordering=_order_parts(directory,parts,fsync,merge=ordered_rows and coalesce_rows is not None)
- with (directory/'variant_ids.npy').open('wb') as handle:
-  np.save(handle,np.asarray(marker_names,dtype=str),allow_pickle=False);handle.flush()
-  if fsync:os.fsync(handle.fileno())
- if variant_metadata is not None:
-  with (directory/'variant_metadata.npz').open('wb') as handle:
-   np.savez(handle,**{key:np.asarray(v,dtype=np.int64 if key=='position' else str) for key,v in variant_metadata.items()});handle.flush()
+ publication['order_parts_seconds']=time.perf_counter()-step
+ embed=variant_source is None if embed_variant_ids is None else bool(embed_variant_ids)
+ if embed:
+  step=time.perf_counter()
+  with (directory/'variant_ids.npy').open('wb') as handle:
+   np.save(handle,np.asarray(marker_names,dtype=str),allow_pickle=False);handle.flush()
    if fsync:os.fsync(handle.fileno())
- manifest={'format':'torchgwas-indexed-sumstats','version':1,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':int((chi2_df() if callable(chi2_df) else chi2_df) if kind=='jagwas' else df),'traits':list(trait_names),'parts':parts,'rows':total,'variant_ids':'variant_ids.npy','p_value':'derived from chi2 and df' if kind=='jagwas' else 'two-sided Student t on t_stat with df'}
+  if variant_metadata is not None:
+   with (directory/'variant_metadata.npz').open('wb') as handle:
+    np.savez(handle,**{key:np.asarray(v,dtype=np.int64 if key=='position' else str) for key,v in variant_metadata.items()});handle.flush()
+    if fsync:os.fsync(handle.fileno())
+  publication['variant_ids_seconds']=time.perf_counter()-step
+ manifest={'format':'torchgwas-indexed-sumstats','version':1,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':int((chi2_df() if callable(chi2_df) else chi2_df) if kind=='jagwas' else df),'traits':list(trait_names),'parts':parts,'rows':total,'p_value':'derived from chi2 and df' if kind=='jagwas' else 'two-sided Student t on t_stat with df'}
+ if embed:manifest['variant_ids']='variant_ids.npy'
+ if variant_source is not None:manifest['variant_source']=dict(variant_source)
  if extra_manifest is not None:
   manifest.update(extra_manifest() if callable(extra_manifest) else extra_manifest)
  if kind=='significant':
@@ -211,10 +226,12 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
  if before_publish is not None:before_publish()
  if live_progress is not None:live_progress.begin_publish()
  from .sumstats import write_manifest
+ step=time.perf_counter()
  write_manifest(directory,manifest,fsync=fsync)
+ publication['manifest_seconds']=time.perf_counter()-step
  if live_progress is not None:live_progress.published()
  return total,{'cells':total,'directory':str(directory),'indexed':True,'write_seconds':time.perf_counter()-started,
-               'ordering':ordering}
+               'ordering':ordering,'publication':publication,'variant_ids_embedded':embed}
 
 
 def _order_parts(directory,parts,fsync,*,merge=True):

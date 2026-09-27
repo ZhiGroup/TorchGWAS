@@ -611,7 +611,7 @@ def run_linear_gwas(
     sumstats_block_bytes: int | None = None,
     sumstats_queue_depth: int | None = None,
     sumstats_fsync: bool = True,
-    sumstats_variant_ids: bool = True,
+    sumstats_variant_ids: bool = False,
     sumstats_fields: str = "beta+t",
     autotune_profile: dict | str | Path | None = None,
     autotune_config: dict | str | Path | None = None,
@@ -735,6 +735,10 @@ def run_linear_gwas(
     resolved_device = choose_device(autotuner.devices[0] if autotuner else variant_devices[0] if variant_devices else device)
     genotype_meta = {}
     requested_sample_ids = _coerce_vector_or_path(sample_ids)
+    # Streaming stores record this input instead of rewriting its variant IDs
+    # (variant_source.py); these are the options needed to reopen it.
+    genotype_input = genotype if isinstance(genotype, (str, Path)) else None
+    genotype_load = dict(pvar=pvar, psam=psam, bim=bim, fam=fam, sample_file=sample_file)
     if isinstance(genotype, (str, Path)):
         genotype, geno_sample_ids, geno_marker_ids, genotype_meta = load_genotype(
             genotype,
@@ -1355,6 +1359,15 @@ def run_linear_gwas(
                 marker_names = marker_names[first:last]
             if variant_metadata is not None:
                 variant_metadata = {key: np.asarray(value)[first:last] for key, value in variant_metadata.items()}
+        from .variant_source import variant_source_record
+        variant_source = variant_source_record(
+            genotype=genotype_input,
+            genotype_format=genotype_meta.get('genotype_format') or genotype_format,
+            marker_ids=None if marker_ids is None else marker_names,
+            variant_offset=0 if variant_range is None else _resolve_variant_range(variant_range, int(genotype.shape[1]))[0],
+            n_variants=genotype_shape[1], load=genotype_load)
+        # A genotype passed as an object has no path to record: keep its IDs.
+        embed_variant_ids = bool(sumstats_variant_ids) or variant_source is None or variant_source['genotype'] is None
         if calibrator is not None:
             calibration_devices=variant_devices or trait_devices or [str(resolved_device)]
             calibrator.prepare(genotype,devices=calibration_devices,request=dict(
@@ -1580,7 +1593,7 @@ def run_linear_gwas(
                         if any(value!=first_qc for value in tile_qc.values()):
                             raise RuntimeError('Genotype exclusion counts differ across phenotype tiles')
                         genotype._last_scan_exclusion_counts=first_qc
-                if sumstats_variant_ids:
+                if embed_variant_ids:
                     ids_path=out/'sumstats'/'variant_ids.txt'
                     tile_metadata['variant_id_bytes']=_write_variant_ids(ids_path,marker_names)
                     if sumstats_fsync:
@@ -1595,7 +1608,8 @@ def run_linear_gwas(
                 store_beta=sumstats_fields!='t',before_publish=finalize_tiles,
                 on_write_progress=output_progress,
                 on_writer_open=None if productive is None else productive.register_writer,
-                trait_df=partition_trait_df)
+                trait_df=partition_trait_df,
+                extra_manifest=None if variant_source is None else dict(variant_source=variant_source))
             if full_variant_output:
                 from .sumstats_sharded import write_variant_sharded_sumstats
                 def scan_shard(first,last,shard_device,workers):
@@ -1899,7 +1913,8 @@ def run_linear_gwas(
                     partition_for_range=partition_for_range,variant_offset=source_start,
                     live_progress=indexed_live_progress,
                     # Large parts unless the JIT path observes each chunk's write.
-                    coalesce_rows=None if indexed_observed else COALESCE_ROWS)
+                    coalesce_rows=None if indexed_observed else COALESCE_ROWS,
+                    variant_source=variant_source, embed_variant_ids=embed_variant_ids)
             else:
                 n_rows, sumstats_summary = _write_linear_binary_streaming(
                     out / "sumstats",
@@ -1912,9 +1927,10 @@ def run_linear_gwas(
                     block_bytes=sumstats_block_bytes,
                     queue_depth=sumstats_queue_depth or DEFAULT_SUMSTATS_QUEUE_DEPTH,
                     fsync=sumstats_fsync,
-                    write_variant_ids=sumstats_variant_ids,
+                    write_variant_ids=embed_variant_ids,
                     store_beta=sumstats_fields != "t",
-                    extra_manifest={"genotype_format": genotype_meta.get("format")},
+                    extra_manifest={"genotype_format": genotype_meta.get("genotype_format"),
+                                    **({} if variant_source is None else dict(variant_source=variant_source))},
                     borrow_results=borrow_results,
                     store_variant_df=full_binary_df and bool(np.all(trait_df == residual_df)),
                     on_write_progress=output_progress,
@@ -2187,7 +2203,9 @@ def run_linear_gwas(
                     block_bytes=sumstats_block_bytes,
                     queue_depth=sumstats_queue_depth or DEFAULT_SUMSTATS_QUEUE_DEPTH,
                     fsync=sumstats_fsync,
-                    write_variant_ids=sumstats_variant_ids,
+                    # Rows follow the QC-kept markers, not a contiguous input
+                    # range, so the IDs are stored.
+                    write_variant_ids=True,
                     store_beta=sumstats_fields != "t",
                 )
                 run_metadata["sumstats_write"] = sumstats_summary
