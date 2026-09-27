@@ -13,7 +13,7 @@ def test_original_error_survives_peer_completion_order(tmp_path,monkeypatch,axis
     entered=threading.Barrier(2)
     class Writer:
         def __init__(self,directory,*args,**kwargs):self.root=int(Path(directory).name.split('_')[1])==0
-        def write_chunk(self,*args):raise OSError('original writer fault')
+        def write_chunk(self,*args,**kwargs):raise OSError('original writer fault')
         def close(self):pytest.fail('failed store cannot close successfully')
         def abort(self):
             if self.root:

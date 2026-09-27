@@ -208,8 +208,8 @@ def test_full_output_autotune_matches_fixed_chunks(tmp_path, native):
     tuned = run['autotune']
     assert tuned['method'] == 'empirical' and tuned['tuner_disabled_reason'] is None
     assert tuned['chunk']['state'] == 'committed' and tuned['chunk']['choice'] in (16, 32, 64)
-    b0, t0, _ = open_binary_sumstats(tmp_path/'fixed'/'sumstats')
-    b1, t1, _ = open_binary_sumstats(tmp_path/'tuned'/'sumstats')
+    b0, t0, _logp, _ = open_binary_sumstats(tmp_path/'fixed'/'sumstats')
+    b1, t1, _logp, _ = open_binary_sumstats(tmp_path/'tuned'/'sumstats')
     np.testing.assert_allclose(np.asarray(t1), np.asarray(t0), rtol=2e-5, atol=2e-5)
     np.testing.assert_allclose(np.asarray(b1), np.asarray(b0), rtol=2e-5, atol=2e-5)
 
@@ -288,11 +288,13 @@ def test_jagwas_two_gpu_variant_shards_match_single_fixed(tmp_path, native):
         pytest.skip('two CUDA devices required')
     path = _fixture(tmp_path)
     _run(tmp_path, 'fixed', path, device='cuda:0', chunk_size=32, reduce='jagwas')
+    # A larger probe share: upward probing with depth settling and the
+    # start-size revisit costs more rows than 20% of this small job.
     _, _, run = _run(tmp_path, 'tuned', path, reduce='jagwas', autotune=True,
                      autotune_options=dict(OPTIONS, devices=['cuda:0', 'cuda:1'], min_tile_traits=8, cpus_per_device=1,
-                                           shard_setup_seconds=0), **RING)
+                                           shard_setup_seconds=0, trial_fraction=0.9), **RING)
     assert run['autotune']['layout']['variant_devices'] == ['cuda:0', 'cuda:1']
-    assert run['autotune']['chunk']['state'] == 'committed'
+    assert run['autotune']['chunk']['state'] == 'committed', (run['autotune']['chunk']['reason'], run['autotune']['chunk'].get('method'))
     expected, actual = _pairs(tmp_path/'fixed', 'chi2'), _pairs(tmp_path/'tuned', 'chi2')
     assert actual.keys() == expected.keys() and len(expected) == 8192
     np.testing.assert_allclose([actual[k] for k in expected], list(expected.values()), rtol=2e-4, atol=2e-4)
@@ -530,7 +532,7 @@ def test_dense_shard_model_takes_the_slower_of_gpu_and_writer():
 def test_output_write_rates_uses_the_real_writer_and_cleans_up(tmp_path):
     from torchgwas.empirical_autotune import output_write_rates
     rates = output_write_rates(tmp_path, n_traits=64, writers=2, probe_bytes=1 << 20, chunk_rows=256)
-    assert rates['bytes_per_variant'] == 64 * 8 + 4 and rates['aggregate_writers'] == 2
+    assert rates['bytes_per_variant'] == 64 * 12 + 4 and rates['aggregate_writers'] == 2
     assert rates['writer_bytes_per_second'] > 0 and rates['aggregate_bytes_per_second'] > 0
     assert rates['probe_rows'] % 256 == 0
     assert list(tmp_path.iterdir()) == []  # scratch stores removed

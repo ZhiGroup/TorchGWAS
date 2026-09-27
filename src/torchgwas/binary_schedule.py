@@ -15,7 +15,8 @@ class BinaryWriterSchedule:
               append_seconds=0.,handoff_seconds=0.,open_seconds=0.,
               inflight_bytes=512<<20,writeback_bytes=64<<20,cpu_fraction=None,write_capacity=None,writeback_service=None,
               copy_seconds_per_call=0.):
-  stream_work=work.get('stream_work') or {a:work for a in (['beta','t'] if work['arrays']==2 else ['t'])}
+  # Matrix streams in the writer's close order: beta (optional), t, -log10 P.
+  stream_work=work.get('stream_work') or {a:work for a in (['beta','t','logp'] if work['arrays']==3 else ['t','logp'])}
   if writeback_service is None and writeback_bytes and any(w['binary_payload_bytes']//w['arrays']>=writeback_bytes for w in stream_work.values()):
    raise ValueError('Periodic sync_file_range needs an explicit storage-writeback schedule')
   self.cpu_resources={'cpu':cpu_fraction} if cpu_fraction else None

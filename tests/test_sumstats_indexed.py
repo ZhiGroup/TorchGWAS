@@ -20,6 +20,7 @@ def test_selected_indices_labels_and_t_only(tmp_path):
     np.testing.assert_array_equal(part["variant_index"], [2, 3])
     np.testing.assert_array_equal(part["trait_index"], [0, 1])
     np.testing.assert_array_equal(part["t_stat"], [-3., 4.])
+    assert "neg_log10_p" in part
     assert "beta" not in part
     assert np.load(tmp_path / "variant_ids.npy").tolist() == labels
     assert not list(tmp_path.glob("*.tsv*"))
@@ -95,6 +96,7 @@ def test_threshold_across_chunks(tmp_path):
     assert rows == 4
     np.testing.assert_array_equal(part["variant_index"], [0, 1, 2, 2])
     np.testing.assert_array_equal(part["t_stat"], [4., 5., 6., 8.])
+    assert "neg_log10_p" in part
 
 
 def test_empty_selection_and_joint_statistics(tmp_path):
@@ -263,8 +265,8 @@ def test_default_parts_follow_bytes_not_rows(tmp_path):
     total, summary = write_indexed_sumstats(tmp_path, names, [f't{i}' for i in range(10)], 24, iter(chunks),
                                             kind='significant', df=20, coalesce_bytes=16_000)
     manifest, parts = open_indexed_sumstats(tmp_path)
-    # 28 bytes per pair (two int64 indices, beta, t and df as float32): 2,800
-    # per chunk, so a part closes after 6 chunks (16,800 bytes): 7 parts.
-    assert total == 4000 and len(manifest['parts']) == 7
+    # 32 bytes per pair (two int64 indices; beta, t, df and -log10 P as
+    # float32): 3,200 per chunk, so a part closes after 5 chunks: 8 parts.
+    assert total == 4000 and len(manifest['parts']) == 8
     rows = np.concatenate([part['variant_index'] for part in parts])
     assert np.all(np.diff(rows) >= 0)

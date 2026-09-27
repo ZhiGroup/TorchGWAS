@@ -102,7 +102,7 @@ def test_dense_and_significant_output_follow_actual_rows(tmp_path,count,block_by
     assert sum(b['h2d_bytes'] for b in work['blocks'])==32*10
     dense=dense_runtime(choice)
     assert [r['blocks'] for r in dense['tiles']]==[4,4,4]
-    assert dense['binary_payload_bytes']==8*10*5+4*10*3
+    assert dense['binary_payload_bytes']==12*10*5+4*10*3
     # First and second equal-width tiles have different pinned-cache states;
     # the narrower third tile also has distinct work. All three are expanded.
     assert trait_tiled_graph_chunks(choice)==12
@@ -152,7 +152,7 @@ def test_auto_writer_block_uses_first_actual_chunk_and_df_matches_layout():
     sizes=[128,512,256,1];k=4097
     work=binary_output_work(sum(sizes),k,512,borrow_chunks=False,store_variant_df=True,chunk_rows=sizes)
     assert work['block_bytes']==128*k*4
-    assert work['binary_payload_bytes']==(8*k+4)*sum(sizes)
+    assert work['binary_payload_bytes']==(12*k+4)*sum(sizes)
     assert work['staging_copy_bytes']==work['binary_payload_bytes']
     assert [r['markers'] for r in work['stream_work']['df']['chunks']]==sizes
     assert [r['markers'] for r in work['chunks']]==sizes

@@ -102,10 +102,12 @@ def write_trait_tiled_sumstats(directory, *, n_variants, trait_names, n_samples,
                 for chunk in iterator:
                     if stop.is_set():
                         raise RuntimeError('trait tile cancelled after peer failure')
-                    if len(chunk)!=6:
+                    # (start, end, beta, t, p, -log10 P, df); without -log10
+                    # P (six long) the writer computes it.
+                    if len(chunk) not in (6,7):
                         raise ValueError('Full trait tiles require scan df metadata')
-                    start,end,beta,t_stat,_,variant_df=chunk
-                    writer.write_chunk(start,end,beta,t_stat,variant_df if trait_df is None else None)
+                    start,end,beta,t_stat=chunk[:4];variant_df=chunk[-1];logp=chunk[5] if len(chunk)==7 else None
+                    writer.write_chunk(start,end,beta,t_stat,logp,variant_df=variant_df if trait_df is None else None)
                 summary=writer.close()
                 completed.append(dict(trait_range=[offset,offset+width],directory=relative,
                     device=device,reader_workers=workers,seconds=time.perf_counter()-started,write=summary))
@@ -136,7 +138,7 @@ def write_trait_tiled_sumstats(directory, *, n_variants, trait_names, n_samples,
         before_publish()
     manifest=dict(format='torchgwas-binary-sumstats',version=2,layout='trait_tiles',
         shape=[int(n_variants),len(trait_names)],dtype='float32',byte_order='little',
-        arrays=['beta','t_stat'] if store_beta else ['t_stat'],traits=list(trait_names),
+        arrays=['beta','t_stat','neg_log10_p'] if store_beta else ['t_stat','neg_log10_p'],traits=list(trait_names),
         n_samples=int(n_samples),tiles=completed,
         **(dict(df=dict(layout='per_tile'),
                 p_value='not stored; two-sided Student t using the matching tile df sidecar')
@@ -214,8 +216,8 @@ class TiledSumstatsArray:
                 values=open_binary_df(path)
                 local=np.broadcast_to(values,(self.shape[0],end-start))[rows]
             else:
-                beta,t_stat,_=open_binary_sumstats(path)
-                local=(beta if self.field=='beta' else t_stat)[rows]
+                beta,t_stat,logp,_=open_binary_sumstats(path)
+                local={'beta':beta,'t_stat':t_stat,'neg_log10_p':logp}[self.field][rows]
             result[:,positions]=local[:,columns[positions]-start]
         if scalars[0]:
             result=result[0]
@@ -256,4 +258,6 @@ def open_trait_tiled_sumstats(directory,manifest):
     if offset!=shape[1]:
         raise ValueError('Incomplete trait coverage')
     return (TiledSumstatsArray(directory,manifest,'beta') if 'beta' in manifest['arrays'] else None,
-            TiledSumstatsArray(directory,manifest,'t_stat'),manifest)
+            TiledSumstatsArray(directory,manifest,'t_stat'),
+            TiledSumstatsArray(directory,manifest,'neg_log10_p') if 'neg_log10_p' in manifest['arrays'] else None,
+            manifest)

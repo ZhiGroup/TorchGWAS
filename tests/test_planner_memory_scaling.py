@@ -32,8 +32,8 @@ def test_direct_memory_matches_enumerated_writer_for_empty_tail_and_borrowed_chu
 def test_auto_memory_depends_only_on_first_chunk(m,k,b,expected):
     with patch('torchgwas.binary_output_work.binary_output_work',side_effect=AssertionError('expanded schedule')):
         result=binary_output_memory(m,k,b,queue_depth=3,store_variant_df=True)
-    assert result['block_bytes_by_stream']==dict(beta=expected,t=expected,df=min(expected,1<<20))
-    assert result['allocated_staging_bytes']==4*(2*expected+min(expected,1<<20))
+    assert result['block_bytes_by_stream']==dict(beta=expected,t=expected,logp=expected,df=min(expected,1<<20))
+    assert result['allocated_staging_bytes']==4*(3*expected+min(expected,1<<20))
 
 
 @pytest.mark.parametrize('beta,df,borrow',itertools.product([False,True],repeat=3))
@@ -51,7 +51,7 @@ def test_memory_agrees_with_production_writer_allocations(tmp_path,monkeypatch,b
     for start in range(0,m,b):
         stop=min(start+b,m)
         writer.write_chunk(start,stop,np.ones((stop-start,k)),np.ones((stop-start,k)),
-            np.full((stop-start,1),22) if df else None)
+            variant_df=np.full((stop-start,1),22) if df else None)
     writer.close()
     memory=binary_output_memory(m,k,b,block,depth,beta,df)
     assert sum(allocations)==memory['allocated_staging_bytes']

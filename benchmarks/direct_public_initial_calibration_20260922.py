@@ -121,7 +121,7 @@ def worker(args):
 def arrays(directory,mode):
     if mode=='jagwas':return {'chi2':read_jagwas(directory,4097)[1]}
     if mode=='significant_tiles':return read_significant(directory,4097,512)[1]
-    beta,tstat,manifest=open_binary_sumstats(directory/'sumstats')
+    beta,tstat,_logp,manifest=open_binary_sumstats(directory/'sumstats')
     assert manifest['shape']==[4097,512]
     # Use bounded row slicing, including for lazy tiled readers.
     return {name:np.concatenate([np.asarray(value[i:i+128,:]) for i in range(0,4097,128)])

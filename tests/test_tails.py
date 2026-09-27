@@ -198,11 +198,22 @@ class ScanDeviceTailTestCase(unittest.TestCase):
         compiled, starts = tails._STAGES[device]
         if compiled is None:
             self.skipTest("no compiler for this device")
+        # Normalised as neg_log10_p_device hands them to the ahead-of-time build.
         t = torch.as_tensor(np.random.default_rng(5).normal(scale=8.0, size=(64, 33)), device=device)
-        df = torch.full((64, 1), 22238.0, device=device)
+        df = torch.full((64, 33), 22238.0, device=device, dtype=torch.float64)
         fast = tails._evaluate(compiled, t, df, starts)
         slow = tails._evaluate(tails._eager_stages(), t, df, starts)
         np.testing.assert_allclose(fast.cpu().numpy(), slow.cpu().numpy(), rtol=1e-10, atol=1e-10)
+
+    @unittest.skipUnless(__import__("torch").cuda.is_available(), "CUDA required")
+    def test_preparing_keeps_this_threads_subnormals(self):
+        import torch
+        from torchgwas import tails
+
+        tails.prepare_device_tail(torch.device("cuda", torch.cuda.current_device()))
+        self.assertTrue(tails._keeps_subnormals())
+        value = np.array([1e-40], dtype=np.float32)
+        self.assertGreater(float((value * np.float32(1.0))[0]), 0.0)
 
 
 if __name__ == "__main__":

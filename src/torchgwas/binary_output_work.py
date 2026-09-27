@@ -71,7 +71,7 @@ def compact_binary_output_work(markers, traits=1, chunk_markers=2048,
                                queue_depth, store_beta, store_variant_df)
  size = memory['block_bytes']
  streams = {}
- for name in (['beta','t'] if store_beta else ['t']):
+ for name in (['beta','t','logp'] if store_beta else ['t','logp']):
   streams[name] = _compact_stream(markers, traits, chunk_markers, size,
                                  borrow_chunks=borrow_chunks,
                                  writeback_bytes=writeback_bytes,
@@ -98,7 +98,7 @@ def compact_binary_output_work(markers, traits=1, chunk_markers=2048,
  return result
 
 def binary_output_memory(markers,traits=1,chunk_markers=2048,block_bytes=None,
-                         queue_depth=3,store_beta=True,store_variant_df=False):
+                         queue_depth=3,store_beta=True,store_variant_df=False,*,stream_names=None):
  """Exact staging allocation without constructing chunks or write events.
 
  The first payload selects beta/t block size; df uses its own 1 MiB cap.
@@ -113,7 +113,10 @@ def binary_output_memory(markers,traits=1,chunk_markers=2048,block_bytes=None,
  # chunk selects a minimum 1 MiB and maximum 16 MiB auto block per array.
  first=min(markers,chunk_markers)*traits*4
  size=block_bytes if block_bytes is not None else (min(16<<20,max(1<<20,first)) if markers else 16<<20)
- streams={name:size for name in (['beta','t'] if store_beta else ['t'])}
+ # Matrix streams: beta (optional), t and -log10 P. stream_names overrides
+ # them for a single sidecar stream (the per-variant df).
+ names=stream_names if stream_names is not None else (['beta','t','logp'] if store_beta else ['t','logp'])
+ streams={name:size for name in names}
  if store_variant_df:streams['df']=min(size,1<<20)
  allocated=(queue_depth+1)*sum(streams.values())
  return dict(block_bytes=size,queue_depth=queue_depth,arrays=len(streams),
@@ -123,14 +126,15 @@ def binary_output_memory(markers,traits=1,chunk_markers=2048,block_bytes=None,
 
 def binary_output_work(markers,traits=1,chunk_markers=2048,block_bytes=None,
                        queue_depth=3,borrow_chunks=True,store_beta=True,fsync=True,
-                       writeback_bytes=64<<20,sync_file_range=True,store_variant_df=False,*,chunk_rows=None):
+                       writeback_bytes=64<<20,sync_file_range=True,store_variant_df=False,*,chunk_rows=None,
+                       _stream_names=None):
  if chunk_rows is not None:
   if (type(chunk_markers) is not int or chunk_markers<1 or not isinstance(chunk_rows,(list,tuple))
       or any(type(v) is not int or not 0<v<=chunk_markers for v in chunk_rows)
       or sum(chunk_rows)!=markers):
    raise ValueError('Explicit writer chunks must cover all markers within capacity')
  first=chunk_rows[0] if chunk_rows else chunk_markers
- memory=binary_output_memory(markers,traits,first,block_bytes,queue_depth,store_beta)
+ memory=binary_output_memory(markers,traits,first,block_bytes,queue_depth,store_beta,stream_names=_stream_names)
  size=memory['block_bytes']
  filled=0;events=[];copies=0;copy_calls=0;chunks=[]
  counts=(chunk_rows if chunk_rows is not None else
@@ -163,8 +167,8 @@ def binary_output_work(markers,traits=1,chunk_markers=2048,block_bytes=None,
  if store_variant_df:
   primary=dict(result)
   df=binary_output_work(markers,1,chunk_markers,min(size,1<<20),queue_depth,
-      borrow_chunks,False,fsync,writeback_bytes,sync_file_range,chunk_rows=chunk_rows)
-  result['stream_work']={name:primary for name in (['beta','t'] if store_beta else ['t'])}
+      borrow_chunks,False,fsync,writeback_bytes,sync_file_range,chunk_rows=chunk_rows,_stream_names=['df'])
+  result['stream_work']={name:primary for name in (['beta','t','logp'] if store_beta else ['t','logp'])}
   result['stream_work']['df']=df
   result['arrays']+=1
   for name in ['allocated_staging_bytes','zero_initialization_bytes','binary_payload_bytes',
@@ -172,5 +176,5 @@ def binary_output_work(markers,traits=1,chunk_markers=2048,block_bytes=None,
                'payload_queued_only_at_close_bytes','fsync_calls']:
    result[name]+=df[name]
   result['df_payload_bytes']=df['binary_payload_bytes']
-  result['scope']='Exact per-stream beta/t/variant-df work, including the independent 1 MiB df block cap. Manifest serialization, validation, atomic replacement/directory fsync and allocator/storage latency require separate service.'
+  result['scope']='Exact per-stream beta/t/-log10 P/variant-df work, including the independent 1 MiB df block cap. Manifest serialization, validation, atomic replacement/directory fsync and allocator/storage latency require separate service.'
  return result

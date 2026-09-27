@@ -77,7 +77,7 @@ def test_api_selected_pairs_match_full_pgen_statistics_with_missing_calls(tmp_pa
     options=dict(genotype_format='pgen',pgen_mode='hardcall',device=device,compute_dtype='float32',chunk_size=4,
         reader_workers=2,prefetch_chunks=2,variant_range=(1,18),sumstats_queue_depth=1)
     run_linear_gwas(path,y,cov,output_dir=tmp_path/'full',**options)
-    beta,t,_=open_binary_sumstats(tmp_path/'full/sumstats');df=np.broadcast_to(open_binary_df(tmp_path/'full/sumstats'),t.shape)
+    beta,t,_logp,_=open_binary_sumstats(tmp_path/'full/sumstats');df=np.broadcast_to(open_binary_df(tmp_path/'full/sumstats'),t.shape)
     if missing_pheno:
         # Dense legacy stores only trait df for this case. Verify the selected
         # producer's combined df independently from observed counts instead.
@@ -158,7 +158,7 @@ def test_real_native_multigpu_significance_tiles_isolate_qc_and_share_setup(tmp_
     opts = dict(device='cuda:1', compute_dtype='float32', chunk_size=7,
                 reader_workers=3, prefetch_chunks=2, variant_range=(3, 62), sumstats_queue_depth=1)
     full = run_linear_gwas(source, y, cov, output_dir=tmp_path/'full', **opts)
-    beta, t, _ = open_binary_sumstats(tmp_path/'full/sumstats')
+    beta, t, _logp, _ = open_binary_sumstats(tmp_path/'full/sumstats')
     df = np.broadcast_to(open_binary_df(tmp_path/'full/sumstats'), t.shape)
     keep = np.nonzero(np.isfinite(t) & (2 * special.stdtr(df, -np.abs(t)) <= threshold))
     expected = [keep[0], keep[1], beta[keep], t[keep], df[keep]]

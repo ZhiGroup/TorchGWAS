@@ -30,18 +30,18 @@ def test_staged_live_writer_is_priced_from_existing_independent_service(tmp_path
         on_write_progress=lambda event: None)
     try:
         values = np.ones((1, 2), np.float32)
-        writer.write_chunk(0, 1, values, values, np.ones((1, 1), np.float32))
+        writer.write_chunk(0, 1, values, values, variant_df=np.ones((1, 1), np.float32))
         observation = writer.queue_snapshot()
         priced = price_dense_writer_queue_observation(observation, profile())
         assert observation['atomic_writer_streams']
-        assert set(priced['streams']) == {'beta', 't_stat', 'df'}
-        assert priced['pending_write_bytes_interval'] == [20, 20]
-        assert priced['pagecache_cpu_seconds_at_fixed_price'] == pytest.approx([2., 2.])
-        assert priced['storage_seconds_at_fixed_price'] == pytest.approx([4., 4.])
+        assert set(priced['streams']) == {'beta', 't_stat', 'neg_log10_p', 'df'}
+        assert priced['pending_write_bytes_interval'] == [28, 28]
+        assert priced['pagecache_cpu_seconds_at_fixed_price'] == pytest.approx([2.8, 2.8])
+        assert priced['storage_seconds_at_fixed_price'] == pytest.approx([5.6, 5.6])
         assert priced['streams']['df']['pending_write_bytes_interval'] == [4, 4]
         assert priced['streams']['df']['stream_serial_pagecache_seconds_at_fixed_fraction'] == pytest.approx([.8, .8])
         assert not priced['prediction_complete'] and not priced['selection_validated']
-        writer.write_chunk(1, 2, values, values, np.ones((1, 1), np.float32))
+        writer.write_chunk(1, 2, values, values, variant_df=np.ones((1, 1), np.float32))
         writer.close()
     finally:
         writer.abort()
@@ -86,15 +86,16 @@ def test_two_writers_have_one_common_anchor_and_distinct_device_prices(tmp_path)
         anchor = time.perf_counter()
         second = pass_once()
         bracket = bracket_dense_writer_queues(first, second, anchor)
-        assert bracket['logical_pending_bytes_interval'] == [16, 16]
-        assert bracket['os_write_bytes_upper'] == 16
+        # beta, t and -log10 P: one float32 row of two traits each.
+        assert bracket['logical_pending_bytes_interval'] == [24, 24]
+        assert bracket['os_write_bytes_upper'] == 24
         other = deepcopy(profile())
         other['writeback_service']['pagecache_seconds_per_byte'] = .2
         other['writeback_service']['storage_seconds_per_byte'] = .4
         priced = price_bracketed_dense_writer_queues(
             bracket, {'cuda:0':profile(), 'cuda:1':other})
-        assert priced['pagecache_cpu_seconds_upper_at_fixed_price'] == pytest.approx(2.4)
-        assert priced['storage_seconds_upper_at_fixed_price'] == pytest.approx(4.8)
+        assert priced['pagecache_cpu_seconds_upper_at_fixed_price'] == pytest.approx(3.6)
+        assert priced['storage_seconds_upper_at_fixed_price'] == pytest.approx(7.2)
         stale = deepcopy(second)
         stale[keys[0]]['observation']['streams']['beta']['accepted_bytes'] = 0
         with pytest.raises(ValueError):

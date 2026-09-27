@@ -7,6 +7,7 @@ from scipy import stats
 import torch
 from torchgwas.linear import linear_scan, linear_scan_streaming_chunks
 from torchgwas.api import run_linear_gwas
+from torchgwas.tails import upper_tail_log10_from_t
 
 
 class Source:
@@ -44,11 +45,18 @@ class NativeScanTests(unittest.TestCase):
         for chunk in (7, 19):
             source = Source(g)
             iterator, _ = linear_scan_streaming_chunks(source, y, c,
-                chunk_size=chunk, device="cuda:0", prefetch_chunks=2)
+                chunk_size=chunk, device="cuda:0", prefetch_chunks=2,
+                compute_log10_p=True)
             rows = list(iterator)  # Retention must survive result-ring reuse.
             for field in (2, 3, 4):
                 actual = np.concatenate([row[field] for row in rows])
                 np.testing.assert_allclose(actual, reference[field-2], rtol=2e-4, atol=2e-5)
+            actual_logp = np.concatenate([row[5] for row in rows])
+            np.testing.assert_allclose(
+                actual_logp,
+                upper_tail_log10_from_t(
+                    np.concatenate([row[3] for row in rows]), 129 - 2 - 2),
+                rtol=1e-10, atol=1e-10)
             self.assertEqual(source.passes, 1)
 
     def test_api_single_pass_and_fused_missing_qc(self):

@@ -43,7 +43,7 @@ def main():
         with np.load(out / group / 'jagwas' / 'sumstats' / 'variant_metadata.npz') as meta:
             position = np.asarray(meta['position'], np.int64)
         kept = sorted(set(range(manifest['jagwas_rank']['traits'])) - {d['index'] for d in manifest['jagwas_rank']['dropped']})
-        _, t, _ = open_binary_sumstats(out / group / 'full' / 'sumstats')
+        _, t, _logp, _ = open_binary_sumstats(out / group / 'full' / 'sumstats')
         variant_df = np.asarray(open_binary_df(out / group / 'full' / 'sumstats'), np.float64).reshape(-1)
         processed, _ = residualize_and_standardize(np.load(PHENOS / f'{group}.npy').astype(np.float32),
                                                    np.load(COVARIATES).astype(np.float32))

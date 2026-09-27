@@ -247,10 +247,17 @@ def upper_tail_log10_from_t_torch(t, df):
 # compile, the same stages run eagerly.
 
 DEVICE_TAIL_BLOCK = 4
-# Row strips bound the FP64 transient (~90 bytes per cell) to ~190 MB.
-DEVICE_TAIL_MAX_CELLS = 1 << 21
+# Constants, so the exported graphs call neither scipy nor numpy.
+_LGAMMA_HALF = float(special.gammaln(0.5))
+_LN10 = float(np.log(10.0))
+# Row strips bound the FP64 transient to ~380 MB: 747 MB was measured for one
+# unstripped 8.4M-cell chunk (89 bytes per cell; the planner charges 96). Each
+# strip is 12 compiled calls, so a 1024 x 8192 chunk is two strips.
+DEVICE_TAIL_MAX_CELLS = 1 << 22
+DEVICE_TAIL_TRANSIENT_BYTES_PER_CELL = 96
 
 _STAGES = {}
+_KINDS = {}  # device -> 'aoti' (ahead-of-time build), 'jit' (torch.compile) or 'eager'
 _STAGE_LOCK = None
 
 
@@ -298,12 +305,12 @@ def _tail_epilogue(df, x, y, reflect, h):
     import torch
 
     a = df.double() * 0.5
-    log_beta = torch.lgamma(a) + float(special.gammaln(0.5)) - torch.lgamma(a + 0.5)
+    log_beta = torch.lgamma(a) + _LGAMMA_HALF - torch.lgamma(a + 0.5)
     log_direct = (a * torch.log(x.clamp_min(_TINY)) + 0.5 * torch.log(y.clamp_min(_TINY))
                   - torch.log(a) - log_beta + torch.log(h))
     upper = 2.0 * torch.exp(-log_beta + 0.5 * torch.log(y.clamp_min(_TINY)) + a * torch.log1p(-y)) * h
     log_reflect = torch.log((1.0 - upper).clamp(_TINY, 1.0))
-    return -torch.where(reflect, log_reflect, log_direct) / float(np.log(10.0))
+    return -torch.where(reflect, log_reflect, log_direct) / _LN10
 
 
 def _eager_stages():
@@ -346,20 +353,26 @@ def prepare_device_tail(device):
         if device in _STAGES:
             return _STAGES[device][0] is not None
         compiled = None
-        if device.type == 'cuda' and os.environ.get('TORCHGWAS_COMPILE_TAILS', '1') != '0':
+        kind = 'eager'
+        # TORCHGWAS_COMPILE_TAILS: 0 eager only, jit skips the ahead-of-time build.
+        mode = os.environ.get('TORCHGWAS_COMPILE_TAILS', '1')
+        if device.type == 'cuda' and mode != '0':
             try:
-                compiled = tuple(torch.compile(stage, dynamic=True) for stage in _eager_stages())
+                compiled = _load_aoti(device) if mode != 'jit' else None
+                kind = 'aoti' if compiled is not None else 'jit'
+                compiled = compiled or tuple(torch.compile(stage, dynamic=True) for stage in _eager_stages())
                 starts = _starts(device)
                 with torch.cuda.device(device):
-                    probe = torch.linspace(0.0, 40.0, 64, device=device, dtype=torch.float32)[:, None]
-                    probe_df = torch.full((64, 1), 30.0, device=device)
+                    probe = torch.linspace(0.0, 40.0, 64 * 3, device=device, dtype=torch.float64).reshape(64, 3)
+                    probe_df = torch.full((64, 3), 30.0, device=device, dtype=torch.float64)
                     fast = _evaluate(compiled, probe, probe_df, starts)
                     slow = _evaluate(_eager_stages(), probe, probe_df, starts)
                     if not bool(torch.allclose(fast, slow, rtol=1e-10, atol=1e-10)):
-                        compiled = None
+                        compiled, kind = None, 'eager'
             except Exception:  # noqa: BLE001 - no compiler, no Triton: the eager stages are exact too
-                compiled = None
+                compiled, kind = None, 'eager'
         _STAGES[device] = (compiled, _starts(device))
+        _KINDS[device] = kind
         return compiled is not None
 
 
@@ -386,8 +399,175 @@ def neg_log10_p_device(t, df, *, out=None, max_cells=DEVICE_TAIL_MAX_CELLS):
         df = df.reshape(1, -1) if df.dim() == 1 and df.shape[0] == traits and traits != rows else df.reshape(-1, 1)
     result = torch.empty((rows, traits), dtype=torch.float32, device=t.device) if out is None else out
     step = max(1, int(max_cells) // max(1, traits))
-    for first in range(0, rows, step):
-        last = min(rows, first + step)
-        strip_df = df[first:last] if df.shape[0] == rows else df
-        result[first:last] = _evaluate(stages, t[first:last], strip_df, starts)
+
+    aot = _KINDS.get(device) == 'aoti'
+
+    def run():
+        for first in range(0, rows, step):
+            last = min(rows, first + step)
+            strip_t = t[first:last]
+            strip_df = df[first:last] if df.shape[0] == rows else df
+            if aot:
+                # The build takes FP64 (rows, traits) of at least 2 x 2.
+                if min(strip_t.shape) < 2:
+                    result[first:last] = _evaluate(_eager_stages(), strip_t, strip_df, starts)
+                    continue
+                strip_t = strip_t.double().contiguous()
+                strip_df = strip_df.double().expand(strip_t.shape).contiguous()
+            result[first:last] = _evaluate(stages, strip_t, strip_df, starts)
+
+    if compiled is None:
+        run()
+    elif aot:
+        # Not dynamo functions, so no lock; but they launch on the current
+        # device's current stream, which must be t's device.
+        with torch.cuda.device(t.device):
+            run()
+    else:
+        # PyTorch's FX-tracing flag is process-wide: a compiled call made
+        # while another thread compiles (a second GPU's prepare) is refused.
+        # Calls and compiles therefore share the lock; a call only queues
+        # kernels, so shards hold it briefly.
+        with _STAGE_LOCK:
+            run()
     return result
+
+
+def prepare_device_tail_async(devices):
+    """Prepare the device tail for each CUDA device on a daemon thread.
+
+    The first GPU costs ~5-7 s (compiler import, trace, cache load), each
+    further one ~2 s. Started at API entry it overlaps input loading and
+    preparation; a scan that needs a device first waits on the same lock.
+    """
+    import threading
+
+    import torch
+
+    targets = [torch.device(d) for d in devices if torch.device(d).type == 'cuda']
+    if not targets or not torch.cuda.is_available():
+        return None
+
+    def run():
+        for device in targets:
+            try:
+                prepare_device_tail(device)
+            except Exception:  # noqa: BLE001 - the scan prepares (or falls back) itself
+                pass
+
+    worker = threading.Thread(target=run, name='torchgwas-tail-compile', daemon=True)
+    worker.start()
+    return worker
+
+
+# -- ahead-of-time build (AOTInductor) ------------------------------------------
+#
+# torch.compile costs every process ~2 s to import the compiler, ~5 s to trace
+# the first GPU's stages and ~1 s for each further GPU; a 10 s dense scan paid
+# that before its first chunk. The same stages exported with AOTInductor load
+# in milliseconds, one library serves every GPU of an architecture, and a
+# four-iteration block runs 8.4M cells in 0.26 ms on the H100 (2.5e-14 from
+# the eager stages). They are built once per architecture, torch and stage
+# source, like the native decoders (build_device_tail.sh), into
+# .build-libs/device_tail_<key>/; inputs are normalised to FP64 (rows, traits).
+
+def _stage_source_key(capability):
+    import hashlib
+    import inspect
+
+    import torch
+
+    source = ''.join(inspect.getsource(stage) for stage in
+                     (_guard, _tail_prologue, _tail_block, _tail_epilogue))
+    text = '|'.join((torch.__version__, str(torch.version.cuda), f'sm{capability[0]}{capability[1]}',
+                     str(DEVICE_TAIL_BLOCK), source))
+    return hashlib.sha256(text.encode()).hexdigest()[:24]
+
+
+def device_tail_directory(capability):
+    from pathlib import Path
+
+    return Path(__file__).resolve().parents[2] / '.build-libs' / f'device_tail_{_stage_source_key(capability)}'
+
+
+def build_device_tail(device='cuda'):
+    """Export the three stages with AOTInductor for `device`'s architecture."""
+    import json
+
+    import torch
+    from torch.export import Dim
+
+    device = torch.device(device)
+    capability = torch.cuda.get_device_capability(device)
+    directory = device_tail_directory(capability)
+    directory.mkdir(parents=True, exist_ok=True)
+    rows, traits = Dim('rows', min=2, max=1 << 24), Dim('traits', min=2, max=1 << 24)
+    matrix = {0: rows, 1: traits}
+
+    class Prologue(torch.nn.Module):
+        def forward(self, t, df):
+            return _tail_prologue(t, df)
+
+    class Block(torch.nn.Module):
+        def forward(self, first, second, argument, c, d, h, start):
+            return _tail_block(first, second, argument, c, d, h, start)
+
+    class Epilogue(torch.nn.Module):
+        def forward(self, df, x, y, reflect, h):
+            return _tail_epilogue(df, x, y, reflect, h)
+
+    t = torch.linspace(0.0, 40.0, 64 * 33, dtype=torch.float64, device=device).reshape(64, 33)
+    df = torch.full_like(t, 30.0)
+    first, second, argument, c, d, h, x, y, reflect = _tail_prologue(t, df)
+    start = torch.tensor(1.0, dtype=torch.float64, device=device)
+    exported = {
+        'prologue': (Prologue(), (t, df), (matrix, matrix)),
+        'block': (Block(), (first, second, argument, c, d, h, start), (matrix,) * 6 + (None,)),
+        'epilogue': (Epilogue(), (df, x, y, reflect, h), (matrix,) * 5),
+    }
+    for name, (module, args, shapes) in exported.items():
+        torch._export.aot_compile(module, args, dynamic_shapes=shapes,
+                                  options={'aot_inductor.output_path': str(directory / f'{name}.so')})
+    manifest = dict(torch=torch.__version__, cuda=torch.version.cuda, capability=list(capability),
+                    block_iterations=DEVICE_TAIL_BLOCK, key=_stage_source_key(capability),
+                    files=[f'{name}.so' for name in exported])
+    (directory / 'manifest.json').write_text(json.dumps(manifest, indent=1) + '\n')
+    return directory
+
+
+def _keeps_subnormals():
+    value = np.array([1e-40], dtype=np.float32)
+    return bool((value * np.float32(1.0))[0] != 0)
+
+
+def _load_aoti(device):
+    """AOTInductor stages for `device`, or None when this architecture has no build."""
+    import json
+
+    import torch
+
+    directory = device_tail_directory(torch.cuda.get_device_capability(device))
+    manifest_path = directory / 'manifest.json'
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    if any(not (directory / name).exists() for name in manifest.get('files', ())):
+        return None
+    # Inductor links its wrapper with -ffast-math, and loading such a library
+    # (crtfastmath) switches the loading thread to flush subnormals to zero,
+    # which would change NumPy results on that thread. Restore the mode.
+    kept = _keeps_subnormals()
+    pro, blk, epi = [torch._export.aot_load(str(directory / f'{name}.so'), device=str(device))
+                     for name in ('prologue', 'block', 'epilogue')]
+    if kept and not _keeps_subnormals():
+        torch.set_flush_denormal(False)
+
+    def epilogue(*args):
+        # A single-output graph returns its tensor, not a list (indexing it
+        # would take the first row).
+        value = epi(*args)
+        return value[0] if isinstance(value, (list, tuple)) else value
+
+    return (lambda t, df: tuple(pro(t, df)),
+            lambda *args: tuple(blk(*args)),
+            epilogue)

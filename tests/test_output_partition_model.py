@@ -48,7 +48,7 @@ def test_single_device_full_panel_has_equal_priced_work_on_either_axis(tmp_path)
                 t=torch_trait_tiled_runtime(trait,host_serial_fraction=fraction,host_serial_policy=policy)
                 v=torch_trait_tiled_runtime(variant,host_serial_fraction=fraction,host_serial_policy=policy)
                 assert t['estimated_tile_seconds']==v['estimated_tile_seconds']
-                assert t['binary_payload_bytes']==v['binary_payload_bytes']==440
+                assert t['binary_payload_bytes']==v['binary_payload_bytes']==640
                 assert v['genotype_passes']==1
 
 
@@ -58,7 +58,7 @@ def test_variant_graph_conserves_shared_work_and_does_not_reread_payload(tmp_pat
     with patch('torchgwas.mechanistic_torch.tensor_stage_service',side_effect=component):
         graph=torch_trait_tiled_runtime(candidate,host_serial_fraction=.5,host_serial_policy='held-last',return_graph=True)
         result=graph.solve();report=torch_trait_tiled_runtime(candidate,host_serial_fraction=.5)
-    assert report['binary_payload_bytes']==440 and report['df_payload_bytes']==40
+    assert report['binary_payload_bytes']==640 and report['df_payload_bytes']==40
     assert report['genotype_passes']==1 and sum(r['blocks'] for r in report['tiles'])==5
     for resource,capacity in graph.capacities.items():
         work=sum(graph.nodes[name][0]*demand.get(resource,0.) for name,demand in graph.demands.items())

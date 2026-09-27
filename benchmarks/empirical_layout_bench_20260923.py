@@ -114,7 +114,7 @@ def digest_output(directory, mode):
     from torchgwas.sumstats import open_binary_sumstats
     from torchgwas.sumstats_indexed import open_indexed_sumstats
     if mode == 'full':
-        beta, t, _ = open_binary_sumstats(directory/'sumstats')
+        beta, t, _logp, _ = open_binary_sumstats(directory/'sumstats')
         return dict(kind='dense', t=np.asarray(t, dtype=np.float64))
     _, parts = open_indexed_sumstats(directory/'sumstats')
     rows = {}

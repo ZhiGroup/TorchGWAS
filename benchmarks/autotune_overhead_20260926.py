@@ -50,7 +50,7 @@ def configs(devices, reduce):
 def dense_sample(out, rows=512):
     """t at evenly spaced variants: a small cross-layout check kept after the output is deleted."""
     from torchgwas.sumstats import open_binary_sumstats
-    _, t_stat, _ = open_binary_sumstats(out / 'sumstats')
+    _, t_stat, _logp, _ = open_binary_sumstats(out / 'sumstats')
     n = t_stat.shape[0]
     return np.stack([np.asarray(t_stat[int(i)], dtype=np.float32)
                      for i in np.linspace(0, n - 1, min(rows, n)).astype(np.int64)])

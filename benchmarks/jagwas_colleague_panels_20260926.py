@@ -68,7 +68,7 @@ def main():
         if not (out / group / 'full' / 'sumstats' / 'manifest.json').exists():
             run_linear_gwas(str(BGEN), str(phenotype), sumstats_fields='t', sumstats_format='binary',
                             output_dir=str(out / group / 'full'), **common)
-        _, t, full_manifest = open_binary_sumstats(out / group / 'full' / 'sumstats')
+        _, t, _logp, full_manifest = open_binary_sumstats(out / group / 'full' / 'sumstats')
         variant_df = np.asarray(open_binary_df(out / group / 'full' / 'sumstats'), np.float64).reshape(-1)
         # The scan's processed panel: complete phenotypes, the same covariates and sample order.
         processed, _ = residualize_and_standardize(np.load(phenotype).astype(np.float32),

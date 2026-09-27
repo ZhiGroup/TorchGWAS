@@ -3,6 +3,7 @@ import threading
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from torchgwas.initial_chunk_autotune import PublicInitialChunkTuning
 from torchgwas.productive_dense_writer_queue_service import price_bracketed_dense_writer_queues
@@ -41,7 +42,7 @@ def test_live_capture_has_current_staging_and_rejects_advanced_issue(tmp_path):
         live = tuner.capture_live_writer_queues()
         assert live['observation_valid'] and live['stable_revision']
         assert live['registered_writers'] == 1
-        assert live['bracket']['logical_pending_bytes_interval'] == [16, 16]
+        assert live['bracket']['logical_pending_bytes_interval'] == [24, 24]
         only = next(iter(live['writers'].values()))
         assert only['device'] == 'cuda:0'
         assert only['first']['observation']['streams']['beta']['staging_bytes'] == 8
@@ -59,8 +60,8 @@ def test_live_capture_has_current_staging_and_rejects_advanced_issue(tmp_path):
         writer.queue_snapshot = accept_during_capture
         changing = tuner.capture_live_writer_queues()
         assert changing['observation_valid'] and changing['stable_revision']
-        assert changing['bracket']['logical_pending_bytes_interval'] == [16, 32]
-        assert changing['bracket']['os_write_bytes_upper'] == 32
+        assert changing['bracket']['logical_pending_bytes_interval'] == [24, 48]
+        assert changing['bracket']['os_write_bytes_upper'] == 48
         profile = dict(cpu_fraction=.5,
             writer_copy_service=dict(cpu_seconds_per_byte=0.,cpu_seconds_per_call=0.),
             process_units=dict(bytearray_zero_bytes=0.),executor_cpu_seconds=0.,
@@ -69,9 +70,9 @@ def test_live_capture_has_current_staging_and_rejects_advanced_issue(tmp_path):
                 fadvise_seconds=0.),fsync_seconds=0.)
         priced = price_bracketed_dense_writer_queues(changing['bracket'],
                                                      {'cuda:0': profile})
-        assert priced['os_write_bytes_upper'] == 32
-        assert priced['pagecache_cpu_seconds_upper_at_fixed_price'] == 3.2
-        assert priced['storage_seconds_upper_at_fixed_price'] == 6.4
+        assert priced['os_write_bytes_upper'] == 48
+        assert priced['pagecache_cpu_seconds_upper_at_fixed_price'] == pytest.approx(4.8)
+        assert priced['storage_seconds_upper_at_fixed_price'] == pytest.approx(9.6)
         advanced = False
 
         def advance_issue_during_capture():

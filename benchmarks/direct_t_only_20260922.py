@@ -31,7 +31,7 @@ def read_output(path,significant):
         order=np.lexsort((data['trait_index'],data['variant_index']))
         assert len(np.unique(np.column_stack((data['variant_index'],data['trait_index'])),axis=0))==len(order)
         return {name:array[order] for name,array in data.items()}
-    beta,t,_=open_binary_sumstats(path)
+    beta,t,_logp,_=open_binary_sumstats(path)
     assert beta is None and not list(path.rglob('beta.f32'))
     return dict(t_stat=np.asarray(t),df=np.asarray(open_binary_df(path)))
 

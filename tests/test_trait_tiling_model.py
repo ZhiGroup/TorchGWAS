@@ -80,7 +80,7 @@ def test_tile_graph_preserves_lifetimes_and_complete_output(input_path,block_byt
         assert result['seconds']+1e-10>=work/capacity
     report = runtime(c,host_serial_policy=policy)
     assert report['genotype_passes']==3
-    assert report['binary_payload_bytes']==8*10*5+4*10*3
+    assert report['binary_payload_bytes']==12*10*5+4*10*3
     assert report['df_payload_bytes']==4*10*3
     assert sum(tile['writer_copy_bytes'] for tile in report['tiles'])==report['binary_payload_bytes']
     assert report['prediction_complete'] is False

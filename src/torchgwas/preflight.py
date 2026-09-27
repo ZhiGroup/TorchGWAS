@@ -55,7 +55,8 @@ def largest_fitting_traits(*, chunk_variants: int, depth: int, n_samples: int,
                            device_memory_bytes: float,
                            n_traits: int,
                            headroom: float = 0.85,
-                           decode_on_gpu: bool = False) -> int:
+                           decode_on_gpu: bool = False,
+                           compute_log10_p: bool = False) -> int:
     """Largest trait count whose device rings fit, by bisection on the model.
 
     Bisects the same `predicted_peak_bytes` the planner uses, so the answer a
@@ -69,7 +70,8 @@ def largest_fitting_traits(*, chunk_variants: int, depth: int, n_samples: int,
             chunk_variants=chunk_variants, depth=depth, n_samples=n_samples,
             n_traits=traits, covariate_rank=covariate_rank,
             transfer_bytes_per_variant=transfer_bytes_per_variant,
-            decode_on_gpu=decode_on_gpu)
+            decode_on_gpu=decode_on_gpu,
+            compute_log10_p=compute_log10_p)
         return peak["gpu_bytes_per_device"] <= budget
 
     if fits(n_traits):
@@ -93,7 +95,8 @@ def check_plan(*, chunk_variants: int, depth: int, n_samples: int,
                reduced: bool,
                trait_devices: int = 1,
                headroom: float = 0.85,
-               decode_on_gpu: bool = False) -> dict:
+               decode_on_gpu: bool = False,
+               compute_log10_p: bool = False) -> dict:
     """Report whether this plan fits, and what to do when it does not.
 
     `reduced` says whether a reduction or significance filter is active, which
@@ -109,7 +112,8 @@ def check_plan(*, chunk_variants: int, depth: int, n_samples: int,
         chunk_variants=chunk_variants, depth=depth, n_samples=n_samples,
         n_traits=n_traits, covariate_rank=covariate_rank,
         transfer_bytes_per_variant=transfer_bytes_per_variant,
-        decode_on_gpu=decode_on_gpu, trait_devices=trait_devices)
+        decode_on_gpu=decode_on_gpu, trait_devices=trait_devices,
+        compute_log10_p=compute_log10_p)
     budget = device_memory_bytes * headroom
     fits = peak["gpu_bytes_per_device"] <= budget
 
@@ -128,7 +132,8 @@ def check_plan(*, chunk_variants: int, depth: int, n_samples: int,
             covariate_rank=covariate_rank,
             transfer_bytes_per_variant=transfer_bytes_per_variant,
             device_memory_bytes=device_memory_bytes, n_traits=n_traits,
-            headroom=headroom, decode_on_gpu=decode_on_gpu)
+            headroom=headroom, decode_on_gpu=decode_on_gpu,
+            compute_log10_p=compute_log10_p)
 
     return {
         "fits": fits,

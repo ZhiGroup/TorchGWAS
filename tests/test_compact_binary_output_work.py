@@ -31,10 +31,10 @@ def test_compact_matches_expanded_fixed_chunks(markers, traits, chunk, block, bo
         ('fsync_calls', 'fsync_calls'),
     ):
         assert compact[short] == expanded[long], (kwargs, short)
-    for name, traits_for_stream in [('beta', traits), ('t', traits)] + ([('df', 1)] if df else []):
+    for name, traits_for_stream in [('beta', traits), ('t', traits), ('logp', traits)] + ([('df', 1)] if df else []):
         size = block if name != 'df' else min(block, 1 << 20)
         one = binary_output_work(markers, traits_for_stream, chunk, size, 2,
-                                 borrow, False, True, 32, True)
+                                 borrow, False, True, 32, True, _stream_names=[name])
         row = compact['streams'][name]
         assert row['payload_bytes'] == one['binary_payload_bytes']
         assert row['staging_copy_bytes'] == one['staging_copy_bytes']
@@ -48,8 +48,8 @@ def test_compact_matches_expanded_fixed_chunks(markers, traits, chunk, block, bo
 def test_large_dense_output_is_compact():
     result = compact_binary_output_work(8_086_101, 128, 1024, block_bytes=16 << 20,
                                         borrow_chunks=False, store_variant_df=True)
-    assert result['payload_bytes'] == 8_086_101 * (128 * 8 + 4)
-    assert len(result['streams']) == 3
+    assert result['payload_bytes'] == 8_086_101 * (128 * 12 + 4)
+    assert len(result['streams']) == 4  # beta, t, -log10 P, df
     assert result['write_calls_minimum'] > 0
 
 

@@ -39,24 +39,24 @@ def test_only_written_common_prefixes_and_exact_data(tmp_path, block, borrow, be
     for start in range(0, n, 4):
         stop = min(start+4, n)
         writer.write_chunk(start, stop, values[start:stop], (values+1)[start:stop],
-                           dfs[start:stop] if variant_df else None)
+                           variant_df=dfs[start:stop] if variant_df else None)
     summary = writer.close()
     assert events[-1].end == n
     assert sum(event.rows for event in events) == n*k
-    assert sum(event.statistic_bytes for event in events) == 4*n*k*(1+int(beta))
+    assert sum(event.statistic_bytes for event in events) == 4*n*k*(2+int(beta))  # t, -log10 P[, beta]
     assert all(a.completed <= b.completed for a, b in zip(events, events[1:]))
     if variant_df:
         np.testing.assert_array_equal(open_binary_df(tmp_path), dfs)
-    stored_beta, stored_t, _ = open_binary_sumstats(tmp_path)
+    stored_beta, stored_t, _logp, _ = open_binary_sumstats(tmp_path)
     np.testing.assert_array_equal(stored_t, values+1)
     if beta: np.testing.assert_array_equal(stored_beta, values)
-    assert summary['payload_bytes'] == 4*n*k*(1+int(beta)) + (4*n if variant_df else 0)
+    assert summary['payload_bytes'] == 4*n*k*(2+int(beta)) + (4*n if variant_df else 0)
     assert summary['progress_callback_seconds'] > 0
     for event in events:
         queue = event.writer_queue
         assert queue['valid'] and queue['kind'] == 'torchgwas.dense_writer_queue_observation.v1'
         assert queue['atomic_writer_streams']
-        assert set(queue['streams']) == ({'t_stat'} | ({'beta'} if beta else set()) |
+        assert set(queue['streams']) == ({'t_stat', 'neg_log10_p'} | ({'beta'} if beta else set()) |
                                          ({'df'} if variant_df else set()))
         for state in queue['streams'].values():
             assert state['accepted_bytes'] - state['written_bytes'] == (
@@ -200,7 +200,7 @@ def test_partition_writers_label_real_global_ranges(tmp_path, axis):
     assert len(opened) == len(partitions)
     assert {device for _, device in opened} == {device for _, _, device in partitions}
     assert sum(e.rows for e in events) == n*k
-    b, t, _ = open_binary_sumstats(tmp_path)
+    b, t, _logp, _ = open_binary_sumstats(tmp_path)
     np.testing.assert_array_equal(b, values); np.testing.assert_array_equal(t, values+1)
 
 

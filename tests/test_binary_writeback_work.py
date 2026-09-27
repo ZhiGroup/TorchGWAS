@@ -20,7 +20,7 @@ def test_variant_df_stream_matches_actual_writer_and_graph(tmp_path,borrow,store
     g=ExecutionGraph();last=g.add('start')
     for i,start in enumerate(range(0,m,b)):
         end=min(start+b,m)
-        actual.write_chunk(start,end,np.ones((end-start,k)),np.ones((end-start,k)),np.full((end-start,1),38))
+        actual.write_chunk(start,end,np.ones((end-start,k)),np.ones((end-start,k)),variant_df=np.full((end-start,1),38))
         last=model.append(g,i,[last])
     summary=actual.close();model.close(g,[last]);g.solve()
     assert model.payload==work['binary_payload_bytes']==summary['payload_bytes']
@@ -36,14 +36,15 @@ def test_staging_call_overhead_counts_partial_block_splits():
     from torchgwas.execution_graph import ExecutionGraph
     work=binary_output_work(5,3,2,block_bytes=17,store_beta=False,
                             borrow_chunks=False,fsync=False,writeback_bytes=0)
-    # Chunks of24,24,12 bytes cross17-byte blocks in2,2,2 pieces.
-    assert work['staging_copy_calls']==6
+    # Chunks of 24, 24, 12 bytes cross 17-byte blocks in 2, 2, 2 pieces, for
+    # each of t and -log10 P.
+    assert work['staging_copy_calls']==12
     writer=BinaryWriterSchedule(work,copy_seconds_per_byte=0.,copy_seconds_per_call=.5,
         zero_seconds_per_byte=0.,write_seconds_per_byte=0.,fsync_seconds_per_array=0.,writeback_bytes=0)
     graph=ExecutionGraph();last=graph.add('start')
     for index in range(3):last=writer.append(graph,index,[last])
     end=writer.close(graph,[last])
-    assert graph.solve()['end'][end]==pytest.approx(3.)
+    assert graph.solve()['end'][end]==pytest.approx(6.)
 
 
 def test_write_crossing_multiple_intervals_waits_previous_and_retains_tail():
@@ -102,7 +103,8 @@ def test_schedule_waits_before_releasing_buffer_and_counts_storage_once():
     last=g.add('start')
     for i in range(3):last=writer.append(g,i,[last])
     end=writer.close(g,[last]);result=g.solve()
-    assert result['end'][end]==pytest.approx(38.)
+    # t then -log10 P: 36 bytes of storage and a 2 s fsync each.
+    assert result['end'][end]==pytest.approx(76.)
     assert writer.range_schedules['t'].bytes==36
     wait='writer:t:range:1:1:wait'
     first_storage='writer:t:range:0:0:storage'
@@ -131,7 +133,7 @@ def test_two_array_writeback_shares_storage_and_conserves_payload():
     last=g.add('start')
     for i in range(3):last=writer.append(g,i,[last])
     end=writer.close(g,[last])
-    assert g.solve()['end'][end]==pytest.approx(72.)
+    assert g.solve()['end'][end]==pytest.approx(108.)  # beta, t and -log10 P
     assert sum(s.bytes for s in writer.range_schedules.values())==work['binary_payload_bytes']
 
 
