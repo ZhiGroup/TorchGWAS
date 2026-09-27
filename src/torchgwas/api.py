@@ -627,6 +627,12 @@ def run_linear_gwas(
     # 1 / min_residual). The planner prices TORCHGWAS_JAGWAS_RCOND's method.
     jagwas_rcond: float | None = None,
     jagwas_min_residual: float | None = None,
+    # reduce='jagwas' only: [(name, phenotype column indices[, cutoff]), ...] or
+    # a dict, for one joint test per group from a single genotype pass (one chi2
+    # column and one df per group; jagwas_projection.JagwasGroups). A cutoff is
+    # a dict with rcond or min_residual, or a bare rcond; jagwas_rcond and
+    # jagwas_min_residual apply to groups without their own.
+    jagwas_groups=None,
     # Opt-in: mask phenotype values beyond this many SD of their
     # covariate-residualised trait before the scan (preprocess.
     # mask_phenotype_outliers). reduce='jagwas' drops the sample's whole
@@ -653,6 +659,8 @@ def run_linear_gwas(
     min_free_bytes, tuner, probe_chunks and split.
     """
     _api_entered=time.perf_counter()
+    if jagwas_groups is not None and reduce != "jagwas":
+        raise TypeError("jagwas_groups needs reduce='jagwas'")
     # JAGWAS has one joint statistic over the complete retained phenotype
     # panel. Only variants may be partitioned, including across GPUs.
     if reduce == "jagwas" and (trait_block is not None or trait_devices is not None):
@@ -988,8 +996,10 @@ def run_linear_gwas(
                 "reduction and the in-memory path returns the full matrix")
         if reduce_top_k is not None:
             raise ValueError("reduce_top_k does not apply to 'jagwas'")
-        from .jagwas_projection import JagwasReduction
-        jagwas = JagwasReduction(rcond=jagwas_rcond, min_residual=jagwas_min_residual)
+        from .jagwas_projection import JagwasGroups, JagwasReduction
+        jagwas = (JagwasReduction(rcond=jagwas_rcond, min_residual=jagwas_min_residual)
+                  if jagwas_groups is None else
+                  JagwasGroups(jagwas_groups, rcond=jagwas_rcond, min_residual=jagwas_min_residual))
         reduction = jagwas
         reduce = None
     if reduce == "significant":
@@ -1315,9 +1325,16 @@ def run_linear_gwas(
                 first, last = _resolve_variant_range(variant_range, int(genotype.shape[1]))
                 active = len(multigpu_variant_ranges(last-first, int(effective_chunk_size), len(variant_devices))) if last > first else 1
                 factor_devices = variant_devices[:max(1,active)]
-            require_jagwas_factor_capacity(int(phenotype.shape[0]), int(phenotype.shape[1]),
-                factor_devices, compute_dtype=resolved_compute_dtype,
-                method='eigen' if jagwas.rcond is not None else 'rounding')
+            if jagwas_groups is None:
+                require_jagwas_factor_capacity(int(phenotype.shape[0]), int(phenotype.shape[1]),
+                    factor_devices, compute_dtype=resolved_compute_dtype,
+                    method='eigen' if jagwas.rcond is not None else 'rounding')
+            else:
+                sizes = [len(columns) for columns in jagwas.columns]
+                largest = jagwas.reductions[int(np.argmax(sizes))]
+                require_jagwas_factor_capacity(int(phenotype.shape[0]), int(phenotype.shape[1]),
+                    factor_devices, compute_dtype=resolved_compute_dtype,
+                    method='eigen' if largest.rcond is not None else 'rounding', group_sizes=sizes)
         if pipeline_profile is not None:
             if resolved_device.type != "cuda" or resolved_compute_dtype != "float32":
                 raise ValueError("pipeline profiles currently describe the float32 CUDA scan")
@@ -1347,6 +1364,21 @@ def run_linear_gwas(
         original_trait_names = trait_columns or [f"trait_{i}" for i in range(qc['phenotype_columns_input'])]
         trait_names = ([original_trait_names[i] for i in qc['phenotype_kept_column_indices']]
                        if 'phenotype_kept_column_indices' in qc else original_trait_names)
+        if jagwas_groups is not None and 'phenotype_kept_column_indices' in qc:
+            # Group columns index the input panel. QC can drop traits (constant
+            # or empty columns), so map each group onto the scanned panel;
+            # unmapped indices would silently join the wrong traits.
+            position = {int(original): i for i, original in enumerate(qc['phenotype_kept_column_indices'])}
+            remapped = []
+            for name, columns, cutoff in zip(jagwas.names, jagwas.columns, jagwas.cutoffs):
+                kept = [position[int(column)] for column in columns if int(column) in position]
+                if len(kept) < len(columns):
+                    warnings.warn(f"jagwas group {name}: {len(columns) - len(kept)} of {len(columns)} "
+                                  f"traits removed by phenotype QC", UserWarning, stacklevel=2)
+                if not kept:
+                    raise ValueError(f"jagwas group {name} has no trait left after phenotype QC")
+                remapped.append((name, kept, cutoff))
+            jagwas = reduction = JagwasGroups(remapped)
         genotype_shape = list(genotype.shape)
         # A ranged scan reports on its range, not on the file. The variant count
         # and the marker names both have to be narrowed here, or the sumstats
@@ -1711,7 +1743,8 @@ def run_linear_gwas(
                 # selected cell by cell on each device (stateless).
                 if jagwas_variant_output:
                     # Shards share the run's kept-trait decision (collinear traits dropped once).
-                    shard_output = dict(reduction_factory=jagwas.spawn)
+                    shard_output = dict(reduction_factory=jagwas.spawn,
+                                        column_groups=getattr(jagwas, 'column_groups', None))
                 else:
                     from .linear import _significant_pairs_iterator
                     # Select pairs on each shard's thread, as trait tiles do;
@@ -1908,7 +1941,8 @@ def run_linear_gwas(
                     kind=kind, df=residual_df,
                     # The kept rank is known once the factors are prepared, before the manifest.
                     chi2_df=(lambda: jagwas.degrees_of_freedom) if jagwas is not None else None,
-                    extra_manifest=((lambda: dict(jagwas_rank=jagwas.rank_report(trait_names)))
+                    extra_manifest=((lambda: dict(jagwas_rank=jagwas.rank_report(trait_names),
+                                                  **({} if jagwas_groups is None else dict(groups=jagwas.names))))
                                     if jagwas is not None else None),
                     p_value_threshold=p_value_threshold,
                     variant_metadata=variant_metadata,fsync=sumstats_fsync,
@@ -2103,6 +2137,7 @@ def run_linear_gwas(
             None if significance is None
             else significance.resolved_threshold(len(trait_names))),
         "reduce_top_k": None if reduction is None else reduction.width,
+        "jagwas_groups": None if jagwas_groups is None else jagwas.names,
         "phenotype_outlier_sd": phenotype_outlier_sd,
         "phenotype_outlier_rows": None if outlier_rows is None else int(outlier_rows.sum()),
         # Recorded because it changes how many passes the run made over the

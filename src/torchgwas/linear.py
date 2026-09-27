@@ -794,6 +794,7 @@ def linear_scan_multigpu(
     genotype, phenotype, covariates=None, *, devices=None, chunk_size=None,
     reader_workers=None, prefetch_chunks=None, compute_p_values=True,
     ordered=True, result_queue_depth=4, reduction_factory=None, variant_range=None, shared_queue_depth=None,
+    column_groups=None,
     result_queue_registration=None, shard_transform=None, transform_borrows=False, **kwargs,
 ):
     """Bounded variant sharding. Close the iterator when stopping early.
@@ -878,12 +879,14 @@ def linear_scan_multigpu(
     keep = (all(str(d).startswith('cuda') for d in devices)
             and getattr(genotype, 'supports_fused_qc', False) and not hasattr(genotype, 'iter_packed_chunks')
             and kwargs.get('compute_dtype', 'float32') == 'float32')
-    if keep:
+    if keep and column_groups is None:
         panel_bytes = 4 * int(np.shape(phenotype)[0]) * int(np.shape(phenotype)[1])
         keep = 2 * panel_bytes < 0.5 * torch.cuda.mem_get_info(torch.device(devices[0]))[0]
+    else:
+        keep = False  # grouped residualisation returns NumPy
     shared_pheno, shared_q, observed = residualize_and_standardize(
         phenotype, covariates, device=choose_device(devices[0]),
-        return_observed_counts=True, keep_on_device=keep)
+        return_observed_counts=True, keep_on_device=keep, column_groups=column_groups)
     stop = threading.Event()
     shared_capacity = shared_queue_depth if shared_queue_depth is not None else result_queue_depth * len(devices)
     shared_queue = queue.Queue(maxsize=shared_capacity)
@@ -1166,11 +1169,13 @@ def linear_scan_streaming_chunks(
     if already_processed:
         pheno_proc, q_matrix = phenotype, covariates
     else:
+        # JagwasGroups: each group residualised as a run of it alone would be.
         pheno_proc, q_matrix, phenotype_observed_counts = residualize_and_standardize(
             phenotype, covariates, device=torch_device,
             return_observed_counts=True,
             _prevalidated_observed_counts=_prevalidated_observed_counts,
-            _prevalidated_covariate_basis=_prevalidated_covariate_basis)
+            _prevalidated_covariate_basis=_prevalidated_covariate_basis,
+            column_groups=getattr(reduction, "column_groups", None))
     if already_processed:
         phenotype_observed_counts = (np.full(
             pheno_proc.shape[1], pheno_proc.shape[0], dtype=np.int64)
