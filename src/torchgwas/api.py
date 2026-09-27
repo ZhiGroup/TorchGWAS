@@ -457,6 +457,10 @@ def _drain_linear_chunks(chunk_iterator) -> tuple[int, dict]:
     return cells, {"discarded": True, "scan_seconds": time.perf_counter() - started}
 
 
+from .host_pages import numpy_hugepage_advice, without_numpy_hugepages
+
+
+@without_numpy_hugepages
 def run_linear_gwas(
     genotype,
     phenotype,
@@ -1350,6 +1354,8 @@ def run_linear_gwas(
             else significance.resolved_threshold(len(trait_names))),
         "reduce_top_k": None if reduction is None else reduction.width,
         "jagwas_groups": None if jagwas_groups is None else jagwas.names,
+        # host_pages.py: NumPy's MADV_HUGEPAGE advice during the run.
+        "numpy_hugepage_advice": numpy_hugepage_advice(),
         "jagwas_rcond": (None if jagwas is None else
                          jagwas.rcond if jagwas_groups is None
                          else [reduction.rcond for reduction in jagwas.reductions]),
