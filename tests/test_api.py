@@ -23,7 +23,7 @@ class APITestCase(unittest.TestCase):
     def test_tabular_inputs_align_to_sample_ids(self):
         toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
         linear = run_linear_gwas(
-            genotype=toy["genotype"],
+            genotype=np.load(toy["genotype"], allow_pickle=False),
             phenotype=None,
             covariates=None,
             phenotype_table=toy["phenotype_table"],
@@ -41,7 +41,7 @@ class APITestCase(unittest.TestCase):
         toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
         with tempfile.TemporaryDirectory() as tmpdir:
             run_linear_gwas(
-                genotype=toy["genotype"],
+                genotype=np.load(toy["genotype"], allow_pickle=False),
                 phenotype=toy["phenotype"],
                 covariates=toy["covariates"],
                 marker_ids=toy["marker_ids"],
