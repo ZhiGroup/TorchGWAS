@@ -13,6 +13,9 @@ Details are in the design doc's "Exact -log10 P from the release" and
 - **Device tail.** `tails.neg_log10_p_device`, built ahead of time per GPU
   architecture: run `build_device_tail.sh` once per host type, or it compiles
   per process.
+- **Grouped JAGWAS.** The planner now prices factor memory and projection per
+  group. Same layout at K = 8,192 in 22 groups (31 s), where fixed chunk 1024
+  took 55 s.
 - **Dense planner.** Autotune's layout was right at K = 512 but it skipped
   probing and kept chunk 1024 (17.6-20.4 s against 10.1-10.8 s fixed). At
   K = 2,048 the write probe underestimated four writers (2 shards 37 s, 4

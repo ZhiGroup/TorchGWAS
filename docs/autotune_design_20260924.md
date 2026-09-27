@@ -1748,6 +1748,31 @@ same layout):
 - On writer-bound dense runs, storing -log10 P costs roughly its share of the
   bytes. GPU-bound runs pay about 3.3 ms per 8.4M cells.
 
+### Grouped JAGWAS in the planner (2026-09-27)
+
+The planner priced a grouped JAGWAS job as one panel of the total width. That
+meant 3 x K x K FP64 of factor memory and a K-wide projection per variant, so
+it refused grouped jobs whose total K has no single factor that fits a GPU,
+though the API's own capacity gate accepted them. It now takes the group sizes:
+- `jagwas_factor_bytes`: the largest group's three k x k matrices plus the
+  other groups' retained factors;
+- `jagwas_projection_flops`: the sum of each group's own projection.
+
+Measured (H100 GPUs 4-7, full scale, K = 8,192 in 22 groups;
+`results/grouped_jagwas_autotune_20260927/`):
+
+| | executor seconds |
+|---|---|
+| autotune, group pricing | 31.0, 31.3 |
+| autotune, one-panel pricing | 31.4, 31.2 |
+| fixed 4 shards, chunk 1024 | 54.6, 55.7 |
+
+- Both pricings chose 4 shards, since the FP32 scoring dominates at this size.
+  The grouped estimate of GPU time per variant is 13% lower.
+- Grouped JAGWAS favours larger chunks: 22 projections per chunk make a fixed
+  per-chunk cost, which autotune's larger chunks amortize (43% faster than
+  chunk 1024).
+
 ### GIL and process start
 
 - **Correction (2026-09-26):** hold time understates the GIL's cost. With
