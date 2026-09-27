@@ -174,10 +174,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="skip the final fsync; reported write time then excludes durability",
     )
     linear.add_argument(
+        "--sumstats-variant-ids",
+        dest="sumstats_variant_ids",
+        action="store_true",
+        help="also store the variant IDs (default: the store records its input and variant indices)",
+    )
+    linear.add_argument(
         "--no-sumstats-variant-ids",
         dest="sumstats_variant_ids",
         action="store_false",
-        help="skip writing variant_ids.txt next to the binary store",
+        help="record the input and variant indices only (the default)",
     )
     linear.add_argument("--output-dir", required=True)
 

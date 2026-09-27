@@ -12,6 +12,7 @@ from torchgwas.api import run_linear_gwas
 from torchgwas.sumstats import open_binary_sumstats,open_binary_df
 from torchgwas.sumstats_indexed import open_indexed_sumstats
 from test_pgen_native_reader import write_pgen
+from torchgwas.variant_source import store_variant_ids
 
 
 def selected_arrays(chunks):
@@ -183,7 +184,7 @@ def test_real_native_multigpu_significance_tiles_isolate_qc_and_share_setup(tmp_
         else:
             np.testing.assert_allclose(got, want, rtol=4e-5, atol=3e-6)
     manifest, _ = open_indexed_sumstats(tmp_path/'selected/sumstats')
-    np.testing.assert_array_equal(np.load(tmp_path/'selected/sumstats'/manifest['variant_ids']), [f'v{i}' for i in range(3, 62)])
+    np.testing.assert_array_equal(store_variant_ids(tmp_path/'selected/sumstats'), [f'v{i}' for i in range(3, 62)])
     profile = source._last_scan_profile
     assert profile['layout']['queue_depth'] == 1
     assert profile['layout']['readers_per_device'] == [2, 1]

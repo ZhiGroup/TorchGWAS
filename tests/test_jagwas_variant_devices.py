@@ -9,6 +9,7 @@ from torchgwas.api import run_linear_gwas
 from torchgwas.linear import linear_scan_multigpu, linear_scan_streaming_chunks
 from torchgwas.reduce import JagwasReduction
 from torchgwas.sumstats_indexed import open_indexed_sumstats
+from torchgwas.variant_source import store_variant_ids
 
 
 def test_factory_instances_and_scan_counters_are_private():
@@ -199,8 +200,8 @@ def test_joint_api_matches_serial_and_fp64_ols(tmp_path,monkeypatch,fmt,cuda,chu
     metadata=tmp_path/'parallel'/'sumstats'/'variant_metadata.npz'
     if metadata.exists():
         with np.load(metadata) as archive:assert all(len(archive[key])==20 for key in archive.files)
-    np.testing.assert_array_equal(np.load(tmp_path/'parallel'/'sumstats'/'variant_ids.npy'),
-                                  np.load(tmp_path/'serial'/'sumstats'/'variant_ids.npy'))
+    np.testing.assert_array_equal(store_variant_ids(tmp_path/'parallel'/'sumstats'),
+                                  store_variant_ids(tmp_path/'serial'/'sumstats'))
 
 
 def test_small_range_trims_idle_devices_and_keeps_global_trait_df(tmp_path,monkeypatch):

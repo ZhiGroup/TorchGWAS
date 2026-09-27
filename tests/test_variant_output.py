@@ -9,6 +9,7 @@ import pytest
 from torchgwas.api import run_linear_gwas
 from torchgwas.sumstats import open_binary_sumstats,open_binary_df,read_manifest
 from torchgwas.sumstats_sharded import write_variant_sharded_sumstats,VariantShardedArray
+from torchgwas.variant_source import store_variant_ids
 
 
 def synthetic(directory, *, store_beta=True,before_publish=None):
@@ -147,7 +148,7 @@ def test_full_api_variant_shards_match_serial_with_missing_genotypes_and_ranges(
                                   np.asarray(open_binary_df(tmp_path/'serial'/'sumstats')))
     assert actual[2]['shape']==[17,6]
     assert actual[2]['traits']==[f'trait_{i}' for i in range(k) if i!=2]
-    assert (tmp_path/'sharded'/'sumstats'/'variant_ids.txt').read_bytes()==(tmp_path/'serial'/'sumstats'/'variant_ids.txt').read_bytes()
+    np.testing.assert_array_equal(store_variant_ids(tmp_path/'sharded'/'sumstats'),store_variant_ids(tmp_path/'serial'/'sumstats'))
     assert parallel.run_metadata['variant_devices']==devices
     for key in ['dropped_genotype_columns','genotype_columns_kept']:
         assert parallel.qc_summary[key]==serial.qc_summary[key]
@@ -250,7 +251,7 @@ def test_bgen_dosage_variant_shards_match_serial_and_trim_idle_devices(tmp_path,
                                   np.asarray(open_binary_df(tmp_path/'serial'/'sumstats')))
     active=devices[:1] if span else devices
     assert result.run_metadata['variant_devices']==active
-    assert (tmp_path/'shards'/'sumstats'/'variant_ids.txt').read_bytes()==(tmp_path/'serial'/'sumstats'/'variant_ids.txt').read_bytes()
+    np.testing.assert_array_equal(store_variant_ids(tmp_path/'shards'/'sumstats'),store_variant_ids(tmp_path/'serial'/'sumstats'))
 
 
 @pytest.mark.parametrize('layout',['shards','tiles'])

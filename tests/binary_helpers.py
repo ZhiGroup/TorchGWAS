@@ -4,18 +4,18 @@ import numpy as np
 from scipy import special,stats
 from torchgwas.sumstats import open_binary_sumstats, open_binary_df
 from torchgwas.sumstats_indexed import open_indexed_sumstats
+from torchgwas.variant_source import store_variants
 
 def binary_rows(out):
  directory=Path(out)/'sumstats';manifest=json.loads((directory/'manifest.json').read_text())
- rows=[];meta={}
- if (directory/'variant_metadata.npz').exists():
-  with np.load(directory/'variant_metadata.npz',allow_pickle=False) as f:meta={k:f[k] for k in f.files}
+ rows=[]
+ # Embedded IDs, or the recorded input's own (variant_source.store_variants).
+ ids,meta=store_variants(directory)
  if manifest['format']=='torchgwas-indexed-sumstats':
-  ids=np.load(directory/'variant_ids.npy',allow_pickle=False);_,parts=open_indexed_sumstats(directory)
+  _,parts=open_indexed_sumstats(directory)
  else:
   beta,t,manifest=open_binary_sumstats(directory)
   stored_df=np.broadcast_to(open_binary_df(directory),t.shape)
-  ids=(directory/'variant_ids.txt').read_text().splitlines()
   vi,ti=np.indices(t.shape)
   parts=[{'variant_index':vi.ravel(),'trait_index':ti.ravel(),'beta':np.asarray(beta).ravel(),'t_stat':np.asarray(t).ravel()}]
  for part in parts:
