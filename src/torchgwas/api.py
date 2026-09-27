@@ -1437,14 +1437,18 @@ def run_linear_gwas(
         # (shared_decode.py): on for autotuned runs, or TORCHGWAS_SHARED_DECODE=1.
         import os as _os
         import threading
-        # Autotuned runs select significant pairs on the GPU (layout_profile
-        # 2026-09-24: never slower, 10x faster on a CPU-loaded host); an
-        # explicit TORCHGWAS_SIGNIFICANCE_BACKEND still wins.
-        significance_backend = ('device' if empirical is not None and significance is not None
-                                and 'TORCHGWAS_SIGNIFICANCE_BACKEND' not in _os.environ else None)
-        if empirical is not None and significance is not None:
-            genotype_meta['significance_backend'] = (significance_backend
-                                                     or _os.environ.get('TORCHGWAS_SIGNIFICANCE_BACKEND', 'host'))
+        # Significant pairs are selected on the GPU unless the threshold passes a
+        # large share of cells (reduce.default_significance_backend; layout_profile
+        # 2026-09-24: never slower, 10x faster on a CPU-loaded host). An explicit
+        # TORCHGWAS_SIGNIFICANCE_BACKEND still wins.
+        significance_backend = None
+        if significance is not None:
+            from .significance_backend import default_significance_backend
+            significance_backend = _os.environ.get('TORCHGWAS_SIGNIFICANCE_BACKEND') or default_significance_backend(
+                significance, int(np.shape(phenotype)[1]))
+            genotype_meta['significance_backend'] = significance_backend
+            if 'TORCHGWAS_SIGNIFICANCE_BACKEND' in _os.environ:
+                significance_backend = None  # linear reads the variable itself
         shared_state = dict(hub=None, enabled=False)
         # More phenotype tiles than GPUs means rounds, and every round decodes
         # the genotype again. TORCHGWAS_GENOTYPE_CACHE=1 decodes once into

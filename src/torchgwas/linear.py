@@ -77,6 +77,11 @@ def _packed_bed_statistics(
                               covariate_rank=n_samples - df - 2)
 
 
+def _default_significance_backend(significance, n_traits):
+    from .significance_backend import default_significance_backend
+    return default_significance_backend(significance, n_traits)
+
+
 def _significant_pairs_iterator(chunks, significance, n_traits, df):
     """Select all passing pairs with the df carried by the statistics producer.
 
@@ -1269,8 +1274,9 @@ def linear_scan_streaming_chunks(
                                     variant_range=variant_range,
                                     reduction=reduction, reader_worker_limit=_reader_worker_limit,
                                     borrow_results=borrow_results, return_df=return_df,
-                                    significance=(significance if not phenotype_has_missing and
-                                        (_significance_backend or os.environ.get('TORCHGWAS_SIGNIFICANCE_BACKEND','host'))=='device'
+                                    significance=(significance if significance is not None and not phenotype_has_missing and
+                                        (_significance_backend or os.environ.get('TORCHGWAS_SIGNIFICANCE_BACKEND')
+                                         or _default_significance_backend(significance, significance_n_traits or pheno_proc.shape[1]))=='device'
                                         else None),
                                     significance_n_traits=significance_n_traits,
                                     chunk_size_selector=_chunk_size_selector,
