@@ -10,12 +10,14 @@ from pathlib import Path
 import numpy as np
 
 
-def _write_plink_triplet(prefix: Path, dosage_a1: np.ndarray) -> Path:
+def _write_plink_triplet(prefix: Path, dosage_a1: np.ndarray, sample_ids=None) -> Path:
     dosage_a1 = np.asarray(dosage_a1, dtype=np.float32)
     n_samples, n_markers = dosage_a1.shape
     bed = Path(f"{prefix}.bed")
+    families = ([(f"F{i}", f"I{i}") for i in range(n_samples)] if sample_ids is None
+                else [(sample, sample) for sample in sample_ids])
     Path(f"{prefix}.fam").write_text(
-        "".join(f"F{i} I{i} 0 0 0 -9\n" for i in range(n_samples)),
+        "".join(f"{fid} {iid} 0 0 0 -9\n" for fid, iid in families),
         encoding="utf-8",
     )
     Path(f"{prefix}.bim").write_text(
@@ -60,6 +62,7 @@ class CLITestCase(unittest.TestCase):
             bed = _write_plink_triplet(
                 Path(tmpdir) / "genotype",
                 np.load(toy / "genotype.npy", allow_pickle=False),
+                sample_ids=(toy / "samples.tsv").read_text().split(),
             )
             cmd = [
                 sys.executable,
