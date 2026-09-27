@@ -33,6 +33,9 @@ def configs(devices, reduce):
                                                 prefetch_chunks=32)),
                 dict(name='fixed4', kwargs=dict(variant_devices=devices, chunk_size=4096,
                                                 reader_workers=8 * len(devices), prefetch_chunks=16)),
+                # The shard count dense autotune chose on 2026-09-27, without its planning.
+                dict(name='fixed2', kwargs=dict(variant_devices=devices[:2], chunk_size=4096,
+                                                reader_workers=16, prefetch_chunks=16)),
                 dict(name='auto', kwargs=dict(autotune=True, autotune_options=dict(devices=devices)))]
     base = dict(reduce=reduce)
     if reduce == 'significant':
