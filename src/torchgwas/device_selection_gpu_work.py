@@ -7,6 +7,7 @@ not recovered physical counters or a fitted selector-duration table.
 import math
 from .mechanistic_plan import _integer
 from .first_principles import positive
+from .selection_geometry import DEVICE_SELECTION_MAX_CELLS
 
 SOURCES={
     'nonzero':'https://github.com/pytorch/pytorch/blob/v2.5.1/aten/src/ATen/native/cuda/Nonzero.cu',
@@ -90,7 +91,10 @@ def selection_gpu_work(work,kernels,*,compute_capability,lookback_windows=1):
                 op=step['op'],step_index=step_index)]
             continue
         block=next(blocks_by_nonzero);cells,retained=block['cells'],block['retained']
-        if cells>1<<20:raise ValueError('Selector CUB source model requires the bounded 1M-cell path')
+        # PyTorch 2.5.1 nonzero is one count reduce and one flagged select at
+        # any extent below INT_MAX; above 1M cells the count grid saturates at
+        # CUB's occupancy bound, which the partial check below admits.
+        if cells>DEVICE_SELECTION_MAX_CELLS:raise ValueError('Selector block exceeds the CUDA nonzero limit')
         phases={};count=[]
         first=take('DeviceReduce')
         if 'Policy600' not in first['name'] or 'NonZeroOp<bool>' not in first['name']:
