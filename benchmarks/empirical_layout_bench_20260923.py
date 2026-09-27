@@ -104,7 +104,8 @@ def child(data, out, config):
                 autotune=meta.get('autotune'), shared_decode=meta.get('shared_decode'),
                 jagwas_projection=timing.get('jagwas_projection'),
                 sumstats_write={key: value for key, value in timing.items()
-                                if isinstance(value, (int, float, str, bool)) or key == 'ordering'},
+                                if isinstance(value, (int, float, str, bool)) or key in ('ordering', 'publication')},
+                numpy_hugepage_advice=meta.get('numpy_hugepage_advice'),
                 process_cpu=list(os.times()[:2]))
 
 
