@@ -541,3 +541,60 @@ def test_api_phenotype_outlier_rows_are_recorded(tmp_path, monkeypatch):
     manifest, values = rows(tmp_path / 'out')
     assert manifest['df'] == 6 and len(values) > 0
 
+
+
+@pytest.mark.parametrize('layout', [dict(device='cpu'), dict(variant_devices=['cpu:0', 'cpu:1'])])
+def test_api_groups_match_separate_scans(tmp_path, monkeypatch, layout):
+    from test_jagwas_variant_devices import fixture, rows
+    from torchgwas.api import run_linear_gwas
+    from torchgwas.sumstats_indexed import open_indexed_sumstats
+    monkeypatch.setenv('TORCHGWAS_PGEN_BACKEND', 'native')
+    monkeypatch.delenv('TORCHGWAS_JAGWAS_RCOND', raising=False)
+    path, _, y, c = fixture(tmp_path, 'pgen', missing=False)
+    y = np.asarray(y, dtype=np.float64)
+    # Column 2 is constant and removed by phenotype QC; the groups index the
+    # input panel, so group a keeps traits 0 and 1 and b stays whole.
+    a, b = y[:, :3], np.column_stack([y[:, 3:], y[:, 4]])  # b: four traits and a duplicate
+    options = dict(genotype_format='pgen', compute_dtype='float32', chunk_size=8, reader_workers=2,
+                   reduce='jagwas', sumstats_queue_depth=1, **layout)
+    with pytest.warns(UserWarning) as caught:
+        result = run_linear_gwas(path, np.column_stack([a, b]), c, output_dir=tmp_path / 'grouped',
+                                 jagwas_groups=[('a', [0, 1, 2]), ('b', [3, 4, 5, 6, 7])], **options)
+    messages = [str(w.message) for w in caught]
+    assert any('jagwas group a: 1 of 3 traits removed by phenotype QC' in m for m in messages)
+    assert any('4 of 5' in m for m in messages)
+    run_linear_gwas(path, a, c, output_dir=tmp_path / 'a', **options)
+    with pytest.warns(UserWarning):
+        run_linear_gwas(path, b, c, output_dir=tmp_path / 'b', **options)
+    manifest, parts = open_indexed_sumstats(tmp_path / 'grouped' / 'sumstats')
+    grouped = {}
+    for part in parts:
+        for variant, values in zip(part['variant_index'], np.asarray(part['chi2'])):
+            grouped[int(variant)] = values
+    assert manifest['groups'] == ['a', 'b'] and manifest['df'] == [2, 4]
+    assert result.run_metadata['jagwas_groups'] == ['a', 'b']
+    for column, (name, df) in enumerate([('a', 2), ('b', 4)]):
+        separate, alone = rows(tmp_path / name)
+        assert separate['df'] == df
+        ordered = sorted(alone)
+        np.testing.assert_allclose([grouped[i][column] for i in ordered], [alone[i] for i in ordered],
+                                   rtol=1e-5, atol=0)
+
+
+def test_groups_are_residualised_as_if_alone():
+    from torchgwas.preprocess import residualize_and_standardize
+    rng = np.random.default_rng(3)
+    phenotype = rng.normal(size=(300, 9)).astype(np.float32)
+    covariates = rng.normal(size=(300, 4))
+    grouped, _ = residualize_and_standardize(phenotype, covariates, column_groups=[[0, 1, 2], [5, 6]])
+    for columns in ([0, 1, 2], [5, 6], [3, 4, 7, 8]):  # the last: columns in no group
+        alone, _ = residualize_and_standardize(phenotype[:, columns], covariates)
+        np.testing.assert_array_equal(grouped[:, columns], alone)
+
+
+def test_api_refuses_groups_without_jagwas(tmp_path):
+    # Refused before the genotype is opened.
+    from torchgwas.api import run_linear_gwas
+    with pytest.raises(TypeError, match='jagwas_groups'):
+        run_linear_gwas('missing.pgen', np.zeros((4, 2)), reduce='significant', output_dir=tmp_path / 'bad',
+                        device='cpu', jagwas_groups={'a': [0, 1]})

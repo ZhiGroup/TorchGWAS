@@ -181,7 +181,10 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
     if live_progress is not None:
      live_progress.begin_chunk(source_span,partition)
    if kind=='jagwas':
-    values=np.asarray(chunk[3],dtype=np.float64).reshape(-1);keep=np.flatnonzero(np.isfinite(values))
+    # One column per JAGWAS group: chi2 is (rows, groups), a row kept while any group is finite.
+    values=np.asarray(chunk[3],dtype=np.float64).reshape(end-start,-1)
+    if values.shape[1]==1:values=values[:,0];keep=np.flatnonzero(np.isfinite(values))
+    else:keep=np.flatnonzero(np.isfinite(values).any(axis=1))
     if live_progress is not None:live_progress.begin_emit()
     part=add({'variant_index':start+keep,'chi2':values[keep]},start,end)
     completed(start,end,began,part,partition);continue
@@ -226,7 +229,10 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
     np.savez(handle,**{key:np.asarray(v,dtype=np.int64 if key=='position' else str) for key,v in variant_metadata.items()});handle.flush()
     if fsync:os.fsync(handle.fileno())
   publication['variant_ids_seconds']=time.perf_counter()-step
- manifest={'format':'torchgwas-indexed-sumstats','version':1,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':int((chi2_df() if callable(chi2_df) else chi2_df) if kind=='jagwas' else df),'traits':list(trait_names),'parts':parts,'rows':total,'p_value':'derived from chi2 and df' if kind=='jagwas' else 'two-sided Student t on t_stat with df'}
+ if kind=='jagwas':
+  joint_df=chi2_df() if callable(chi2_df) else chi2_df
+  joint_df=[int(value) for value in joint_df] if isinstance(joint_df,(list,tuple)) else int(joint_df)
+ manifest={'format':'torchgwas-indexed-sumstats','version':1,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':joint_df if kind=='jagwas' else int(df),'traits':list(trait_names),'parts':parts,'rows':total,'p_value':'derived from chi2 and df' if kind=='jagwas' else 'two-sided Student t on t_stat with df'}
  if embed:manifest['variant_ids']='variant_ids.npy'
  if variant_source is not None:manifest['variant_source']=dict(variant_source)
  if extra_manifest is not None:

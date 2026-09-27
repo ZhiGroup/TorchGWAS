@@ -444,8 +444,16 @@ def residualize_and_standardize(
     _prevalidated_observed_counts=None,
     _prevalidated_covariate_basis=...,
     keep_on_device: bool = False,
+    column_groups=None,
 ):
     """Centre each trait, project out the covariates, and scale to unit variance.
+
+    `column_groups` (disjoint index arrays) residualises each group by its own
+    call, exactly as a run of that group alone would; columns in no group are
+    one more call. The arithmetic per column is the same either way, but
+    reductions and GEMMs are chosen by block width and round differently, and
+    a JAGWAS rank decision on a near-collinear group can turn on that rounding
+    (jagwas_projection.JagwasGroups). The result is always NumPy.
 
     keep_on_device=True (CUDA device, complete phenotypes) returns the result
     as a tensor on `device` instead of downloading it; other paths still
@@ -476,6 +484,30 @@ def residualize_and_standardize(
     caller's own array, dropping the peak to the phenotype itself; it mutates
     the argument, so it is opt-in and the default remains the safe copy.
     """
+    if column_groups is not None:
+        if inplace:
+            raise ValueError("column_groups cannot be combined with inplace=True")
+        groups = [np.asarray(columns, dtype=np.int64).reshape(-1) for columns in column_groups]
+        uncovered = np.setdiff1d(np.arange(phenotype.shape[1]),
+                                 np.concatenate(groups) if groups else np.empty(0, np.int64))
+        prevalidated = (None if _prevalidated_observed_counts is None
+                        else np.asarray(_prevalidated_observed_counts))
+        out = group_q = None
+        counts = np.empty(phenotype.shape[1], dtype=np.int64)
+        for columns in groups + ([uncovered] if len(uncovered) else []):
+            block, group_q, block_counts = residualize_and_standardize(
+                phenotype[:, columns], covariates, device=device, trait_block=trait_block,
+                out_dtype=out_dtype, return_observed_counts=True,
+                _prevalidated_observed_counts=None if prevalidated is None else prevalidated[columns],
+                _prevalidated_covariate_basis=_prevalidated_covariate_basis)
+            block = np.asarray(block)
+            if out is None:
+                out = np.empty(phenotype.shape, dtype=block.dtype)
+            out[:, columns] = block
+            counts[columns] = block_counts
+        result = (out, group_q)
+        return (*result, counts) if return_observed_counts else result
+
     q_matrix = None
     if _prevalidated_covariate_basis is not ...:
         # Internal reuse only: the API derived this basis from the same retained

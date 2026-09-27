@@ -201,10 +201,25 @@ def jagwas_factor_memory_floor(samples, traits, *, compute_dtype='float32', meth
         scope='Necessary explicit factor-preparation tensor capacity only. Passing does not establish scan, workspace, allocator or host-memory feasibility.')
 
 
-def require_jagwas_factor_capacity(samples, traits, devices, *, compute_dtype='float32', method=None):
-    """Refuse a definitely oversized joint factor on any active CUDA device."""
+def require_jagwas_factor_capacity(samples, traits, devices, *, compute_dtype='float32', method=None,
+                                   group_sizes=None):
+    """Refuse a definitely oversized joint factor on any active CUDA device.
+
+    group_sizes (JagwasGroups): groups factor one at a time, so the floor is
+    the whole panel, the largest group's live factor matrices, and every other
+    group's retained FP64 factor (at most k x k).
+    """
     import torch
-    work=jagwas_factor_memory_floor(samples,traits,compute_dtype=compute_dtype,method=method)
+    if group_sizes:
+        sizes=[int(size) for size in group_sizes]
+        largest=max(sizes)
+        work=dict(jagwas_factor_memory_floor(samples,largest,compute_dtype=compute_dtype,method=method))
+        panel_largest=4*int(samples)*largest
+        work['explicit_live_bytes']=(4*int(samples)*int(traits)+work['explicit_live_bytes']-panel_largest
+                                     +8*(sum(size*size for size in sizes)-largest*largest))
+        work['group_sizes']=sizes
+    else:
+        work=jagwas_factor_memory_floor(samples,traits,compute_dtype=compute_dtype,method=method)
     for name in devices:
         device=torch.device(name)
         if device.type!='cuda':continue
