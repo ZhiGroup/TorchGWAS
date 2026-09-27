@@ -856,8 +856,14 @@ def run_linear_gwas(
             from .empirical_autotune import (decode_cpu_seconds_per_variant, gpu_seconds_per_variant,
                                              shard_setup_seconds)
             decode_cpu = setup = None
+            # A grouped JAGWAS job projects and factors each group alone.
+            group_sizes = None
+            if mode == 'jagwas' and jagwas_groups is not None:
+                from .jagwas_projection import JagwasGroups
+                group_sizes = [len(columns) for columns in JagwasGroups(jagwas_groups).columns]
             gpu_per_variant = gpu_seconds_per_variant(devices[0], mode=mode, n_samples=int(genotype.shape[0]),
-                                                      n_traits=int(np.shape(phenotype)[1]))
+                                                      n_traits=int(np.shape(phenotype)[1]),
+                                                      group_sizes=group_sizes)
             if len(devices) > 1:
                 setup = (float(options['shard_setup_seconds']) if options.get('shard_setup_seconds') is not None
                          else shard_setup_seconds(devices[1]))  # a GPU the job uses (at least two are kept)
@@ -872,7 +878,8 @@ def run_linear_gwas(
                     # The probe writes at most 5% of the job's own output; below
                     # 16 MB per writer it cannot resolve a rate and is skipped.
                     width = int(np.shape(phenotype)[1])
-                    job_bytes = (last - first) * (width * (8 if sumstats_fields != 't' else 4) + 4)
+                    # beta (optional), t and -log10 P per cell, one df per variant.
+                    job_bytes = (last - first) * (width * (12 if sumstats_fields != 't' else 8) + 4)
                     probe = min(256 << 20, int(0.05 * job_bytes / (1 + len(devices))))
                     if probe >= 16 << 20:
                         from .empirical_autotune import output_write_rates
@@ -892,7 +899,8 @@ def run_linear_gwas(
                                  else None),
                 decode_cpu_per_variant=decode_cpu, gpu_seconds_per_variant=gpu_per_variant,
                 shard_setup_seconds=setup, cpu_cores=cpu_detail.get('affinity'),
-                cpu_load=cpu_detail.get('load_1min'), allow_partitions=unfiltered, output_rates=output_rates)
+                cpu_load=cpu_detail.get('load_1min'), allow_partitions=unfiltered, output_rates=output_rates,
+                group_sizes=group_sizes)
             layout['cpus'] = cpu_detail
             sizes = layout.get('chunk_sizes') or sizes  # sizes whose rings do not fit are dropped
             layout['per_variant_transfer_bytes'] = per_variant

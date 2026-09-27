@@ -405,17 +405,45 @@ def measured_gemm_rate(device, dtype, size=2048, repeats=3):
     return 2.0 * size ** 3 / sorted(seconds)[len(seconds) // 2]
 
 
-def gpu_seconds_per_variant(device, *, mode, n_samples, n_traits):
+def jagwas_projection_flops(n_traits, group_sizes=None):
+    """FP64 projection FLOPs per variant: one K-wide factor, or one per JAGWAS group.
+
+    Each group projects only its own columns (jagwas_projection.JagwasGroups),
+    so a grouped job costs sum(k_g^2)-order work, not K^2: 22 groups of 100
+    traits are ~22x cheaper than one 2,200-trait panel.
+    """
+    from .jagwas_blocks import projection_flops_per_variant
+    if not group_sizes:
+        return projection_flops_per_variant(int(n_traits))
+    return sum(projection_flops_per_variant(int(size)) for size in group_sizes)
+
+
+def jagwas_factor_bytes(n_traits, group_sizes=None):
+    """FP64 factor bytes a GPU holds for JAGWAS while preparing.
+
+    One panel: correlation, factor and inverse, 3 x K x K. Groups factor one
+    at a time (reduction_tensor_work.require_jagwas_factor_capacity): the
+    largest group's three k x k matrices plus every other group's retained
+    k x k factor.
+    """
+    if not group_sizes:
+        return 3 * int(n_traits) ** 2 * 8
+    sizes = [int(size) for size in group_sizes]
+    largest = max(sizes)
+    return 3 * largest * largest * 8 + 8 * (sum(size * size for size in sizes) - largest * largest)
+
+
+def gpu_seconds_per_variant(device, *, mode, n_samples, n_traits, group_sizes=None):
     """GEMM time one GPU spends per variant: FP32 scoring, plus the FP64 projection for JAGWAS.
 
     A floor: statistics and selection kernels add to it, so CPU demand
-    derived from it errs toward fewer GPUs.
+    derived from it errs toward fewer GPUs. group_sizes (JAGWAS groups)
+    prices each group's own projection.
     """
     import torch
     seconds = 2.0 * n_samples * n_traits / measured_gemm_rate(device, torch.float32)
     if mode == 'jagwas':
-        from .jagwas_blocks import projection_flops_per_variant
-        seconds += projection_flops_per_variant(n_traits) / measured_gemm_rate(device, torch.float64)
+        seconds += jagwas_projection_flops(n_traits, group_sizes) / measured_gemm_rate(device, torch.float64)
     return seconds
 
 
@@ -634,7 +662,7 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
                 min_tile_traits=2048, max_tile_traits=32768, cpus_per_device=None, reduction_width=None,
                 allow_partitions=True, chunk_sizes=None, decode_cpu_per_variant=None,
                 gpu_seconds_per_variant=None, host_cores_per_device=0.25, shard_setup_seconds=None,
-                cpu_cores=None, cpu_load=None, output_rates=None):
+                cpu_cores=None, cpu_load=None, output_rates=None, group_sizes=None):
     """Choose GPUs and the phenotype/variant partition for one job.
 
     mode is 'full', 'significant' or 'jagwas'. Returns a dict with
@@ -662,6 +690,9 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
     Variant-shard count: with gpu_seconds_per_variant and shard_setup_seconds
     (measured), G minimizes setup*G + n_variants*gpu_seconds_per_variant/G;
     otherwise at most n_variants // (8*capacity) shards.
+
+    group_sizes (JAGWAS groups): the factor memory is priced per group
+    (jagwas_factor_bytes); the panel itself still sits whole on every GPU.
 
     output_rates (dense output, from output_write_rates): each shard writes its
     own store, so a shard serves a variant in max(GPU time, output bytes / one
@@ -773,7 +804,7 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
         from .pipeline_model import device_ring_bytes
         ring = device_ring_bytes(chunk_variants=kept[0], depth=depth, n_samples=n_samples, n_traits=n_traits,
                                  covariate_rank=covariate_rank, transfer_bytes_per_variant=transfer_bytes_per_variant)
-        if ring + 3 * n_traits * n_traits * 8 > 0.85 * device_free_bytes:
+        if ring + jagwas_factor_bytes(n_traits, group_sizes) > 0.85 * device_free_bytes:
             raise ValueError(f'the JAGWAS factor for {n_traits} traits does not fit one GPU '
                              f'({device_free_bytes/2**30:.1f} GiB free); JAGWAS needs the full panel on every GPU')
     if dropped:
@@ -882,7 +913,7 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
         device = device_ring_bytes(chunk_variants=chunk, depth=slots, n_samples=n_samples, n_traits=need,
                                    covariate_rank=covariate_rank, transfer_bytes_per_variant=transfer_bytes_per_variant)
         if mode == 'jagwas':
-            device += 3 * n_traits * n_traits * 8
+            device += jagwas_factor_bytes(n_traits, group_sizes)
         host = host_pinned_bytes(chunk_variants=chunk, depth=slots, n_traits=need,
                                  transfer_bytes_per_variant=transfer_bytes_per_variant, reduction_width=reduction_width)
         return device <= 0.85 * device_free_bytes and (not host_free_bytes or host * used <= 0.85 * host_free_bytes)

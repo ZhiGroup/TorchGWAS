@@ -529,6 +529,32 @@ def test_dense_shard_model_takes_the_slower_of_gpu_and_writer():
     assert gpu == 1.0 + 5.0  # GPU-bound: 10 s of GEMM over two shards
 
 
+def test_grouped_jagwas_is_priced_by_its_groups(monkeypatch):
+    import torchgwas.empirical_autotune as autotune
+    from torchgwas.jagwas_blocks import projection_flops_per_variant
+    groups = [1000] * 30
+    # Factor memory: the largest group live, the others' retained factors.
+    assert autotune.jagwas_factor_bytes(30_000) == 3 * 30_000 ** 2 * 8
+    assert autotune.jagwas_factor_bytes(30_000, groups) == 3 * 1000 ** 2 * 8 + 8 * 29 * 1000 ** 2
+    # A panel whose single factor cannot fit one GPU fits as 30 groups.
+    many = [f'cuda:{i}' for i in range(4)]
+    with pytest.raises(ValueError, match='JAGWAS factor'):
+        plan_layout(mode='jagwas', n_traits=30_000, devices=many, cpus=40, **dict(BASE, device_free_bytes=8*GIB))
+    plan_layout(mode='jagwas', n_traits=30_000, devices=many, cpus=40, group_sizes=groups,
+                **dict(BASE, device_free_bytes=8*GIB))
+    # GPU time: each group's projection, not one 30,000-wide one.
+    monkeypatch.setattr(autotune, 'measured_gemm_rate', lambda device, dtype: 1e12)
+    single = autotune.gpu_seconds_per_variant('cuda:0', mode='jagwas', n_samples=1000, n_traits=30_000)
+    grouped = autotune.gpu_seconds_per_variant('cuda:0', mode='jagwas', n_samples=1000, n_traits=30_000,
+                                              group_sizes=groups)
+    assert grouped == pytest.approx((2 * 1000 * 30_000 + 30 * projection_flops_per_variant(1000)) / 1e12)
+    # The FP32 scoring is the same either way. The projection is G/2 to G times
+    # cheaper: a small group is one triangular block (~2 k^2), the wide panel many (~K^2).
+    assert autotune.jagwas_projection_flops(30_000, groups) == 30 * projection_flops_per_variant(1000)
+    assert autotune.jagwas_projection_flops(30_000) / autotune.jagwas_projection_flops(30_000, groups) > 10
+    assert single / grouped > 5
+
+
 def test_output_write_rates_uses_the_real_writer_and_cleans_up(tmp_path):
     from torchgwas.empirical_autotune import output_write_rates
     rates = output_write_rates(tmp_path, n_traits=64, writers=2, probe_bytes=1 << 20, chunk_rows=256)
