@@ -1,5 +1,32 @@
 # TorchGWAS JIT autotune handoff — 2026-09-23
 
+## Update (2026-09-27): git repo, stores, selection, workspace, host pages
+
+Details are in the design doc's "Stores, selection, factor workspace and host
+pages" section.
+- **Repository.** This tree is a git repo on branch `jagwas-dev`, on top of
+  origin/main 4a3e410 (one overlay commit, then one commit per change). It
+  lacks the release's log10-p output (see the overlay message). It has not
+  been pushed.
+- **Stores are index-only.** The manifest records `variant_source` (input,
+  offset, count, ID digest), and `store_variants` maps rows back to IDs.
+  `--sumstats-variant-ids` embeds them.
+- **Device selection is the default** while the threshold is below 8/20.
+- **Indexed parts** close at 64 MiB.
+- **Grouped JAGWAS** is on this line, with the QC remap.
+- **Eigen factor workspace is priced.** Xsyevd asks for about 3·K² FP64
+  (6.46 GB at K = 16,384), which the plan now adds when the census is in the
+  profile.
+- **The selector launch model covers whole-chunk blocks.** A100 census up to
+  33.5M cells, with a saturated count grid of 4,320.
+- **The post-scan tail is explained:** NumPy hugepage faults, not fsync.
+  - On lab-h100, NUMA nodes 1-3 were full, and each large NumPy allocation
+    waited on THP compaction that failed. 8.09M IDs took 75-154 s to convert
+    against 0.46 s, and a fresh 1 GiB array 10.8-120 s against 0.4 s.
+  - `run_linear_gwas` now turns NumPy's hugepage advice off
+    (`host_pages.py`; `TORCHGWAS_NUMPY_HUGEPAGE=1` keeps it).
+  - Check `/proc/pressure/memory` before trusting host timings.
+
 ## Update (2026-09-26, late): tuner probing, pinned rings, dense multi-GPU
 
 Details are in the design doc's "Tuner probing, pinned rings and dense-output
@@ -22,12 +49,9 @@ multi-GPU" section.
   - At K=2048, one GPU takes 88-120 s (one writer) and four shards 29-45 s.
   - Under disk contention it measured the slow disk and kept one GPU.
   - Tiles and shards accept missing phenotypes (per-trait df, as on one device).
-- **Open:**
-  - Under shared-disk contention, indexed-output runs gained a 38-160 s
-    post-scan tail.
-  - Default runs already coalesce parts (262,144 rows). The likely cost is
-    publishing `variant_ids.npy` (8.09M IDs as `<U11`, ~356 MB, fsynced);
-    not yet confirmed.
+- **Open (resolved 2026-09-27):** the 38-160 s post-scan tail of
+  indexed-output runs was NumPy hugepage faults while converting the IDs
+  (see the update above), not the disk.
 
 ## Update (2026-09-26): significant pairs, per-chunk host cost fixed
 

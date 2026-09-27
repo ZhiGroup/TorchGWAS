@@ -1448,11 +1448,11 @@ their last chunk (fixed and autotuned alike).
   observer (JIT productive or calibration paths), the API coalesces 262,144
   rows per part per producer (`COALESCE_ROWS`), so a full-scale run writes a
   few dozen parts at most.
-- The likelier cost is publication after the scan: `variant_ids.npy` holds
-  all 8,086,101 IDs as fixed-width `<U11` (44 bytes each, ~356 MB), written
-  and fsynced before the manifest. The parts total ~19 MB (significant) or
-  ~130 MB (JAGWAS). Timing each publication step on a quiet and a contended
-  disk would confirm or rule this out.
+- Resolved on 2026-09-27 (see "NumPy hugepage faults" below). It was not the
+  disk. Writing and fsyncing `variant_ids.npy` (356 MB) takes 0.2 s. The time
+  went into converting the 8.09M object IDs to fixed-width unicode while
+  publishing: 75-154 s, because every large NumPy allocation faulted into
+  failed THP compaction on the host's full NUMA nodes.
 
 **Measured after the changes** (H100; `results/tuner_v3_*`, `tuner_v4_*`,
 `dense_layout_*`; executor seconds, interleaved repeats):
@@ -1490,6 +1490,162 @@ JAGWAS (K = 8,192), GPUs 4-7 without foreign processes (v4), executor seconds:
 
 Significant pairs are not reported: the post-scan tail (above) dominated
 every run in the contended windows, fixed and autotuned alike.
+
+### Stores, selection, factor workspace and host pages (2026-09-27)
+
+**Index-only stores (`variant_source.py`).** Rows already carry their
+variant: dense row i is input variant `variant_offset + i`, and indexed rows
+store `variant_index`. A streaming store therefore no longer copies the IDs
+(356 MB of `<U11` per indexed store at 8.09M variants) or the variant
+metadata. Its manifest records `variant_source` instead: genotype path,
+format, reopen options, offset, count, and a digest (sha256 over the count and
+4,097 evenly spaced IDs, milliseconds at 8M). `store_variants` resolves IDs
+and metadata through the genotype and refuses one whose list no longer matches
+the digest. `sumstats_variant_ids=True` still embeds them, and in-memory
+genotypes and in-memory results always do. The format is in
+`docs/sumstats-format.md`.
+
+**Device selection by default (`significance_backend.py`).** Host selection
+moves dense beta and t, 8 B per cell, and filters them on one core: 12.6 ms per
+1024 × 8192 chunk on the H100, against a 10.7 ms GPU chunk. Device selection
+moves 20 B per passing pair. It moves less while the passing fraction, about
+the threshold under the null, stays below 8/20, and every run now uses that
+rule. Before, only autotuned runs did. Panels with missing phenotypes still
+select on the host.
+
+**Indexed parts close by bytes.** Parts closed at 2^18 rows: 4 MB for
+JAGWAS, about 7 MB for significant pairs. They now close at 64 MiB, so the
+fsync count is total bytes / 64 MiB plus one per producer. The JIT per-chunk
+path is unchanged, because its write model counts chunks.
+
+**Grouped JAGWAS on this line.** Ported from the clump branch: one genotype
+pass for several panels (`jagwas_groups`). Each group is residualized as a run
+of it alone, and gets its own cutoff, factor, and df column. Group columns
+are remapped through phenotype QC's kept columns. On the clump branch, a
+dropped trait shifted every later group and the run failed with IndexError.
+That branch's streaming preparation did not record the kept columns, and it
+is fixed there too (c872213, not deployed). The capacity gate models one group
+factored at a time. Autotune still prices a grouped job as one panel of the
+total width.
+
+**Eigen factor workspace (`cusolver_memory.jagwas_eigen_factor_workspace`).**
+The default factor is `torch.linalg.eigh` followed by `torch.linalg.qr(mode='r')`
+on the kept rows. PyTorch 2.5.1 runs these as one cusolverDnXsyevd (vectors,
+lower) and one Xgeqrf in place on R, both with NULL params. The untimed census
+(`benchmarks/direct_jagwas_eigen_workspace_20260927.py`) queries Xsyevd per K,
+and Xgeqrf for every kept row count k in [1, K], because k is only known from
+the data. At K = 7, 512 and 2048 the caching allocator's peak exceeds outputs
+plus the queried workspace by exactly the 512 B info tensor, for both eigh and
+QR.
+
+| K | Xsyevd | Xgeqrf (max over k) | plan setup at N = 22,250 |
+|---|---|---|---|
+| 2,048 | 0.10 GB | 9.4 MB | 1.01 GB (unchanged: the residualization peak dominates) |
+| 8,192 | 1.62 GB | 34.6 MB | 4.34 → 5.96 GB |
+| 16,384 | 6.46 GB | 68.2 MB | 12.97 → 19.43 GB |
+
+- Xsyevd asks for about 3·K² FP64, three times the correlation itself. It is
+  the largest single term of the eigen factor.
+- Xgeqrf does not depend on k on the A100. On the H100 it is not monotone in k
+  at K = 16,384, though the maximum is the same, so the census keeps the
+  maximum.
+- The two workspaces are never live together, so the plan adds the larger.
+- The API's capacity gate is a necessary floor and still leaves the workspace
+  out. A census covers only its own installation and trait counts.
+
+**Selector launches above 1M cells.** Device selection runs one `nonzero` per
+chunk, but `selection_gpu_work` still refused blocks over 1M cells, the old
+strip bound. PyTorch 2.5.1's `nonzero` is one CUB count reduce and one flagged
+select at any size below INT_MAX, so the guard is now that limit. New A100
+censuses at 1024 × 2048, 1024 × 8192 and 4096 × 8192 (both harnesses take
+large extents) assign every launch once:
+
+| block | count grid | select tiles | count scratch | select scratch |
+|---|---|---|---|---|
+| old 1M strip: 256 × 4093 (scratch at 1,048,576) | 256 | 455 | 17,663 B | 4,351 B |
+| 1024 × 2048 | 512 | 911 | 17,663 B | 7,935 B |
+| 1024 × 8192 | 2,048 | 3,641 | 17,663 B | 29,695 B |
+| 4096 × 8192 | 4,320 (saturated) | 14,564 | 17,663 B | 117,247 B |
+
+The count grid is the lesser of ⌈cells / 4096⌉ and CUB's occupancy bound, 108
+SMs × 8 × 5 = 4,320. Count scratch is sized for that bound, and select scratch
+is (tiles + 32) × 8 B.
+
+**NumPy hugepage faults (`host_pages.py`).** NumPy madvises MADV_HUGEPAGE on
+arrays of 4 MB or more. With THP defrag set to `madvise`, a fault in such a
+region compacts memory synchronously. On lab-h100, NUMA nodes 1-3 were full
+of page cache (0-2 GB free; node 0 had 166 GB). The kernel had counted 811M
+compaction stalls, 98% of them failed, and memory PSI sat at about 70%.
+
+| operation | advice on | advice off |
+|---|---|---|
+| 8.09M object IDs → `<U9` | 75-154 s | 0.42-0.46 s |
+| fresh 356 MB array, touched | 19.5-33.4 s | 0.11 s |
+| fresh 1 GiB array, touched (node 0 CPUs) | 10.8-120 s | 0.36-0.45 s |
+| streaming add, resident 3 × 1 GiB | 16.7-17.9 GB/s | 10.9-15.5 GB/s |
+
+- Resident hugepages gain at most about 1.6x on streaming, and nothing on
+  random gathers.
+- A run allocates host arrays per chunk, part and publication, so the fault
+  cost dominates.
+- `run_linear_gwas` now turns the advice off for its duration and restores
+  it on return or failure. It is reentrant and counted across threads, and the
+  run metadata records the state. `TORCHGWAS_NUMPY_HUGEPAGE=1` keeps NumPy's
+  setting.
+- PyTorch's CPU allocator does not madvise hugepages by default, and pinned
+  buffers are not THP-backed.
+- Earlier host timings on this machine carry this cost in any large NumPy
+  allocation: benchmark harnesses and CPU reference checks as well as
+  torchGWAS.
+
+**Measured after the changes** (`results/rerun_20260927/`, H100 GPUs 4-7,
+from the snapshot). Outputs went to tmpfs, except dense K = 2,048, which went
+to `/data`. Executor seconds, fresh interleaved processes, two repeats.
+Conditions: load 9-16 on 48 cores, another user's job on GPU 3, and memory
+PSI back at 50-70% (it had eased to 3% at the start). Every output was
+checked: max |Δt| ≤ 9.8e-6 on sampled rows across layouts, the same NaN
+pattern, and the same row counts (JAGWAS 8,086,101; significant 663,646).
+
+| job | fixed | auto, one chunk size | autotune |
+|---|---|---|---|
+| significant pairs (fixed 4 shards) | 26.6, 21.6 | 23.2, 31.8 | 27.3, 25.7 (4096, 0 re-probes) |
+| JAGWAS K = 8,192 (fixed 4 shards) | 27.0, 28.8 | 50.1*, 31.7 | 53.3*, 29.1 (4096, 0 re-probes) |
+| dense K = 512, tmpfs (1 GPU; 4 shards) | 16.1, 15.3; 17.3, 33.0* | — | 15.9, 53.3* (2 shards) |
+| dense K = 512, 2% missing | 15.8; 12.6 | — | 20.1 (2 shards) |
+| dense K = 2,048, `/data` (1 GPU; 4 shards) | 402.8, 476.6; 27.0, 125.5 | — | 36.2, 92.5 (2 shards) |
+
+- **No post-scan tail.** Significant and JAGWAS runs end within a second of
+  their last chunk. Publication takes milliseconds, and embedding the IDs adds
+  0.4-1.1 s. This held under memory pressure too, which is where the 38-160 s
+  tails had appeared.
+- **The tail A/B could not reproduce the fault.** It ran while PSI had eased to
+  about 3%, so turning the advice on cost only 0.4-1.1 s (22-37 s runs, noise
+  of the same size). The evidence for the cause remains the microbenchmarks
+  above, which were taken under pressure.
+- **Starred runs fell in slow host windows.** The JAGWAS pair ran back to back
+  at 01:08-01:10. The autotuned run decided at 9.4% of the job, measuring 95k
+  rows/s per GPU (the same as in the fast runs) and forecasting a 43 s job;
+  throughput then fell after the decision. The dense pair each started after a
+  ~70 s gap in which a 33 GB tmpfs output was freed and four CUDA contexts
+  closed. With nodes 1-3 full, tmpfs output and pinned rings reclaim page cache
+  as they allocate.
+- **The disk was 3-4x slower for one writer than on 09-26** (403-477 s against
+  88-120 s). Autotune never chose one GPU. It took 2 shards (36 and 93 s), and
+  fixed 4 shards ran 27 and 126 s.
+
+Significant pairs on the loaded A100 (`results/rerun_20260927_a100/`; GPUs 1,
+2, 6 and 7; load 82-86 on 96 cores; other users' jobs at 100% on GPUs 4-5):
+
+| fixed 4 shards | auto, chunk 1024 | autotune |
+|---|---|---|
+| 180.4, 146.3 | 193.2, 189.7 | 149.0 (3 re-probes, ends at 2048), 126.2 (4096) |
+
+Under load, larger chunks win, and probing is what finds them. Measured per
+GPU in the tuner's decisions: 9.8-33.7k rows/s at 1024, 13.5-33.6k at 2048,
+27.6-35.1k at 4096. The A100 runs return
+663,642 pairs, except the one at chunk 4096, which returns 663,646 like every
+H100 run. Four pairs lie at the p = 1e-5 boundary, where FP32 rounding differs
+by GPU and GEMM shape.
 
 ### GIL and process start
 
