@@ -104,6 +104,15 @@ class CliSurfaceTestCase(unittest.TestCase):
                         ["linear", "--genotype", "g", "--phenotype", "p",
                          "--output-dir", "o", "--reduce", mode])
 
+    def test_cli_does_not_offer_topk_per_trait(self):
+        from torchgwas.cli import _build_parser
+
+        with self.assertRaises(SystemExit):
+            _build_parser().parse_args(
+                ["linear", "--genotype", "g", "--phenotype", "p",
+                 "--output-dir", "o", "--topk-per-trait", "5"]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

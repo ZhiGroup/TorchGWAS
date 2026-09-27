@@ -482,3 +482,16 @@ def test_sumstats_format_none_writes_no_table(tmp_path):
     assert run_metadata["sumstats_format"] == "none"
 
 
+def test_threshold_selector_uses_indexed_binary(tmp_path):
+    from torchgwas.api import run_linear_gwas
+    from binary_helpers import binary_rows
+    genotype, phenotype, covariates = _toy_linear_inputs()
+    run_linear_gwas(
+        genotype,
+        phenotype,
+        covariates=covariates,
+        device="cpu",
+        output_dir=tmp_path,
+        p_value_threshold=1.0,
+    )
+    assert len(binary_rows(tmp_path)) == (genotype.shape[1] - 1) * phenotype.shape[1]
