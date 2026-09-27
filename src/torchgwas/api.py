@@ -727,10 +727,10 @@ def run_linear_gwas(
         if reduce != 'jagwas':
             trait_block = autotuner.qc_trait_block
     resolved_device = choose_device(autotuner.devices[0] if autotuner else variant_devices[0] if variant_devices else device)
-    # Dense binary output stores -log10 P computed on each scan device
-    # (tails.neg_log10_p_device); compiling it for a GPU takes seconds, so it
-    # starts here and overlaps input loading and preparation.
-    if (output_dir is not None and sumstats_format == "binary" and reduce is None
+    # Dense binary output and min-p store -log10 P computed on each scan
+    # device (tails.neg_log10_p_device); loading or compiling it for a GPU
+    # takes seconds, so it starts here and overlaps input loading.
+    if (output_dir is not None and sumstats_format == "binary" and reduce in (None, "min-p")
             and significance_threshold is None and p_value_threshold is None
             and _internal_reduction is None):
         from .tails import prepare_device_tail_async

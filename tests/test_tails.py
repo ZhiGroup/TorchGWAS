@@ -204,6 +204,25 @@ class ScanDeviceTailTestCase(unittest.TestCase):
         fast = tails._evaluate(compiled, t, df, starts)
         slow = tails._evaluate(tails._eager_stages(), t, df, starts)
         np.testing.assert_allclose(fast.cpu().numpy(), slow.cpu().numpy(), rtol=1e-10, atol=1e-10)
+        # The ahead-of-time build's one-graph form, when this device has one.
+        whole = tails._WHOLE.get(device)
+        if whole is not None:
+            np.testing.assert_allclose(tails._evaluate(whole, t, df, starts).cpu().numpy(),
+                                       slow.cpu().numpy(), rtol=1e-10, atol=1e-10)
+            self.assertEqual(set(tails._FORM_COSTS[device]), {"blocks", "whole"})
+
+    def test_the_form_follows_host_and_gpu_cost_per_strip(self):
+        from torchgwas import tails
+
+        key = object()
+        # H100-like: whole 0.085 ms a call and 0.83 ns a cell, blocks 0.46 ms and 0.39 ns.
+        tails._FORM_COSTS[key] = dict(whole=(8.5e-5, 8.3e-10), blocks=(4.6e-4, 3.9e-10))
+        try:
+            self.assertEqual(tails._choose_form(key, 4096), "whole")         # min-p winners
+            self.assertEqual(tails._choose_form(key, 8_388_608), "blocks")   # a 1024 x 8192 strip
+            self.assertEqual(tails._choose_form(object(), 4096), "blocks")   # nothing measured
+        finally:
+            del tails._FORM_COSTS[key]
 
     @unittest.skipUnless(__import__("torch").cuda.is_available(), "CUDA required")
     def test_preparing_keeps_this_threads_subnormals(self):
