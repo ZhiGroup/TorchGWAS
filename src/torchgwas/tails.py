@@ -259,6 +259,10 @@ DEVICE_TAIL_TRANSIENT_BYTES_PER_CELL = 96
 _STAGES = {}
 _KINDS = {}  # device -> 'aoti' (ahead-of-time build), 'jit' (torch.compile) or 'eager'
 _STAGE_LOCK = None
+# The AOT build's second form (_tail_whole), and each form's measured
+# (host seconds per call, GPU seconds per cell) on that device (_form_costs).
+_WHOLE = {}
+_FORM_COSTS = {}
 
 
 def _guard(value):
@@ -313,6 +317,25 @@ def _tail_epilogue(df, x, y, reflect, h):
     return -torch.where(reflect, log_reflect, log_direct) / _LN10
 
 
+def _tail_whole(t, df):
+    """Prologue, every block and the epilogue in one graph (the AOT build's second form).
+
+    One host call per strip instead of 12, but slower on the GPU: Inductor
+    fuses the 40 iterations with recomputation, 0.82-0.85 ns per cell
+    against 0.36-0.42 for the blocks, which store (c, d, h) every four
+    iterations (H100; the best fusion setting tried, realize_opcount_threshold
+    8, reached 0.56; benchmarks/tail_graph_forms_20260927.py and
+    tail_whole_build_options_20260927.py). Host time matters because a call
+    holds the GIL while it launches: with the blocks, a (4096, 1) tail took
+    0.59 ms on one GPU and 2.89 ms per call on each of four
+    (tail_thread_scaling_20260927.py). _choose_form weighs the two.
+    """
+    first, second, argument, c, d, h, x, y, reflect = _tail_prologue(t, df)
+    for start in range(1, _TORCH_ITERATIONS + 1, DEVICE_TAIL_BLOCK):
+        c, d, h = _tail_block(first, second, argument, c, d, h, float(start))
+    return _tail_epilogue(df, x, y, reflect, h)
+
+
 def _eager_stages():
     return (_tail_prologue, _tail_block, _tail_epilogue)
 
@@ -325,11 +348,59 @@ def _starts(device):
 
 
 def _evaluate(stages, t, df, starts):
+    if callable(stages):  # the whole tail as one graph (_tail_whole)
+        return stages(t, df)
     prologue, block, epilogue = stages
     first, second, argument, c, d, h, x, y, reflect = prologue(t, df)
     for start in starts:
         c, d, h = block(first, second, argument, c, d, h, start)
     return epilogue(df, x, y, reflect, h)
+
+
+def _form_costs(device, blocks, whole, starts):
+    """(host seconds per call, GPU seconds per cell) of each form, timed on `device`.
+
+    Host time from a (2048, 2) call, whose GPU work is negligible; GPU time
+    from a (512, 8192) strip, where it dominates (the host side overlaps).
+    About 30 ms per device, once.
+    """
+    import time
+
+    import torch
+
+    costs = {}
+    for name, stages in (('blocks', blocks), ('whole', whole)):
+        seconds = []
+        for shape, calls in (((2048, 2), 5), ((512, 8192), 3)):
+            t = torch.full(shape, 3.0, dtype=torch.float64, device=device)
+            df = torch.full(shape, 22_238.0, dtype=torch.float64, device=device)
+            _evaluate(stages, t, df, starts)
+            torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            for _ in range(calls):
+                _evaluate(stages, t, df, starts)
+            torch.cuda.synchronize(device)
+            seconds.append((time.perf_counter() - started) / calls)
+        costs[name] = (seconds[0], seconds[1] / (512 * 8192))
+    return costs
+
+
+def _choose_form(device, cells):
+    """'whole' or 'blocks' for a strip of `cells` on `device`, by measured cost.
+
+    A strip holds the GIL for its host time, and every CUDA device with a
+    tail in this process (a shard thread each) needs the same GIL, while its
+    GPU time is its own device's. The chosen form minimizes host seconds
+    times those devices plus GPU seconds per cell times `cells`: min-p's
+    winner column is host-bound (whole), a dense strip GPU-bound (blocks on
+    one GPU, the whole graph from about 3.4M cells down on four).
+    """
+    costs = _FORM_COSTS.get(device)
+    if costs is None:
+        return 'blocks'
+    sharing = max(1, sum(1 for key in _STAGES if getattr(key, 'type', None) == 'cuda'))
+    price = {name: host * sharing + per_cell * cells for name, (host, per_cell) in costs.items()}
+    return min(price, key=price.get)
 
 
 def prepare_device_tail(device):
@@ -357,20 +428,29 @@ def prepare_device_tail(device):
         # TORCHGWAS_COMPILE_TAILS: 0 eager only, jit skips the ahead-of-time build.
         mode = os.environ.get('TORCHGWAS_COMPILE_TAILS', '1')
         if device.type == 'cuda' and mode != '0':
+            whole = None
             try:
-                compiled = _load_aoti(device) if mode != 'jit' else None
-                kind = 'aoti' if compiled is not None else 'jit'
-                compiled = compiled or tuple(torch.compile(stage, dynamic=True) for stage in _eager_stages())
+                loaded = _load_aoti(device) if mode != 'jit' else None
+                kind = 'aoti' if loaded is not None else 'jit'
+                compiled, whole = loaded or (tuple(torch.compile(stage, dynamic=True) for stage in _eager_stages()),
+                                             None)
                 starts = _starts(device)
                 with torch.cuda.device(device):
                     probe = torch.linspace(0.0, 40.0, 64 * 3, device=device, dtype=torch.float64).reshape(64, 3)
                     probe_df = torch.full((64, 3), 30.0, device=device, dtype=torch.float64)
-                    fast = _evaluate(compiled, probe, probe_df, starts)
                     slow = _evaluate(_eager_stages(), probe, probe_df, starts)
+                    fast = _evaluate(compiled, probe, probe_df, starts)
                     if not bool(torch.allclose(fast, slow, rtol=1e-10, atol=1e-10)):
-                        compiled, kind = None, 'eager'
+                        compiled, whole, kind = None, None, 'eager'
+                    if whole is not None and not bool(torch.allclose(_evaluate(whole, probe, probe_df, starts), slow,
+                                                                     rtol=1e-10, atol=1e-10)):
+                        whole = None
+                    if whole is not None:
+                        _FORM_COSTS[device] = _form_costs(device, compiled, whole, starts)
             except Exception:  # noqa: BLE001 - no compiler, no Triton: the eager stages are exact too
-                compiled, kind = None, 'eager'
+                compiled, whole, kind = None, None, 'eager'
+            if whole is not None:
+                _WHOLE[device] = whole
         _STAGES[device] = (compiled, _starts(device))
         _KINDS[device] = kind
         return compiled is not None
@@ -401,6 +481,10 @@ def neg_log10_p_device(t, df, *, out=None, max_cells=DEVICE_TAIL_MAX_CELLS):
     step = max(1, int(max_cells) // max(1, traits))
 
     aot = _KINDS.get(device) == 'aoti'
+    whole = _WHOLE.get(device)
+
+    def form(cells):
+        return whole if whole is not None and _choose_form(device, cells) == 'whole' else stages
 
     def run():
         for first in range(0, rows, step):
@@ -422,14 +506,14 @@ def neg_log10_p_device(t, df, *, out=None, max_cells=DEVICE_TAIL_MAX_CELLS):
                 flat_df = strip_df.double().expand(strip_t.shape).reshape(-1).contiguous()
                 if cells % 2:
                     flat_t, flat_df = torch.cat((flat_t, flat_t[-1:])), torch.cat((flat_df, flat_df[-1:]))
-                values = _evaluate(stages, flat_t.view(-1, 2), flat_df.view(-1, 2), starts)
+                values = _evaluate(form(cells), flat_t.view(-1, 2), flat_df.view(-1, 2), starts)
                 result[first:last] = values.reshape(-1)[:cells].view(strip_t.shape)
                 continue
             if aot:
                 # The build takes FP64 (rows, traits) of at least 2 x 2.
                 strip_t = strip_t.double().contiguous()
                 strip_df = strip_df.double().expand(strip_t.shape).contiguous()
-            result[first:last] = _evaluate(stages, strip_t, strip_df, starts)
+            result[first:last] = _evaluate(form(strip_t.numel()), strip_t, strip_df, starts)
 
     if compiled is None:
         run()
@@ -493,7 +577,7 @@ def _stage_source_key(capability):
     import torch
 
     source = ''.join(inspect.getsource(stage) for stage in
-                     (_guard, _tail_prologue, _tail_block, _tail_epilogue))
+                     (_guard, _tail_prologue, _tail_block, _tail_epilogue, _tail_whole))
     text = '|'.join((torch.__version__, str(torch.version.cuda), f'sm{capability[0]}{capability[1]}',
                      str(DEVICE_TAIL_BLOCK), source))
     return hashlib.sha256(text.encode()).hexdigest()[:24]
@@ -506,7 +590,11 @@ def device_tail_directory(capability):
 
 
 def build_device_tail(device='cuda'):
-    """Export the three stages with AOTInductor for `device`'s architecture."""
+    """Export both forms of the tail with AOTInductor for `device`'s architecture.
+
+    The three block stages (prologue, block, epilogue) and the one-graph
+    whole tail; neg_log10_p_device picks per strip (_choose_form).
+    """
     import json
 
     import torch
@@ -531,6 +619,10 @@ def build_device_tail(device='cuda'):
         def forward(self, df, x, y, reflect, h):
             return _tail_epilogue(df, x, y, reflect, h)
 
+    class Whole(torch.nn.Module):
+        def forward(self, t, df):
+            return _tail_whole(t, df)
+
     t = torch.linspace(0.0, 40.0, 64 * 33, dtype=torch.float64, device=device).reshape(64, 33)
     df = torch.full_like(t, 30.0)
     first, second, argument, c, d, h, x, y, reflect = _tail_prologue(t, df)
@@ -539,6 +631,7 @@ def build_device_tail(device='cuda'):
         'prologue': (Prologue(), (t, df), (matrix, matrix)),
         'block': (Block(), (first, second, argument, c, d, h, start), (matrix,) * 6 + (None,)),
         'epilogue': (Epilogue(), (df, x, y, reflect, h), (matrix,) * 5),
+        'whole': (Whole(), (t, df), (matrix, matrix)),
     }
     for name, (module, args, shapes) in exported.items():
         torch._export.aot_compile(module, args, dynamic_shapes=shapes,
@@ -571,18 +664,22 @@ def _load_aoti(device):
     # Inductor links its wrapper with -ffast-math, and loading such a library
     # (crtfastmath) switches the loading thread to flush subnormals to zero,
     # which would change NumPy results on that thread. Restore the mode.
+    names = ('prologue', 'block', 'epilogue', 'whole')
+    if manifest.get('files') != [f'{name}.so' for name in names]:
+        return None
     kept = _keeps_subnormals()
-    pro, blk, epi = [torch._export.aot_load(str(directory / f'{name}.so'), device=str(device))
-                     for name in ('prologue', 'block', 'epilogue')]
+    pro, blk, epi, whole = [torch._export.aot_load(str(directory / f'{name}.so'), device=str(device))
+                            for name in names]
     if kept and not _keeps_subnormals():
         torch.set_flush_denormal(False)
 
-    def epilogue(*args):
+    def single(graph):
         # A single-output graph returns its tensor, not a list (indexing it
         # would take the first row).
-        value = epi(*args)
-        return value[0] if isinstance(value, (list, tuple)) else value
+        def call(*args):
+            value = graph(*args)
+            return value[0] if isinstance(value, (list, tuple)) else value
+        return call
 
-    return (lambda t, df: tuple(pro(t, df)),
-            lambda *args: tuple(blk(*args)),
-            epilogue)
+    return ((lambda t, df: tuple(pro(t, df)), lambda *args: tuple(blk(*args)), single(epi)),
+            single(whole))
