@@ -19,10 +19,55 @@ def _phenotype_column_mask(phenotype: np.ndarray) -> tuple[np.ndarray, np.ndarra
     counts = observed.sum(axis=0).astype(np.int64)
     safe_counts = np.maximum(counts, 1)
     means = np.where(observed, phenotype, 0).sum(axis=0) / safe_counts
-    centered = np.where(observed, phenotype - means[None, :], 0)
-    sum_squares = np.sum(centered * centered, axis=0)
+    centered = phenotype - means[None, :]
+    np.copyto(centered, 0, where=~observed)
+    np.square(centered, out=centered)
+    sum_squares = np.sum(centered, axis=0)
     keep = (counts > 1) & np.isfinite(sum_squares) & (sum_squares > 0)
     return keep, counts
+
+
+def _phenotype_column_mask_device(block, device):
+    """_phenotype_column_mask plus the missing-cell count, on a CUDA device.
+
+    Same decisions as the NumPy version: sums in float64, two-pass centred
+    sum of squares, so a constant column is exactly zero either way.
+    """
+    import torch
+    import warnings
+    with warnings.catch_warnings():
+        # A read-only memory map is fine: the block is only read, on its way to the GPU.
+        warnings.filterwarnings('ignore', message='The given NumPy array is not writable')
+        values = torch.as_tensor(np.ascontiguousarray(block), device=device)
+    if torch.isinf(values).any():
+        raise ValueError("phenotype contains infinite values")
+    observed = ~torch.isnan(values)
+    counts = observed.sum(dim=0)
+    filled = torch.where(observed, values, torch.zeros((), dtype=values.dtype, device=values.device)).double()
+    means = filled.sum(dim=0) / counts.clamp(min=1)
+    filled.sub_(means).mul_(observed)
+    sum_squares = (filled * filled).sum(dim=0)
+    keep = (counts > 1) & torch.isfinite(sum_squares) & (sum_squares > 0)
+    missing = int(observed.numel() - int(counts.sum()))
+    return keep.cpu().numpy(), counts.cpu().numpy().astype(np.int64), missing
+
+
+def _phenotype_qc(phenotype, *, dtype, device, block_bytes=512 << 20):
+    """Keep mask, observed counts and missing cells over column blocks on `device`.
+
+    Blocks are sized by bytes, not columns, so a million samples still fit.
+    """
+    n, k = phenotype.shape
+    width = max(1, int(block_bytes // max(1, n * 4)))
+    keep = np.empty(k, dtype=bool)
+    counts = np.empty(k, dtype=np.int64)
+    missing = 0
+    for start in range(0, k, width):
+        end = min(start + width, k)
+        block = np.asarray(phenotype[:, start:end], dtype=dtype)
+        keep[start:end], counts[start:end], cells = _phenotype_column_mask_device(block, device)
+        missing += cells
+    return keep, counts, missing
 
 
 def prepare_inputs(
@@ -79,6 +124,26 @@ def prepare_inputs(
     return genotype, phenotype, covariates, qc
 
 
+class PhenotypeColumnView:
+    """Column selection without materializing a filtered whole phenotype panel."""
+    def __init__(self,values,columns):
+        self.values=values
+        self.columns=np.asarray(columns,dtype=np.int64)
+        self.shape=(values.shape[0],len(self.columns))
+        self.ndim=2
+        self.dtype=values.dtype
+
+    def __getitem__(self,key):
+        rows,columns=key
+        selected=self.columns[columns]
+        return self.values[rows][...,selected]
+
+    def __array__(self,dtype=None,copy=None):
+        if copy is False:
+            raise ValueError('Filtered phenotype columns require a copy')
+        return np.asarray(self.values[:,self.columns],dtype=dtype)
+
+
 def prepare_inputs_for_prep(
     genotype,
     phenotype: np.ndarray,
@@ -86,6 +151,8 @@ def prepare_inputs_for_prep(
     genotype_chunk_size: int | None = None,
     validate_genotype: bool = True,
     dtype=np.float64,
+    phenotype_block_size: int | None = None,
+    qc_device=None,
 ) -> tuple[np.ndarray, np.ndarray | None, dict]:
     """Validate and QC the inputs the out-of-core scan will stream against.
 
@@ -102,10 +169,27 @@ def prepare_inputs_for_prep(
         raise ValueError(f"genotype must be 2D, got {getattr(genotype, 'shape', None)}")
     # `asarray` is a no-op when the caller already holds this dtype, which
     # is the point: at voxel scale that copy is the whole problem.
-    phenotype = ensure_2d(np.asarray(phenotype, dtype=dtype), "phenotype")
+    if phenotype_block_size is not None and (isinstance(phenotype_block_size,bool) or not isinstance(phenotype_block_size,int) or phenotype_block_size<1):
+        raise ValueError('phenotype_block_size must be a positive integer')
+    phenotype = ensure_2d(np.asarray(phenotype, dtype=dtype if phenotype_block_size is None else None), "phenotype")
     covariates = None if covariates is None else ensure_2d(np.asarray(covariates, dtype=dtype), "covariates")
 
-    pheno_mask, phenotype_observed_counts = _phenotype_column_mask(phenotype)
+    if qc_device is not None:
+        # Column QC on the scan GPU (bounded blocks), not one CPU core.
+        pheno_mask, phenotype_observed_counts, phenotype_missing_cells = _phenotype_qc(
+            phenotype, dtype=dtype, device=qc_device)
+    elif phenotype_block_size is None:
+        pheno_mask, phenotype_observed_counts = _phenotype_column_mask(phenotype)
+        phenotype_missing_cells=int(np.isnan(phenotype).sum())
+    else:
+        pheno_mask=np.empty(phenotype.shape[1],dtype=bool)
+        phenotype_observed_counts=np.empty(phenotype.shape[1],dtype=np.int64)
+        phenotype_missing_cells=0
+        for start in range(0,phenotype.shape[1],phenotype_block_size):
+            end=min(start+phenotype_block_size,phenotype.shape[1])
+            block=np.asarray(phenotype[:,start:end],dtype=dtype)
+            pheno_mask[start:end],phenotype_observed_counts[start:end]=_phenotype_column_mask(block)
+            phenotype_missing_cells+=int(np.isnan(block).sum())
     if covariates is not None:
         validate_no_missing(covariates, "covariates")
         check_aligned_rows(("genotype", genotype), ("phenotype", phenotype), ("covariates", covariates))
@@ -151,12 +235,14 @@ def prepare_inputs_for_prep(
         "n_samples": int(genotype.shape[0]),
         "genotype_qc_mode": genotype_qc_mode,
         "genotype_qc_chunk_size": int(effective_chunk_size),
-        "phenotype_missing_cells": int(np.isnan(phenotype).sum()),
+        "phenotype_missing_cells": phenotype_missing_cells,
         "phenotype_observed_counts": phenotype_observed_counts[pheno_mask].tolist(),
     }
 
     if not pheno_mask.all():
-        phenotype = phenotype[:, pheno_mask]
+        qc['phenotype_kept_column_indices']=np.flatnonzero(pheno_mask).tolist()
+        phenotype = (phenotype[:, pheno_mask] if phenotype_block_size is None else
+                     PhenotypeColumnView(phenotype,np.flatnonzero(pheno_mask)))
     if phenotype.shape[1] == 0:
         raise ValueError("all phenotype columns were dropped due to zero variance")
     return phenotype, covariates, qc
@@ -258,7 +344,7 @@ def _device_trait_block(n_samples: int, itemsize: int, device,
     per_trait = 3.0 * max(n_samples, 1) * max(itemsize, 1)
     return max(int(budget_bytes // per_trait), 1)
 
-def _residualize_on_device(phenotype, q_matrix, device):
+def _residualize_on_device(phenotype, q_matrix, device, keep_on_device=False):
     """The projection and standardisation, on the GPU, in trait blocks.
 
     Same operations in the same order as the numpy path below, including
@@ -304,7 +390,16 @@ def _residualize_on_device(phenotype, q_matrix, device):
     # One output array, written block by block. Accumulating blocks in a list
     # and concatenating would hold two full copies at the join, which is the
     # allocation this change exists to avoid.
-    result = np.empty((n_samples, n_traits), dtype=out_dtype)
+    single_block = 0 < n_traits <= block
+    # A completed CPU download already owns independent, writable storage.
+    # Its NumPy view retains that CPU tensor; a second whole-tile allocation
+    # and copy adds first-touch/page-release work without changing any value.
+    if keep_on_device:
+        # Callers that fan the panel out to other GPUs keep it here.
+        result = torch.empty((n_samples, n_traits), dtype=torch_dtype, device=device)
+        single_block = False
+    else:
+        result = None if single_block else np.empty((n_samples, n_traits), dtype=out_dtype)
     for begin in range(0, n_traits, block):
         stop = min(begin + block, n_traits)
         values = torch.as_tensor(
@@ -317,7 +412,15 @@ def _residualize_on_device(phenotype, q_matrix, device):
         deviation = torch.where(deviation == 0, torch.ones_like(deviation),
                                 deviation)
         values /= deviation
-        result[:, begin:stop] = values.cpu().numpy()
+        if keep_on_device:
+            result[:, begin:stop].copy_(values)
+            del values
+            continue
+        downloaded = values.cpu().numpy()
+        if single_block:
+            return downloaded
+        result[:, begin:stop] = downloaded
+        del downloaded
         del values
     return result
 
@@ -338,8 +441,15 @@ def residualize_and_standardize(
     trait_block: int = RESIDUALIZE_TRAIT_BLOCK,
     out_dtype=None,
     return_observed_counts: bool = False,
+    _prevalidated_observed_counts=None,
+    _prevalidated_covariate_basis=...,
+    keep_on_device: bool = False,
 ):
     """Centre each trait, project out the covariates, and scale to unit variance.
+
+    keep_on_device=True (CUDA device, complete phenotypes) returns the result
+    as a tensor on `device` instead of downloading it; other paths still
+    return NumPy.
 
     `device` is optional and advisory: pass a CUDA device to run the projection
     there. The numpy path stays the reference implementation and the two are
@@ -367,18 +477,40 @@ def residualize_and_standardize(
     the argument, so it is opt-in and the default remains the safe copy.
     """
     q_matrix = None
-    if covariates is not None and covariates.shape[1] > 0:
+    if _prevalidated_covariate_basis is not ...:
+        # Internal reuse only: the API derived this basis from the same retained
+        # covariates to determine rank/df before starting its tile/shard workers.
+        # None deliberately means a validated zero-rank basis, not "recompute".
+        q_matrix = _prevalidated_covariate_basis
+        if q_matrix is not None:
+            q_matrix=np.asarray(q_matrix)
+            columns=0 if covariates is None else covariates.shape[1]
+            if (q_matrix.ndim!=2 or q_matrix.shape[0]!=phenotype.shape[0]
+                or not 0<q_matrix.shape[1]<=columns):
+                raise ValueError('Prevalidated covariate basis must match the retained sample/column dimensions')
+    elif covariates is not None and covariates.shape[1] > 0:
         q_matrix = _covariate_basis(covariates)
 
-    phenotype_observed_counts = np.sum(~np.isnan(phenotype), axis=0).astype(np.int64)
+    if _prevalidated_observed_counts is None:
+        phenotype_observed_counts = np.sum(~np.isnan(phenotype), axis=0).astype(np.int64)
+    else:
+        # Internal reuse of QC for this unchanged input, including its retained
+        # column order. Callers without that provenance must use the default.
+        counts = np.asarray(_prevalidated_observed_counts)
+        if (phenotype.ndim != 2 or counts.shape != (phenotype.shape[1],)
+                or counts.dtype.kind not in 'iu'
+                or np.any(counts < 0) or np.any(counts > phenotype.shape[0])):
+            raise ValueError('Prevalidated observed counts must match the phenotype columns and sample range')
+        phenotype_observed_counts = counts.astype(np.int64, copy=False)
     if np.any(phenotype_observed_counts == 0):
         raise ValueError("phenotype contains an entirely missing trait")
-    has_missing = bool(np.isnan(phenotype).any())
+    has_missing = bool(np.any(phenotype_observed_counts != phenotype.shape[0]))
 
     if (not has_missing and device is not None
             and getattr(device, "type", None) == "cuda"):
         try:
-            processed = _residualize_on_device(phenotype, q_matrix, device)
+            processed = (_residualize_on_device(phenotype, q_matrix, device, keep_on_device=True) if keep_on_device
+                         else _residualize_on_device(phenotype, q_matrix, device))
             result = (processed, q_matrix)
             return (*result, phenotype_observed_counts) if return_observed_counts else result
         except (RuntimeError, ImportError):
@@ -441,3 +573,29 @@ def standardize_genotype(genotype_chunk: np.ndarray) -> np.ndarray:
     std = centered.std(axis=0, keepdims=True)
     std[std == 0] = 1.0
     return centered / std
+
+
+def mask_phenotype_outliers(phenotype, covariates, threshold, *, whole_rows):
+    """Set phenotype values beyond `threshold` SD of their covariate-residualised,
+    standardised trait to missing; return the masked FP64 copy and the affected rows.
+
+    whole_rows (JAGWAS): a sample with any such value loses its whole panel row.
+    On near-collinear imaging panels a few samples, extreme in many traits at
+    once, made the low-variance directions heavy-tailed; masking or clipping
+    only their extreme values broke the traits' linear relations for those
+    samples and made those directions heavier-tailed still, while dropping the
+    row made them Gaussian. A per-trait scan masks just the value. The missing
+    values then take the ordinary phenotype-missingness path.
+    """
+    if not (threshold > 0 and np.isfinite(threshold)):
+        raise ValueError("phenotype_outlier_sd must be a positive number")
+    values = np.array(phenotype, dtype=np.float64)
+    standardized, _ = residualize_and_standardize(values, covariates)
+    extreme = np.abs(standardized) > threshold
+    rows = extreme.any(axis=1)
+    if whole_rows:
+        values[rows] = np.nan
+    else:
+        values[extreme] = np.nan
+    return values, rows
+

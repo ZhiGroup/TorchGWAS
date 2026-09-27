@@ -92,3 +92,4 @@ def predict_runtime_from_hardware(*, n_variants, n_samples, n_traits, covariate_
                   gpu_count=gpu_count, decode_threads=decode_threads)
     result['assumptions'].append('Legacy frequency/efficiency scaling is caller-supplied and unverified; prefer independently sustained rates.')
     return result
+

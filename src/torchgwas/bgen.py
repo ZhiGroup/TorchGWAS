@@ -917,11 +917,18 @@ class BgenGenotype:
         return self.backend_used
 
     def iter_device_chunks(self,chunk_size,device,reader_workers=None,prefetch_chunks=None,
-                           variant_range=None):
+                           variant_range=None,chunk_size_selector=None):
+        """Decode large tiles on the GPU and cut them into scan chunks.
+
+        chunk_size is the ring capacity. With chunk_size_selector, each cut
+        asks the selector for its size, so the empirical tuner can change the
+        chunk size without restarting decode; cuts never cross a tile.
+        """
         import torch
         from concurrent.futures import ThreadPoolExecutor
         from collections import deque
         from .bgen_gpu import GpuBgenDecoder
+        from .adaptive_chunks import selected_chunk_size
         if chunk_size<=0:
             raise ValueError('chunk_size must be positive')
         depth=self.prefetch_chunks if prefetch_chunks is None else int(prefetch_chunks)
@@ -1029,14 +1036,29 @@ class BgenGenotype:
             while pending:
                 start,end,future=pending.popleft()
                 output=future.result()
-                for offset in range(0,end-start,chunk_size):
-                    stop=min(offset+chunk_size,end-start)
+                offset=0
+                while offset<end-start:
+                    size=(chunk_size if chunk_size_selector is None else
+                          selected_chunk_size(chunk_size_selector,start+offset,span_end,chunk_size))
+                    stop=min(offset+size,end-start)
                     view=output[offset:stop]
                     view.record_stream(torch.cuda.current_stream(device))
                     yield start+offset,start+stop,view
+                    offset=stop
                 submit()
         finally:
             resources.close()
 
     def close(self):
         pass
+
+
+
+
+
+
+
+
+
+
+

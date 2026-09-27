@@ -16,7 +16,7 @@ venv/
 # Local analysis outputs and server configuration
 results/
 paper/
-benchmarks/
+# benchmarks/ is kept on this development branch: its tests import benchmark modules
 .bench_snapshots/
 _scratch/
 competitor_grid/
@@ -32,3 +32,4 @@ prep_out/
 run.json
 qc.json
 sumstats/
+.codex/

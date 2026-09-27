@@ -24,8 +24,13 @@ computed afterwards on the k survivors only.
 
 from __future__ import annotations
 
+
 import numpy as np
 import torch
+
+from .selection_geometry import DEVICE_SELECTION_MAX_CELLS, device_selection_shape
+# The one JAGWAS reduction (score statistic, rank cutoff, triangular projection).
+from .jagwas_projection import JagwasReduction  # noqa: F401,E402
 
 
 _SINGLE = ("max-abs-t", "max-t2", "min-p")
@@ -211,12 +216,36 @@ class SignificantPairs:
             raise ValueError("threshold must be in (0, 1]")
         self.threshold = None if threshold is None else float(threshold)
         self.alpha = float(alpha)
+        self._integer_df_cache = None
 
     def resolved_threshold(self, n_traits: int) -> float:
         """The explicit threshold if given, else `alpha / K`."""
         if self.threshold is not None:
             return self.threshold
         return bonferroni_threshold(n_traits, self.alpha)
+
+    def prepare_integer_df(self, n_samples: int, n_traits: int):
+        """Exact readonly FP64 critical values, shared across complete-input tiles.
+
+        The API prepares this once before workers start. Publishing a complete
+        immutable tuple also makes concurrent duplicate preparation harmless.
+        Fractional df keeps the ordinary SciPy path; changing the threshold
+        invalidates lookup reuse rather than returning stale critical values.
+        """
+        if isinstance(n_samples, bool) or not isinstance(n_samples, int) or n_samples < 1:
+            raise ValueError('Positive sample count required for critical-value table')
+        threshold = self.resolved_threshold(n_traits)
+        cached = self._integer_df_cache
+        if cached is not None and cached[:2] == (n_samples, threshold):
+            return cached[2]
+        from scipy import special
+        values = np.arange(1, n_samples + 1, dtype=np.float64)
+        table = np.empty(n_samples + 1, dtype=np.float64)
+        table[1:] = 0. if threshold == 1. else np.abs(special.stdtrit(values, threshold / 2.))
+        table[0] = np.nan
+        table.setflags(write=False)
+        self._integer_df_cache = (n_samples, threshold, table)
+        return table
 
     def critical_abs_t(self, variant_df, n_traits: int):
         """Per-variant |t| at which the two-sided p-value equals the threshold.
@@ -228,6 +257,14 @@ class SignificantPairs:
 
         threshold = self.resolved_threshold(n_traits)
         df = np.asarray(variant_df, dtype=np.float64)
+        # The inverse CDF may return a tiny nonzero value at p=0.5. At the
+        # inclusive threshold 1, valid t=0 must pass exactly.
+        if threshold == 1.0:
+            return np.where(df > 0, 0.0, np.nan)
+        cached = self._integer_df_cache
+        if (cached is not None and cached[1] == threshold
+                and np.all(np.isfinite(df) & (df >= -cached[0]) & (df <= cached[0]) & (df == np.floor(df)))):
+            return cached[2][np.maximum(df, 0).astype(np.int64)]
         critical = np.abs(special.stdtrit(df, threshold / 2.0))
         return critical
 
@@ -257,134 +294,80 @@ class SignificantPairs:
         return rows, cols, beta[rows, cols], t[rows, cols]
 
 
-class JagwasReduction:
-    """One multivariate statistic per variant: `T = z' R^-1 z`, chi-square on K df.
+def device_significance_critical(significance, n_samples, n_traits, device):
+    """Small FP32 lookup with thresholds rounded upward, preserving FP64 tests.
 
-    The per-variant top-k reductions answer "which single trait is strongest
-    here", which is a different and weaker question than "is this variant
-    associated with the trait set at all". This is the joint test: with `R` the
-    K x K correlation of the residualised standardised phenotypes, `T` is the
-    quadratic form of the variant's z-scores against `R^-1`, and under the null
-    it is chi-square with K degrees of freedom -- **not** Student t, so the
-    p-value comes from a different tail than every other mode here.
-
-    **`z` is exactly `t`.** The reference implementation writes
-    `z = t2.sqrt() * sign(gy)`; since `se > 0`, `sign(t) = sign(beta) =
-    sign(gy)`, so the signed root of `t^2` is `t` itself and no separate sign
-    array is needed.
-
-    **`T` is evaluated as `||L^-1 z||^2` with `R = L L'`, never by forming
-    `R^-1`.** Same FLOPs -- one `(chunk, K) x (K, K)` product either way -- and
-    three things follow, all inherited from the implementation this is ported
-    from rather than rediscovered:
-
-    * the error tracks `cond(R)^(1/2)` instead of `cond(R)`, which on this
-      cohort is the difference between max `|dT|` of 1.8e-12 and 3.7e-12;
-    * `T >= 0` holds by construction, where the `(z @ Rinv) * z` form can go
-      slightly negative for variants whose `T` is near zero;
-    * `cholesky` factors and tests positive-definiteness in one step, so a
-      phenotype set with a collinear pair is reported rather than silently
-      producing a `T` from an indefinite inverse.
-
-    The factorisation is done in float64 even when the scan is float32: `R` is
-    formed from the same fp32 GEMM the reference uses, because computing it in
-    numpy instead changes the summation order and at `cond(R) ~ 6e3` that lands
-    as ~3e-3 on `T`.
+    Native complete-phenotype df is an integer in [1,N]. For representable
+    FP32 |t|, comparison to ceil_fp32(critical_fp64) gives exactly the FP64
+    comparison. Invalid df is excluded by status and maps to +inf.
     """
+    critical=significance.prepare_integer_df(n_samples,n_traits)[1:]
+    with np.errstate(over='ignore'):
+        rounded=critical.astype(np.float32)
+    rounded=np.where(rounded.astype(np.float64)<critical,
+                     np.nextafter(rounded,np.float32(np.inf)),rounded)
+    table=np.concatenate([np.array([np.inf],np.float32),rounded])
+    return torch.as_tensor(table,device=device)
 
-    mode = "jagwas"
-    width = 1
 
-    def __init__(self):
-        self._inverse_cholesky = None
-        self._n_traits = None
+def _owned_pairs(packed,first_variant,first_trait):
+    """Split one packed int32 host copy into owned coordinate/value arrays."""
+    return (packed[0].astype(np.int64)+first_variant,packed[1].astype(np.int64)+first_trait,
+            packed[2].view(np.float32),packed[3].view(np.float32),packed[4].view(np.float32))
 
-    def resolved_width(self, n_traits: int) -> int:
-        return 1
 
-    def prepare(self, phenotype, device=None):
-        """Factorise the trait correlation once, before the scan starts.
+def device_significant_pairs(beta,t,status,variant_df,critical,*,start=0,
+                             max_cells=DEVICE_SELECTION_MAX_CELLS):
+    """Bounded PyTorch selection; transfer owned passing rows, with no top-k.
 
-        `phenotype` is the processed (residualised, standardised) design the
-        scan will use, so `R` is the correlation of exactly the columns the
-        statistic is computed from.
-        """
-        matrix = torch.as_tensor(phenotype)
-        if device is not None:
-            matrix = matrix.to(device)
-        samples, traits = matrix.shape
-        if traits < 1:
-            raise ValueError("jagwas needs at least one trait")
-        correlation = (matrix.T @ matrix) / float(samples)
-        try:
-            factor = torch.linalg.cholesky(correlation.double())
-        except RuntimeError as error:
-            raise ValueError(
-                "the trait correlation matrix is not positive definite, so the "
-                "jagwas quadratic form is undefined; this usually means two "
-                "phenotype columns are collinear"
-            ) from error
-        identity = torch.eye(traits, dtype=torch.float64,
-                             device=correlation.device)
-        self._inverse_cholesky = torch.linalg.solve_triangular(
-            factor, identity, upper=False)
-        self._n_traits = int(traits)
-        return self
-
-    @property
-    def degrees_of_freedom(self) -> int:
-        """K, the chi-square df -- not the residual df the t-statistics use."""
-        if self._n_traits is None:
-            raise ValueError("jagwas reduction was not prepared")
-        return self._n_traits
-
-    def host_buffers(self, chunk_size: int, width: int, pin_memory: bool = True):
-        return (
-            torch.empty((chunk_size, 1), dtype=torch.float32, pin_memory=pin_memory),
-            torch.empty((chunk_size, 1), dtype=torch.float32, pin_memory=pin_memory),
-            torch.empty((chunk_size, 1), dtype=torch.int32, pin_memory=pin_memory),
-            torch.empty(chunk_size, dtype=torch.uint8, pin_memory=pin_memory),
-            torch.empty(chunk_size, pin_memory=pin_memory),
-        )
-
-    def reduce(self, beta, t, status, variant_df, width):
-        """`(chunk, K)` in, `(chunk, 1)` out, carrying `T` in the `t` slot.
-
-        The narrow result rides the same pinned ring every other reduction
-        uses; what changes is the meaning, and the jagwas writer is the only
-        consumer that reads it. `beta` has no per-variant analogue in a joint
-        test, so it is returned as NaN rather than as a misleading number from
-        an arbitrary trait.
-        """
-        if self._inverse_cholesky is None:
-            raise ValueError("jagwas reduction was not prepared")
-        scores = t.double()
-        # A variant with any non-finite statistic has no joint statistic, and
-        # it must be invalidated **here**, from the values, not deduced from
-        # `status`. The first version zeroed the NaNs and trusted `status` to
-        # flag the variant, which produced a plausible chi-square for every
-        # degenerate variant on any backend that does not fill in a status
-        # word: the generic device path passes an all-clear status by design,
-        # documenting that "degenerate variants arrive as NaN rather than as a
-        # flag". Measured cost of that assumption: **25 invalid variants in
-        # 100,000 all emitted, none withheld**, with values from 44.5 to 82.5
-        # that look exactly like real results.
-        #
-        # The zeroing still happens, because one NaN would otherwise poison the
-        # whole GEMM row, but the row is remembered and masked afterwards.
-        degenerate = ~torch.isfinite(scores).all(dim=1)
-        scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
-        projected = scores @ self._inverse_cholesky.T
-        statistic = (projected * projected).sum(dim=1, keepdim=True)
-        statistic = statistic.masked_fill(
-            (degenerate | (status != 0)).unsqueeze(1), float("nan"))
-        return (torch.full_like(statistic, float("nan"), dtype=beta.dtype),
-                statistic.to(t.dtype),
-                torch.zeros_like(statistic, dtype=torch.int32),
-                status, variant_df)
-
-    def merge(self, running, incoming, trait_offset: int):
-        raise ValueError(
-            "jagwas cannot be trait-blocked: the statistic is a quadratic form "
-            "over the whole trait correlation, so a block of traits does not "
-            "carry enough information to be merged with another block")
+    A selection block visits at most max_cells cells (by default the whole
+    chunk) and costs two blocking round trips: nonzero's count, then one
+    packed copy of rows, traits, beta, t and df. Round trips and Python
+    dispatch per chunk no longer grow with its cell count. Predicate
+    temporaries stay bounded by PREDICATE_MAX_CELLS; the block's bool mask
+    costs one byte per cell. Host arrays own their storage and survive the
+    next chunk or another device worker. No dense beta/t host ring is
+    allocated for this execution path.
+    """
+    from .host_significance import predicate_block_shape
+    if (isinstance(max_cells,bool) or not isinstance(max_cells,int)
+            or not 1<=max_cells<=DEVICE_SELECTION_MAX_CELLS):
+        raise ValueError('Positive max_cells within the CUDA nonzero limit required')
+    if (t.dtype!=torch.float32 or beta.dtype!=torch.float32 or variant_df.dtype!=torch.float32
+            or critical.dtype!=torch.float32):
+        raise ValueError('Device significance requires native FP32 statistics and df')
+    rows,traits=t.shape
+    if traits<1 or beta.shape!=t.shape or status.shape!=(rows,) or variant_df.shape!=(rows,):
+        raise ValueError('Invalid significance input shapes')
+    # An invalid variant gets an infinite limit. |t| < inf then rejects it
+    # together with non-finite statistics, and NaN fails every comparison, so
+    # this is exactly finite(t) & |t| >= critical[df] & valid.
+    valid=(status==0)&(variant_df>0)&torch.isfinite(variant_df)
+    limits=torch.where(valid,critical[variant_df.to(torch.int64).clamp(0,len(critical)-1)],torch.inf)
+    width,height,_=device_selection_shape(rows,traits,max_cells)
+    for first in range(0,rows,height):
+        last=min(rows,first+height)
+        for left in range(0,traits,width):
+            right=min(traits,left+width)
+            keep=t.new_empty((last-first,right-left),dtype=torch.bool)
+            predicate_height,predicate_width,_=predicate_block_shape(last-first,right-left)
+            for top in range(0,last-first,predicate_height):
+                bottom=min(last-first,top+predicate_height)
+                limit=limits[first+top:first+bottom,None]
+                for column in range(0,right-left,predicate_width):
+                    stop=min(right-left,column+predicate_width)
+                    magnitude=t[first+top:first+bottom,left+column:left+stop].abs()
+                    mask=keep[top:bottom,column:stop]
+                    torch.ge(magnitude,limit,out=mask)
+                    mask&=magnitude<torch.inf
+            ri,ti=keep.nonzero().unbind(1)
+            if not ri.numel():
+                yield (start+first,start+last,np.empty(0,np.int64),np.empty(0,np.int64),
+                       np.empty(0,np.float32),np.empty(0,np.float32),np.empty(0,np.float32))
+                continue
+            # int32 is exact: a block has fewer than 2**31 cells.
+            packed=torch.stack((ri.to(torch.int32),ti.to(torch.int32),
+                                beta[first:last,left:right][ri,ti].view(torch.int32),
+                                t[first:last,left:right][ri,ti].view(torch.int32),
+                                variant_df[first:last][ri].view(torch.int32))).cpu().numpy()
+            yield (start+first,start+last,*_owned_pairs(packed,start+first,left))

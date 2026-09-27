@@ -182,3 +182,11 @@ class GpuBgenDecoder:
         if getattr(self, 'handle', None):
             self.lib.tg_bgen_destroy(self.handle)
             self.handle = None
+
+
+
+
+
+
+
+

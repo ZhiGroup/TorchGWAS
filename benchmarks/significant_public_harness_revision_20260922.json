@@ -1,0 +1,15 @@
+{
+  "initial_harness_sha256": "ec721439dd76336b37936a45922b0716e3c353a4d2902d921a7e1135d6c5a92d",
+  "corrected_harness_sha256": "e00ea132606066cedc61a24336c7a041eae250efc97d220c83eeda9eb3bfc9b0",
+  "initial_job": "20260921-224419-775673",
+  "initial_phases": [
+    "prepare",
+    "first",
+    "second"
+  ],
+  "corrected_phases": [
+    "expired",
+    "finish"
+  ],
+  "reason": "Expiry control profile now uses the canonical absolute artifact path; package source and both completed numerical runs are unchanged."
+}

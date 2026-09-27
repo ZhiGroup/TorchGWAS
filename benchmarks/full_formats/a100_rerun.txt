@@ -1,0 +1,4 @@
+pgen_hardcall|--path /data/zxie3/torchgwas_bench/full35_src/full_hardcall.pgen --pgen-mode hardcall
+pgen_dosage|--path /data/zxie3/torchgwas_bench/full35_src/full_dosage.pgen --pgen-mode dosage
+zstd|--path /data/zxie3/torchgwas_bench/full35_src/full_zstd/full_dosage_pgen_efa599586748
+bgen|--path /data/zxie3/ukb_MRI_bgen/all_filtered.bgen

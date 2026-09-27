@@ -1,0 +1,1 @@
+pgen_hardcall|--path /data/zxie3/torchgwas_bench/full_hardcall.pgen --pgen-mode hardcall

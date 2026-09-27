@@ -11,6 +11,7 @@ from unittest import mock
 
 import numpy as np
 
+from benchmarks.benchmark_pgen_converter import _parse_configs
 from torchgwas.cli import _build_parser, _run_convert_pgen
 from torchgwas.io import infer_genotype_format, load_genotype, load_pgen_genotype
 from torchgwas.pgen import (
@@ -558,6 +559,14 @@ class PgenSourceTestCase(unittest.TestCase):
                 json.loads(Path(convert_args.output_json).read_text())["source_format"], "pgen"
             )
 
+    def test_benchmark_parses_single_or_multiple_worker_chunk_configs(self):
+        self.assertEqual(
+            _parse_configs("1:1024:1:1000,2:4096:4:2500"),
+            [(1, 1024, 1, 1000), (2, 4096, 4, 2500)],
+        )
+        self.assertEqual(_parse_configs("2:4096:4:2500"), [(2, 4096, 4, 2500)])
+
+
 @unittest.skipUnless(importlib.util.find_spec("pgenlib"), "optional pgenlib is not installed")
 class PgenIntegrationTestCase(unittest.TestCase):
     def test_real_pgenlib_hardcall_fixture_matches_trusted_matrix(self):
@@ -838,3 +847,7 @@ class DirectPgenTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+

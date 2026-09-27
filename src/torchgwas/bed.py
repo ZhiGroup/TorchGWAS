@@ -583,12 +583,14 @@ class PlinkBedGenotype:
         reader_workers: int | None = None,
         depth: int | None = None,
         variant_range: tuple[int, int] | None = None,
+        chunk_size_selector=None,
     ) -> "PinnedPackedBedLoader":
         workers = self.reader_workers if reader_workers is None else int(reader_workers)
         chunk = self.preferred_gpu_chunk_size if chunk_size is None else int(chunk_size)
         ring_depth = max(3, workers + 2) if depth is None else int(depth)
         return PinnedPackedBedLoader(self, chunk, workers, ring_depth,
-                                     variant_range=variant_range)
+                                     variant_range=variant_range,
+                                     chunk_size_selector=chunk_size_selector)
 
 
 class PinnedPackedBedLoader:
@@ -601,7 +603,10 @@ class PinnedPackedBedLoader:
         reader_workers: int,
         depth: int,
         variant_range: tuple[int, int] | None = None,
+        chunk_size_selector=None,
     ) -> None:
+        """chunk_size is the buffer capacity; chunk_size_selector, when given,
+        picks each next read's size (at most the capacity) at submission."""
         import torch
 
         from .streaming import _resolve_variant_range
@@ -612,16 +617,12 @@ class PinnedPackedBedLoader:
             variant_range, int(genotype.shape[1]))
         self.genotype = genotype
         self.chunk_size = int(chunk_size)
+        self.chunk_size_selector = chunk_size_selector
         self.reader_workers = int(reader_workers)
         self.depth = int(depth)
-        self.buffers = [
-            torch.empty(
-                (self.chunk_size, genotype._bytes_per_variant),
-                dtype=torch.uint8,
-                pin_memory=True,
-            )
-            for _ in range(self.depth)
-        ]
+        # Pinned on first fill and grown once to the capacity (see
+        # streaming.PinnedDosageLoader): a tuned scan may never need it.
+        self.buffers = [None] * self.depth
         self.free: queue.Queue[int] = queue.Queue()
         for index in range(self.depth):
             self.free.put(index)
@@ -630,6 +631,20 @@ class PinnedPackedBedLoader:
             thread_name_prefix="torchgwas-bed-packed",
         )
 
+    def _slot(self, buffer_index: int, rows: int):
+        """Slot sized for its first chunk when a selector varies sizes; grows once, to the capacity.
+
+        Called at submission, when the slot is free.
+        """
+        import torch
+        buffer = self.buffers[buffer_index]
+        if buffer is None or buffer.shape[0] < rows:
+            # Fixed-size scans copy whole slots and use the capacity anyway.
+            size = rows if buffer is None and self.chunk_size_selector is not None else self.chunk_size
+            self.buffers[buffer_index] = buffer = torch.empty(
+                (size, self.genotype._bytes_per_variant), dtype=torch.uint8, pin_memory=True)
+        return buffer
+
     def _fill(self, buffer_index: int, start: int, end: int):
         byte_count = (end - start) * self.genotype._bytes_per_variant
         target = memoryview(self.buffers[buffer_index].numpy()).cast("B")[:byte_count]
@@ -637,36 +652,38 @@ class PinnedPackedBedLoader:
         return buffer_index, start, end
 
     def __iter__(self):
-        bounds = [
-            (start, min(self.variant_end, start + self.chunk_size))
-            for start in range(self.variant_start, self.variant_end,
-                               self.chunk_size)
-        ]
-        pending: dict[int, Future] = {}
-        submit_index = 0
+        from collections import deque
+        from .adaptive_chunks import selected_chunk_size
 
-        def submit_one() -> None:
-            nonlocal submit_index
+        pending: deque = deque()
+        cursor = self.variant_start
+
+        def submit_one() -> bool:
+            # Bounds are chosen at submission, in order, so a selector's change
+            # applies to the next unread rows and never to queued reads.
+            nonlocal cursor
+            if cursor >= self.variant_end:
+                return False
             buffer_index = self.free.get()
-            start, end = bounds[submit_index]
-            pending[submit_index] = self._pool.submit(
-                self._fill,
-                buffer_index,
-                start,
-                end,
-            )
-            submit_index += 1
+            count = (min(self.chunk_size, self.variant_end - cursor)
+                     if self.chunk_size_selector is None else
+                     selected_chunk_size(self.chunk_size_selector, cursor,
+                                         self.variant_end, self.chunk_size))
+            self._slot(buffer_index, count)
+            pending.append(self._pool.submit(self._fill, buffer_index, cursor, cursor + count))
+            cursor += count
+            return True
 
-        while submit_index < min(len(bounds), self.depth):
-            submit_one()
+        for _ in range(self.depth):
+            if not submit_one():
+                break
         try:
-            for output_index in range(len(bounds)):
-                buffer_index, start, end = pending.pop(output_index).result()
+            while pending:
+                buffer_index, start, end = pending.popleft().result()
                 yield buffer_index, self.buffers[buffer_index], start, end
-                if submit_index < len(bounds):
-                    submit_one()
+                submit_one()
         finally:
-            for future in pending.values():
+            for future in pending:
                 future.cancel()
 
     def release(self, buffer_index: int) -> None:

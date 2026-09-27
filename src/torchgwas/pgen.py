@@ -71,7 +71,7 @@ def _open_pgen(*args, **kwargs):
     return pgenlib.PgenReader(*args, **kwargs)
 
 
-def resolve_pgen_mode_and_backend(path, requested_mode: str) -> tuple[str, str, str]:
+def resolve_pgen_mode_and_backend(path, requested_mode: str, *, _header_receiver=None) -> tuple[str, str, str]:
     """Decide read mode and reader backend for a whole PGEN, and say why.
 
     Returns `(mode, backend, reason)` with `backend` in {"native", "pgenlib"}.
@@ -93,7 +93,7 @@ def resolve_pgen_mode_and_backend(path, requested_mode: str) -> tuple[str, str, 
     outside its scope raises here rather than failing partway through a scan.
     """
     from . import pgen_native
-    from .pgen_reader import file_scope
+    from .pgen_reader import file_scope, read_header, scope_from_vrtypes
 
     forced = os.environ.get("TORCHGWAS_PGEN_BACKEND", "auto").strip().lower()
     if forced not in {"auto", "native", "pgenlib"}:
@@ -109,11 +109,21 @@ def resolve_pgen_mode_and_backend(path, requested_mode: str) -> tuple[str, str, 
     # happens to be built; conflating the two made `TORCHGWAS_PGEN_BACKEND=
     # pgenlib` change what `auto` believed about the data.
     try:
-        scope = file_scope(path)
+        if _header_receiver is None:
+            scope = file_scope(path)
+        else:
+            from .analytical_plan_cache import input_identity
+            identity = input_identity(path)
+            header = read_header(path)
+            scope = scope_from_vrtypes(header.vrtypes)
         scope_error = None
     except Exception as exc:  # noqa: BLE001 - any parse failure disqualifies it
         scope = None
         scope_error = f"the PGEN index did not parse: {type(exc).__name__}: {exc}"
+    if _header_receiver is not None and scope_error is None:
+        if input_identity(path) != identity:
+            raise ValueError('PGEN changed during backend selection')
+        _header_receiver((identity, header))
     hardcall_only = scope is not None and scope.supported
 
     mode = ("hardcall" if hardcall_only else "dosage") if requested_mode == "auto" \
@@ -414,9 +424,12 @@ class PgenDosageSource:
         # Resolve mode and backend before the first reader exists: `_new_reader`
         # needs both, and they are properties of the file rather than of any
         # one reader.
+        prepared_headers = []
         (self.mode, self.pgen_backend,
          self.pgen_backend_reason) = resolve_pgen_mode_and_backend(
-            self.genotype_path, mode)
+            self.genotype_path, mode, _header_receiver=prepared_headers.append)
+        self._prepared_native_header = (prepared_headers[0] if self.pgen_backend == 'native'
+            and len(prepared_headers) == 1 else None)
         self._probe_reader = self._new_reader()
         observed_samples = int(self._probe_reader.get_raw_sample_ct())
         observed_variants = int(self._probe_reader.get_variant_ct())
@@ -473,6 +486,7 @@ class PgenDosageSource:
                 raw_sample_ct=self._raw_n_samples,
                 variant_ct=self._raw_n_variants,
                 sample_subset=self._reader_sample_subset,
+                _prepared_header=self._prepared_native_header,
             )
         return _open_pgen(
             os.fsencode(self.genotype_path),
@@ -667,7 +681,7 @@ class PgenDosageSource:
         code_parts: deque[np.ndarray] = deque()
         index_parts: deque[np.ndarray] = deque()
         buffered = 0
-        emitted = 0
+        emitted = first
         kept: list[np.ndarray] = []
 
         def take(count: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1068,7 +1082,7 @@ class PgenGenotype(PgenDosageSource):
 
     def iter_chunks(self, chunk_size, dtype=np.float32, prefetch_chunks=None,
                     reader_workers=None, variant_range=None):
-        from .streaming import OrderedChunkLoader
+        from .streaming import OrderedChunkLoader, _resolve_variant_range
         workers = self.reader_workers if reader_workers is None else reader_workers
         depth = self.prefetch_chunks if prefetch_chunks is None else prefetch_chunks
         readers = []
@@ -1090,11 +1104,13 @@ class PgenGenotype(PgenDosageSource):
 
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
-        loader = OrderedChunkLoader(self.shape[1], read, self.decode_batch_size, dtype, depth, workers)
+        first,last=_resolve_variant_range(variant_range,self.shape[1])
+        loader = OrderedChunkLoader(self.shape[1], read, self.decode_batch_size, dtype, depth, workers,
+                                    variant_range=(first,last))
         decoded = iter(loader)
         parts = deque()
         buffered = 0
-        emitted = 0
+        emitted = first
 
         def take(count):
             nonlocal buffered
@@ -1144,3 +1160,6 @@ class PgenGenotype(PgenDosageSource):
         """Compact H2D payload; int8 hardcall missing -9 must become NaN on GPU."""
         return self.iter_chunks(chunk_size, self.native_dtype, prefetch_chunks,
                                 reader_workers, variant_range=variant_range)
+
+
+

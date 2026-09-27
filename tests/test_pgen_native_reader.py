@@ -317,6 +317,23 @@ class NativePgenReaderTestCase(unittest.TestCase):
             want[categories == 3] = -9
             np.testing.assert_array_equal(fast, want)
 
+    def test_hardcall_expansion_handles_vector_tails_and_unaligned_guards(self):
+        if not pgen_native.expand_hardcall_available():
+            self.skipTest("hardcall expansion entry point is unavailable")
+        for missing in (-128, -9, 0, 3, 127):
+            for samples in (1, 2, 3, 4, 5, 1023, 1024, 1025):
+                with self.subTest(missing=missing, samples=samples):
+                    stride = (samples + 3)//4 + 3
+                    packed = np.arange(3*stride, dtype=np.uint64).astype(np.uint8).reshape(3, stride)
+                    expected = np.stack([unpack_genovec(row, samples) for row in packed]).astype(np.int8)
+                    expected[expected == 3] = missing
+                    guarded = np.full(3*samples + 2, 42, dtype=np.int8)
+                    destination = guarded[1:-1].reshape(3, samples)
+                    returned = pgen_native.expand_hardcall(packed, samples, destination, missing)
+                    self.assertIs(returned, destination)
+                    np.testing.assert_array_equal(destination, expected)
+                    self.assertEqual((guarded[0], guarded[-1]), (42, 42))
+
     def test_partial_ranges_agree_with_the_whole(self):
         with tempfile.TemporaryDirectory() as directory:
             path, categories = self._fixture(Path(directory))
@@ -328,6 +345,30 @@ class NativePgenReaderTestCase(unittest.TestCase):
                     reader.read_range(start, end, out)
                     with self.subTest(start=start, end=end):
                         np.testing.assert_array_equal(out, whole[start:end])
+
+    def test_packed_workspace_reuse_growth_and_close_preserve_caller_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, categories = self._fixture(Path(directory), variants=41, samples=37)
+            want = categories.astype(np.int8)
+            want[categories == 3] = -9
+            retained = []
+            with NativePgenReader(path) as reader:
+                workspace = None
+                for start,end in [(0,8),(8,16),(16,19),(19,35),(35,41)]:
+                    out = np.empty((end-start,37), dtype=np.int8)
+                    reader.read_range(start,end,out)
+                    if workspace is not None and end-start <= workspace.shape[0]:
+                        self.assertIs(reader._packed_workspace, workspace)
+                    workspace = reader._packed_workspace
+                    np.testing.assert_array_equal(out,want[start:end])
+                    retained.append((start,end,out))
+                self.assertEqual(workspace.shape,(16,10))
+                for start,end,out in retained:
+                    np.testing.assert_array_equal(out,want[start:end])
+            self.assertIsNone(reader._packed_workspace)
+            self.assertIsNone(reader._blob)
+            for start,end,out in retained:
+                np.testing.assert_array_equal(out,want[start:end])
 
     def test_packed_rows_are_the_raw_two_bit_codes_and_padding_is_zeroed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -506,6 +547,25 @@ class NativePgenReaderTestCase(unittest.TestCase):
             self.assertEqual((mode, backend), ("hardcall", "native"))
             mode, backend, _ = resolve_pgen_mode_and_backend(path, "dosage")
             self.assertEqual((mode, backend), ("dosage", "pgenlib"))
+
+    def test_backend_header_can_be_shared_with_native_reader(self):
+        from torchgwas import pgen_native_reader
+        with tempfile.TemporaryDirectory() as directory:
+            path, categories = self._fixture(Path(directory))
+            prepared = []
+            mode, backend, _ = resolve_pgen_mode_and_backend(path, 'auto',
+                _header_receiver=prepared.append)
+            self.assertEqual((mode, backend), ('hardcall', 'native'))
+            self.assertEqual(len(prepared), 1)
+            with unittest.mock.patch.object(pgen_native_reader, 'read_header',
+                    side_effect=AssertionError('index reread')):
+                with NativePgenReader(path, _prepared_header=prepared[0]) as reader:
+                    out=np.empty(categories.shape,dtype=np.int8)
+                    reader.read_range(0,categories.shape[0],out)
+            np.testing.assert_array_equal(out, np.where(categories==3,-9,categories.astype(np.int8)))
+            path.write_bytes(path.read_bytes()+b'changed')
+            with self.assertRaisesRegex(ValueError,'Prepared PGEN header differs'):
+                NativePgenReader(path,_prepared_header=prepared[0])
 
     def test_a_file_the_index_cannot_parse_falls_back_rather_than_raising(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -14,8 +14,7 @@ from scipy import special
 
 from .kernels import linear_chunk_kernel
 from .preprocess import residualize_and_standardize
-from .streaming import ChunkedGenotype
-from .tails import upper_tail_log10_from_t_torch
+from .streaming import ChunkedGenotype, _resolve_variant_range
 from .utils import choose_device, chunk_bounds
 
 
@@ -79,44 +78,24 @@ def _packed_bed_statistics(
 
 
 def _significant_pairs_iterator(chunks, significance, n_traits, df):
-    """Turn full chunks into the (variant, trait) pairs that clear threshold.
+    """Select all passing pairs with the df carried by the statistics producer.
 
-    **There is no k.** An earlier version kept the top `k` traits per variant
-    on the device and thresholded afterwards, which is exact only while fewer
-    than `k` of them clear. That assumption fails precisely where this mode is
-    meant to be used: a real association in a correlated trait set can clear
-    significance on hundreds of traits at once, and every one past the `k`th
-    was discarded with a warning standing in for a guarantee.
-
-    Selection is on `|t|` against a critical value rather than on a p-value per
-    cell, which is the same set: within a variant every trait shares the
-    residual df, so p is strictly decreasing in `|t|`. Computing p for all
-    `M x K` cells instead would cost 0.156 s per million on the host -- about
-    178 s at this cohort -- to answer a question two comparisons settle.
-
-    The critical value uses the run's nominal df rather than each variant's
-    own. At N = 22,250 with 27 covariates, a variant missing 1% of its calls
-    has df smaller by 1%, which moves the critical `|t|` at p = 4e-10 by under
-    0.01% -- orders below any threshold anyone sets, and the same
-    simplification the existing `p_value_threshold` path already makes.
+    A native device selection already produces seven-field selected chunks;
+    other backends provide dense beta/t plus optional broadcastable pair df.
+    The nominal df is only the compatibility fallback for five-field inputs.
     """
-    critical = float(significance.critical_abs_t(
-        np.asarray([float(df)]), n_traits)[0])
-    for start, end, beta_chunk, t_chunk, _p_chunk in chunks:
-        t_values = np.asarray(t_chunk)
-        keep = np.isfinite(t_values) & (np.abs(t_values) >= critical)
-        if not keep.any():
-            yield (start, end, np.empty(0, dtype=np.int64),
-                   np.empty(0, dtype=np.int32),
-                   np.empty(0, dtype=t_values.dtype),
-                   np.empty(0, dtype=t_values.dtype), float(df))
+    for chunk in chunks:
+        if len(chunk)==7:
+            yield chunk
             continue
-        rows, columns = np.nonzero(keep)
-        yield (start, end, rows.astype(np.int64) + start,
-               columns.astype(np.int32),
-               np.asarray(beta_chunk)[rows, columns],
-               t_values[rows, columns], float(df))
-
+        start,end,beta_chunk,t_chunk,_p_chunk=chunk[:5]
+        t_values=np.asarray(t_chunk)
+        row_df=np.asarray(chunk[5] if len(chunk)==6 else float(df))
+        if row_df.ndim==1 and row_df.shape==(t_values.shape[0],):
+            row_df=row_df[:,None]
+        critical=np.atleast_1d(significance.critical_abs_t(row_df,n_traits))
+        from .host_significance import select_host_pairs
+        yield (start,end,*select_host_pairs(None if beta_chunk is None else np.asarray(beta_chunk),t_values,row_df,critical,start))
 
 def _dosage_statistics(genotype, design, phenotype_ss, n_traits, df,
                        validate_range=False, covariate_rank=None):
@@ -261,12 +240,18 @@ def _packed_bed_cuda_iterator(
     torch_device: torch.device,
     reader_workers: int | None,
     compute_p_values: bool,
-    compute_log10_p: bool = False,
     variant_range: tuple[int, int] | None = None,
     reduction=None,
     borrow_results: bool = False,
+    return_df: bool = False,
+    chunk_size_selector=None,
+    chunk_observer=None,
 ) -> Iterator[tuple[int, int, np.ndarray, np.ndarray, np.ndarray | None]]:
     """Overlap packed BED reads, H2D, fused GPU decode, OLS, and result copies.
+
+    chunk_size is the ring capacity. With chunk_size_selector (native kernel
+    only) each read picks its size and statistics run on that many rows;
+    chunk_observer receives a MinimalChunkObservation per delivered chunk.
 
     `borrow_results` yields views into the pinned result ring instead of
     copies. Measured, that copy is **69% of the wall at K=2048** — 4.92 GB at
@@ -394,8 +379,7 @@ def _packed_bed_cuda_iterator(
     # the cap it is measured against shrink with it.
     reduction_width = None if reduction is None else reduction.resolved_width(n_traits)
     staged_traits = n_traits if reduction is None else reduction_width
-    logp_bytes = staged_traits * 8 if compute_log10_p else 0
-    result_slot_bytes = chunk_size * (staged_traits * 2 * 4 + logp_bytes + 1)
+    result_slot_bytes = chunk_size * (staged_traits * 2 * 4 + 1)
     max_slots_by_memory = max(2, (1 << 30) // max(1, result_slot_bytes))
     result_depth = max(2, min(pvalue_workers, max_slots_by_memory))
     beta_host = [
@@ -406,11 +390,6 @@ def _packed_bed_cuda_iterator(
         torch.empty((chunk_size, staged_traits), dtype=torch.float32, pin_memory=True)
         for _ in range(result_depth)
     ]
-    logp_host = (
-        [torch.empty((chunk_size, staged_traits), dtype=torch.float64, pin_memory=True)
-         for _ in range(result_depth)]
-        if compute_log10_p else None
-    )
     index_host = (
         None if reduction is None else [
             torch.empty((chunk_size, staged_traits), dtype=torch.int32, pin_memory=True)
@@ -466,6 +445,7 @@ def _packed_bed_cuda_iterator(
         reader_workers=workers,
         depth=depth,
         variant_range=variant_range,
+        **({} if chunk_size_selector is None else {'chunk_size_selector': chunk_size_selector}),
     )
     # Record the geometry this path RESOLVED, the way `native_scan` does.
     # Without it the fused BED scan reports chunk/depth/transport as None,
@@ -542,18 +522,10 @@ def _packed_bed_cuda_iterator(
             beta_chunk[invalid, :] = np.nan
             t_chunk[invalid, :] = np.nan
         if reduction is None:
-            if compute_log10_p:
-                logp_chunk = logp_host[result_slot][:count].numpy().copy()
-                if np.any(invalid):
-                    logp_chunk[invalid, :] = np.nan
-                p_chunk = None
-                if compute_p_values:
-                    with np.errstate(under="ignore"):
-                        p_chunk = np.power(10.0, -logp_chunk)
-                return start, end, beta_chunk, t_chunk, p_chunk, logp_chunk
             p_chunk = (_two_sided_t_pvalue(t_chunk, df=df_chunk)
                        if compute_p_values else None)
-            return start, end, beta_chunk, t_chunk, p_chunk
+            result = (start, end, beta_chunk, t_chunk, p_chunk)
+            return (*result, df_chunk[:, None]) if return_df else result
         index_chunk = index_host[result_slot][:count].numpy().copy()
         # df is per variant; broadcast it across the k traits kept so the
         # reduced p-values equal the unreduced ones exactly.
@@ -583,17 +555,28 @@ def _packed_bed_cuda_iterator(
                 timings["fetch_seconds"] += time.perf_counter() - started
                 yield item
 
+        def emit(future):
+            result = future.result()
+            yield result
+            if chunk_observer is not None:
+                from .adaptive_chunks import MinimalChunkObservation
+                chunk_observer(MinimalChunkObservation(int(result[0]), int(result[1]), int(chunk_size),
+                                                       str(torch_device), time.perf_counter()))
+
         for iteration, (buffer_index, host_packed, start, end) in enumerate(
                 timed_loader() if profiling else loader):
             if len(pending) >= result_depth:
-                yield pending.popleft().result()
+                yield from emit(pending.popleft())
 
             count = end - start
             device_slot = iteration % len(packed_device)
             if iteration >= len(packed_device):
                 copy_stream.wait_event(compute_done[device_slot])
+            # Adaptive sizes: copy and compute only this chunk's rows, so a
+            # smaller chunk is not charged the full ring capacity.
+            rows = slice(0, count) if chunk_size_selector is not None else slice(None)
             with torch.cuda.stream(copy_stream):
-                packed_device[device_slot].copy_(host_packed, non_blocking=True)
+                packed_device[device_slot][rows].copy_(host_packed[rows], non_blocking=True)
                 copy_done[device_slot].record(copy_stream)
 
             compute_stream = torch.cuda.current_stream(torch_device)
@@ -602,7 +585,7 @@ def _packed_bed_cuda_iterator(
             if profiling:
                 compute_start[result_slot].record(compute_stream)
             beta_t, t_t, status_t, df_t = statistics(
-                packed_device[device_slot],
+                packed_device[device_slot][rows],
                 design_t,
                 phenotype_ss_t,
                 n_samples,
@@ -612,7 +595,6 @@ def _packed_bed_cuda_iterator(
                 sample_bit_shifts_t,
             )
             index_t = None
-            logp_t = None
             if reduction is not None:
                 # On the compute stream and before compute_done, so the copy
                 # stream waits on the narrow result and the wide tensors are
@@ -620,9 +602,6 @@ def _packed_bed_cuda_iterator(
                 beta_t, t_t, index_t, status_t, df_t = reduction.reduce(
                     beta_t[:count], t_t[:count], status_t[:count], df_t[:count],
                     reduction_width)
-            elif compute_log10_p:
-                logp_t = upper_tail_log10_from_t_torch(
-                    t_t[:count], df_t[:count, None])
             if profiling:
                 compute_end[result_slot].record(compute_stream)
             compute_done[device_slot].record(compute_stream)
@@ -634,8 +613,6 @@ def _packed_bed_cuda_iterator(
                 if reduction is None:
                     staged = ((beta_host, beta_t), (t_host, t_t),
                               (status_host, status_t), (df_host, df_t))
-                    if compute_log10_p:
-                        staged += ((logp_host, logp_t),)
                 else:
                     # Already sliced to `count` by the reduction above.
                     staged = ((beta_host, beta_t), (t_host, t_t),
@@ -654,7 +631,7 @@ def _packed_bed_cuda_iterator(
             pending.append(pvalue_pool.submit(finish_result, result_slot, start, end))
 
         while pending:
-            yield pending.popleft().result()
+            yield from emit(pending.popleft())
     finally:
         pvalue_pool.shutdown(wait=True, cancel_futures=True)
         loader.close()
@@ -667,10 +644,10 @@ def linear_scan(
     chunk_size: int | None = None,
     device: str = "auto",
     compute_dtype: str = "float64",
-    return_log10_p: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     pheno_proc, q_matrix, phenotype_observed_counts = residualize_and_standardize(
-        phenotype, covariates, return_observed_counts=True)
+        phenotype, covariates, device=choose_device(device),
+        return_observed_counts=True)
     n_samples = pheno_proc.shape[0]
     n_markers = genotype.shape[1]
     n_traits = pheno_proc.shape[1]
@@ -686,23 +663,10 @@ def linear_scan(
     if np.any(trait_df <= 0):
         raise ValueError("non-positive phenotype-specific residual degrees of freedom")
     trait_scale = np.sqrt(trait_df / float(df))
-    trait_scale_t = torch.as_tensor(
-        trait_scale, dtype=torch_dtype, device=torch_device
-    ) if return_log10_p else None
-    trait_df_factor_t = torch.as_tensor(
-        trait_df / float(df), dtype=torch.float64, device=torch_device
-    ) if return_log10_p else None
 
     beta = np.empty((n_markers, n_traits), dtype=np_dtype)
     t_stat = np.empty((n_markers, n_traits), dtype=np_dtype)
-    p_value = (
-        None if return_log10_p
-        else np.empty((n_markers, n_traits), dtype=np.float64)
-    )
-    log10_p = (
-        np.empty((n_markers, n_traits), dtype=np.float64)
-        if return_log10_p else None
-    )
+    p_value = np.empty((n_markers, n_traits), dtype=np.float64)
 
     for start, end in chunk_bounds(n_markers, chunk_size):
         geno_chunk = np.asarray(genotype[:, start:end], dtype=np_dtype)
@@ -710,26 +674,14 @@ def linear_scan(
         beta_t, t_chunk_t, df_chunk_t = linear_chunk_kernel(
             geno_t, pheno_t, q_t, df, covariate_rank=covariate_rank)
         beta_chunk = beta_t.cpu().numpy()
-        if return_log10_p:
-            adjusted_t = t_chunk_t * trait_scale_t[None, :]
-            pair_df_t = df_chunk_t.double()[:, None] * trait_df_factor_t[None, :]
-            logp_chunk = upper_tail_log10_from_t_torch(adjusted_t, pair_df_t)
-            t_chunk = adjusted_t.cpu().numpy()
-            logp_chunk = logp_chunk.cpu().numpy()
-        else:
-            t_chunk = t_chunk_t.cpu().numpy()
-            variant_df = df_chunk_t.cpu().numpy()
-            t_chunk *= trait_scale[None, :]
-            pair_df = variant_df[:, None] * (trait_df[None, :] / float(df))
-            p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
+        t_chunk = t_chunk_t.cpu().numpy()
+        variant_df = df_chunk_t.cpu().numpy()
+        t_chunk *= trait_scale[None, :]
+        pair_df = variant_df[:, None] * (trait_df[None, :] / float(df))
+        p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
         beta[start:end] = beta_chunk
         t_stat[start:end] = t_chunk
-        if p_value is not None:
-            p_value[start:end] = p_chunk
-        if return_log10_p:
-            log10_p[start:end] = logp_chunk
-    if return_log10_p:
-        return beta, t_stat, log10_p, q_matrix
+        p_value[start:end] = p_chunk
     return beta, t_stat, p_value, q_matrix
 
 
@@ -742,7 +694,6 @@ def linear_scan_streaming(
     compute_dtype: str = "float32",
     reader_workers: int | None = None,
     prefetch_chunks: int | None = None,
-    return_log10_p: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     requested_device = choose_device(device)
     if (
@@ -759,38 +710,21 @@ def linear_scan_streaming(
             compute_dtype=compute_dtype,
             reader_workers=reader_workers,
             prefetch_chunks=prefetch_chunks,
-            compute_p_values=not return_log10_p,
-            compute_log10_p=return_log10_p,
         )
         n_markers = genotype.shape[1]
         n_traits = phenotype.shape[1]
         beta = np.empty((n_markers, n_traits), dtype=np.float32)
         t_stat = np.empty((n_markers, n_traits), dtype=np.float32)
-        p_value = (
-            None if return_log10_p
-            else np.empty((n_markers, n_traits), dtype=np.float64)
-        )
-        log10_p = (
-            np.empty((n_markers, n_traits), dtype=np.float64)
-            if return_log10_p else None
-        )
-        for chunk_result in chunk_iterator:
-            if return_log10_p:
-                start, end, beta_chunk, t_chunk, _p_chunk, logp_chunk = chunk_result
-            else:
-                start, end, beta_chunk, t_chunk, p_chunk = chunk_result
+        p_value = np.empty((n_markers, n_traits), dtype=np.float64)
+        for start, end, beta_chunk, t_chunk, p_chunk in chunk_iterator:
             beta[start:end] = beta_chunk
             t_stat[start:end] = t_chunk
-            if p_value is not None:
-                p_value[start:end] = p_chunk
-            if return_log10_p:
-                log10_p[start:end] = logp_chunk
-        if return_log10_p:
-            return beta, t_stat, log10_p, q_matrix
+            p_value[start:end] = p_chunk
         return beta, t_stat, p_value, q_matrix
 
     pheno_proc, q_matrix, phenotype_observed_counts = residualize_and_standardize(
-        phenotype, covariates, return_observed_counts=True)
+        phenotype, covariates, device=requested_device,
+        return_observed_counts=True)
     n_samples = pheno_proc.shape[0]
     n_markers = genotype.shape[1]
     n_traits = pheno_proc.shape[1]
@@ -814,20 +748,7 @@ def linear_scan_streaming(
 
     beta = np.empty((n_markers, n_traits), dtype=np_dtype)
     t_stat = np.empty((n_markers, n_traits), dtype=np_dtype)
-    p_value = (
-        None if return_log10_p
-        else np.empty((n_markers, n_traits), dtype=np.float64)
-    )
-    log10_p = (
-        np.empty((n_markers, n_traits), dtype=np.float64)
-        if return_log10_p else None
-    )
-    trait_scale_t = torch.as_tensor(
-        trait_scale, dtype=torch_dtype, device=torch_device
-    ) if return_log10_p else None
-    trait_df_factor_t = torch.as_tensor(
-        trait_df / float(df), dtype=torch.float64, device=torch_device
-    ) if return_log10_p else None
+    p_value = np.empty((n_markers, n_traits), dtype=np.float64)
 
     for start, end, geno_chunk in genotype.iter_chunks(
         chunk_size=chunk,
@@ -839,140 +760,252 @@ def linear_scan_streaming(
         beta_t, t_chunk_t, df_chunk_t = linear_chunk_kernel(
             geno_t, pheno_t, q_t, df, covariate_rank=covariate_rank)
         beta_chunk = beta_t.cpu().numpy()
-        if return_log10_p:
-            adjusted_t = t_chunk_t * trait_scale_t[None, :]
-            pair_df_t = df_chunk_t.double()[:, None] * trait_df_factor_t[None, :]
-            logp_chunk = upper_tail_log10_from_t_torch(adjusted_t, pair_df_t)
-            t_chunk = adjusted_t.cpu().numpy()
-            logp_chunk = logp_chunk.cpu().numpy()
-        else:
-            t_chunk = t_chunk_t.cpu().numpy()
-            variant_df = df_chunk_t.cpu().numpy()
-            t_chunk *= trait_scale[None, :]
-            pair_df = variant_df[:, None] * (trait_df[None, :] / float(df))
-            p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
+        t_chunk = t_chunk_t.cpu().numpy()
+        variant_df = df_chunk_t.cpu().numpy()
+        t_chunk *= trait_scale[None, :]
+        pair_df = variant_df[:, None] * (trait_df[None, :] / float(df))
+        p_chunk = _two_sided_t_pvalue(t_chunk, df=pair_df)
         beta[start:end] = beta_chunk
         t_stat[start:end] = t_chunk
-        if p_value is not None:
-            p_value[start:end] = p_chunk
-        if return_log10_p:
-            log10_p[start:end] = logp_chunk
-    if return_log10_p:
-        return beta, t_stat, log10_p, q_matrix
+        p_value[start:end] = p_chunk
     return beta, t_stat, p_value, q_matrix
 
 
+def multigpu_variant_ranges(n_markers, chunk_size, device_count):
+    """Balanced contiguous ranges on chunk boundaries, shared with planner."""
+    if min(n_markers, chunk_size, device_count) < 1:
+        raise ValueError("positive marker, chunk and device counts required")
+    count = min(device_count, math.ceil(n_markers / chunk_size))
+    quotient, remainder = divmod(math.ceil(n_markers / chunk_size), count)
+    result, cursor = [], 0
+    for index in range(count):
+        end = min(n_markers, cursor + (quotient + (index < remainder)) * chunk_size)
+        result.append((cursor, end))
+        cursor = end
+    return result
+
+
 def linear_scan_multigpu(
-    genotype,
-    phenotype,
-    covariates=None,
-    *,
-    devices=None,
-    chunk_size=None,
-    reader_workers=None,
-    prefetch_chunks=None,
-    compute_p_values=True,
-    **kwargs,
+    genotype, phenotype, covariates=None, *, devices=None, chunk_size=None,
+    reader_workers=None, prefetch_chunks=None, compute_p_values=True,
+    ordered=True, result_queue_depth=4, reduction_factory=None, variant_range=None, shared_queue_depth=None,
+    result_queue_registration=None, shard_transform=None, transform_borrows=False, **kwargs,
 ):
-    """Run one scan across several GPUs, sharded by variant range.
+    """Bounded variant sharding. Close the iterator when stopping early.
 
-    `devices` defaults to every visible CUDA device. With one device this is
-    the ordinary single-device scan, so callers need not special-case it.
-
-    Yields the same `(start, end, beta, t, p)` tuples as the single-device
-    scan, in the file's own variant numbering and in variant order.
+    ordered=True preserves variant order but may stall later shards. For
+    sustained concurrency use ordered=False and index results by start/end.
+    borrow_results=True permits ring views until the next iterator request.
+    Each producer waits for consumer acknowledgement before reusing its ring.
+    Stateful reductions require a factory returning a distinct unprepared
+    instance per active device. Preprocessing is shared; joint factors are not.
+    Ranged results retain absolute source coordinates.
+    shard_transform(iterator) -> iterator runs on each shard's producer
+    thread (e.g. host selection of significant pairs), so per-shard work stays
+    parallel and only its output crosses the shared queue. transform_borrows
+    =True lets the scan hand the transform ring views: the transform must be
+    done with a chunk before it requests the next one.
     """
-    import threading
-    import queue as queue_module
-
+    import queue
     if devices is None:
         count = torch.cuda.device_count() if torch.cuda.is_available() else 0
         devices = [f"cuda:{index}" for index in range(count)] or ["cpu"]
     devices = [str(device) for device in devices]
-
+    if not devices or len(set(devices)) != len(devices):
+        raise ValueError("devices must be nonempty and unique")
+    if not isinstance(result_queue_depth, int) or isinstance(result_queue_depth, bool) or result_queue_depth < 1:
+        raise ValueError("result_queue_depth must be a positive integer")
+    if shared_queue_depth is not None:
+        if (ordered or isinstance(shared_queue_depth, bool) or not isinstance(shared_queue_depth, int)
+                or shared_queue_depth < 1):
+            raise ValueError("shared_queue_depth requires unordered execution and a positive integer")
+    borrow_results = kwargs.get("borrow_results", False)
+    if result_queue_registration is not None and (not callable(result_queue_registration)
+            or ordered or reduction_factory is None or borrow_results or shared_queue_depth is None):
+        raise ValueError('Indexed result queue registration requires an owned unordered reduction queue')
+    if "_reader_worker_limit" in kwargs or kwargs.get("already_processed", False):
+        raise ValueError("multi-GPU driver owns reader limits and preprocessing")
+    if reduction_factory is not None and (not callable(reduction_factory) or kwargs.get("reduction") is not None):
+        raise ValueError("Pass a callable reduction_factory or a reduction, not both")
+    if reader_workers is not None:
+        if isinstance(reader_workers, bool) or not isinstance(reader_workers, (int, np.integer)) or reader_workers < 1:
+            raise ValueError("reader_workers must be a positive integer")
+        reader_workers = int(reader_workers)
     n_markers = int(genotype.shape[1])
-    if len(devices) < 2 or n_markers < len(devices):
-        iterator, q_matrix = linear_scan_streaming_chunks(
+    first, last = _resolve_variant_range(variant_range, n_markers)
+    bounds = [(first + lo, first + hi) for lo, hi in
+              multigpu_variant_ranges(last-first, int(chunk_size or 1), len(devices))] if last > first else []
+    devices = devices[:max(1, len(bounds))]
+    reductions = ([reduction_factory() for _ in devices] if reduction_factory is not None
+                  else [kwargs.get("reduction")] * len(devices))
+    if reduction_factory is not None and (any(value is None for value in reductions)
+            or len({id(value) for value in reductions}) != len(reductions)):
+        raise ValueError("reduction_factory must return distinct reduction instances")
+    if len(devices) > 1 and reduction_factory is None and hasattr(kwargs.get("reduction"), "prepare"):
+        raise ValueError("A stateful multi-GPU reduction requires reduction_factory")
+    if len(devices) < 2:
+        if reduction_factory is not None:
+            kwargs = dict(kwargs, reduction=reductions[0])
+        return linear_scan_streaming_chunks(
             genotype, phenotype, covariates, chunk_size=chunk_size,
             device=devices[0], reader_workers=reader_workers,
-            prefetch_chunks=prefetch_chunks,
-            compute_p_values=compute_p_values, **kwargs)
-        return iterator, q_matrix
+            prefetch_chunks=prefetch_chunks, compute_p_values=compute_p_values,
+            _reader_worker_limit=reader_workers,
+            variant_range=variant_range, **kwargs)
+    if reader_workers is None:
+        shard_workers = [None] * len(devices)
+    else:
+        if reader_workers < len(devices):
+            raise ValueError("reader_workers must provide at least one worker per active device")
+        per_device, remainder = divmod(reader_workers, len(devices))
+        shard_workers = [per_device + (index < remainder) for index in range(len(devices))]
+    if kwargs.get('_chunk_size_selector') is not None or kwargs.get('_chunk_observer') is not None:
+        from .adaptive_chunks import validate_chunk_control
+        for device in devices:
+            validate_chunk_control(genotype, torch.device(device), kwargs.get('compute_dtype', 'float32'),
+                                   chunk_size, kwargs.get('_chunk_size_selector'), kwargs.get('_chunk_observer'))
+    selector = kwargs.get('_chunk_size_selector')
+    shard_selectors = ([selector.for_scan(device, span, int(phenotype.shape[1]))
+                       for device, span in zip(devices, bounds)]
+                      if hasattr(selector, 'for_scan') else [selector] * len(devices))
+    # Native dosage shards take the panel GPU to GPU from the first device
+    # when a second copy fits there; others (and missing phenotypes) use host.
+    keep = (all(str(d).startswith('cuda') for d in devices)
+            and getattr(genotype, 'supports_fused_qc', False) and not hasattr(genotype, 'iter_packed_chunks')
+            and kwargs.get('compute_dtype', 'float32') == 'float32')
+    if keep:
+        panel_bytes = 4 * int(np.shape(phenotype)[0]) * int(np.shape(phenotype)[1])
+        keep = 2 * panel_bytes < 0.5 * torch.cuda.mem_get_info(torch.device(devices[0]))[0]
+    shared_pheno, shared_q, observed = residualize_and_standardize(
+        phenotype, covariates, device=choose_device(devices[0]),
+        return_observed_counts=True, keep_on_device=keep)
+    stop = threading.Event()
+    shared_capacity = shared_queue_depth if shared_queue_depth is not None else result_queue_depth * len(devices)
+    shared_queue = queue.Queue(maxsize=shared_capacity)
+    queues = ([queue.Queue(maxsize=result_queue_depth) for _ in devices]
+              if ordered else [shared_queue] * len(devices))
+    finished, failures = object(), []
+    if result_queue_registration is not None and len(devices)>1:
+        result_queue_registration(shared_queue,bounds,devices,finished)
+    records = {}
+    from .sumstats_tiled import ScanSourceView
 
-    # Divide the reader threads among the shards instead of giving each the
-    # full count: the file and the disk are shared, so replicating readers
-    # multiplies contention without adding bandwidth.
-    if reader_workers is not None:
-        reader_workers = max(1, int(reader_workers) // len(devices))
+    def put(outbox, value):
+        while not stop.is_set():
+            try:
+                outbox.put(value, timeout=0.05)
+                return True
+            except queue.Full:
+                pass
+        return False
 
-    # Residualise once. Every shard needs the same processed phenotype, and at
-    # a large trait count recomputing it per shard is both slow and large.
-    shared_pheno, shared_q = residualize_and_standardize(phenotype, covariates)
-
-    # Contiguous shards whose boundaries land on chunk multiples, so the scan
-    # decomposes into exactly the chunks a single-device run would use and the
-    # results agree bit for bit however many GPUs are visible.
-    grain = int(chunk_size) if chunk_size else 1
-    per_shard = max(grain, ((n_markers // len(devices)) // grain) * grain)
-    bounds = []
-    cursor = 0
-    for index in range(len(devices)):
-        last = index == len(devices) - 1
-        end = n_markers if last else min(n_markers, cursor + per_shard)
-        if cursor >= n_markers:
-            break
-        bounds.append((cursor, end))
-        cursor = end
-    devices = devices[:len(bounds)]
-
-    # One bounded queue per shard. A shard runs ahead into its own queue and
-    # blocks only when that queue is full, which cannot stall another shard.
-    shard_queues = [queue_module.Queue(maxsize=4) for _ in devices]
-    errors: list[BaseException] = []
-    q_holder: dict[str, object] = {}
-    finished = object()
-
-    def run_shard(index, device, span):
-        outbox = shard_queues[index]
+    def run_shard(index, device, span, outbox, workers):
+        iterator = scan = None
+        source = ScanSourceView(genotype)
+        source._last_scan_exclusion_counts = {}
+        source._last_scan_profile = {}
+        if workers is not None and hasattr(source, "decode_workers"):
+            source.decode_workers = workers
+        scan_kwargs = dict(kwargs)
+        if selector is not None:
+            scan_kwargs['_chunk_size_selector'] = shard_selectors[index]
+        if reduction_factory is not None:
+            scan_kwargs["reduction"] = reductions[index]
+        if shard_transform is not None and transform_borrows:
+            scan_kwargs["borrow_results"] = True
         try:
-            iterator, q_matrix = linear_scan_streaming_chunks(
-                genotype, shared_pheno, shared_q, chunk_size=chunk_size,
-                device=device, reader_workers=reader_workers,
+            scan, _ = linear_scan_streaming_chunks(
+                source, shared_pheno, shared_q, chunk_size=chunk_size,
+                device=device, reader_workers=workers,
                 prefetch_chunks=prefetch_chunks,
-                compute_p_values=compute_p_values,
-                variant_range=span, already_processed=True, **kwargs)
-            q_holder.setdefault("q", q_matrix)
+                compute_p_values=compute_p_values, variant_range=span,
+                already_processed=True, observed_counts=observed,
+                _reader_worker_limit=workers, **scan_kwargs)
+            iterator = scan if shard_transform is None else shard_transform(scan)
             for item in iterator:
-                outbox.put(item)
-        except BaseException as error:  # noqa: BLE001 - re-raised to the caller
-            errors.append(error)
+                acknowledgement = threading.Event() if borrow_results else None
+                delivered = put(outbox, (item, acknowledgement) if borrow_results else item)
+                # The queue/caller now owns the result. Keeping this local
+                # through next(iterator) retains a wide array during the next
+                # scan wait and moves its destruction onto a later stage.
+                del item
+                if not delivered:
+                    break
+                if acknowledgement is not None:
+                    while not acknowledgement.wait(0.05):
+                        if stop.is_set():
+                            return
+                    if stop.is_set():
+                        return
+            if not stop.is_set():
+                records[index] = dict(device=device, variant_range=list(span), reader_workers=workers,
+                    exclusions=dict(getattr(source, "_last_scan_exclusion_counts", {})),
+                    profile=dict(getattr(source, "_last_scan_profile", {})))
+        except BaseException as error:
+            failures.append(error)
+            stop.set()
         finally:
-            outbox.put(finished)
-
-    threads = [threading.Thread(target=run_shard, args=(index, device, span),
-                                name=f"torchgwas-shard-{index}", daemon=True)
-               for index, (device, span) in enumerate(zip(devices, bounds))]
-    for thread in threads:
-        thread.start()
+            try:
+                for opened in (iterator, scan):  # a transform does not close its source
+                    if opened is not None and hasattr(opened, "close"):
+                        opened.close()
+            except BaseException as error:
+                failures.append(error)
+                stop.set()
+            put(outbox, finished)
 
     def drain():
+        threads = [threading.Thread(target=run_shard, args=(index, device, span, outbox, workers),
+                   name=f"torchgwas-shard-{index}", daemon=True)
+                   for index, (device, span, outbox, workers) in enumerate(zip(devices, bounds, queues, shard_workers))]
+        for thread in threads:
+            thread.start()
         try:
-            # Shards cover ascending contiguous ranges and each shard's chunks
-            # arrive in order, so draining them in turn is already sorted.
-            for outbox in shard_queues:
-                while True:
-                    item = outbox.get()
-                    if item is finished:
-                        break
-                    yield item
+            remaining, index = len(threads), 0
+            while remaining:
+                if failures:
+                    raise failures[0]
+                try:
+                    item = (queues[index] if ordered else shared_queue).get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if item is finished:
+                    remaining -= 1
+                    if ordered:
+                        index += 1
+                else:
+                    acknowledgement = None
+                    if borrow_results:
+                        item, acknowledgement = item
+                    try:
+                        yield item
+                    except BaseException:
+                        stop.set()
+                        raise
+                    finally:
+                        # Drop the previous result before the next blocking get.
+                        del item
+                        if acknowledgement is not None:
+                            acknowledgement.set()
         finally:
+            stop.set()
             for thread in threads:
                 thread.join()
-        if errors:
-            raise errors[0]
-
-    return drain(), q_holder.get("q")
-
+        if failures:
+            raise failures[0]
+        if set(records) != set(range(len(devices))):
+            raise RuntimeError("Incomplete variant shard coverage")
+        shards = [records[index] for index in range(len(devices))]
+        categories = set(shards[0]['exclusions'])
+        if any(set(row['exclusions']) != categories for row in shards):
+            raise RuntimeError("Genotype exclusion categories differ across variant shards")
+        genotype._last_scan_exclusion_counts = {
+            key: sum(row['exclusions'][key] for row in shards) for key in categories}
+        genotype._last_scan_profile = dict(mode='variant_shards', devices=devices,
+            variant_range=[first, last], reader_workers=reader_workers, shards=shards,
+            result_queue_capacity=result_queue_depth * len(devices) if ordered else shared_capacity,
+            ordered=ordered, scope='One shared phenotype preprocessing pass; independent per-device reduction state and scan counters. Per-shard durations can overlap.')
+    return drain(), shared_q
 
 def _default_chunk_variants(genotype, device, n_samples, n_markers, n_traits,
                             covariate_rank, prefetch_chunks):
@@ -1068,18 +1101,38 @@ def linear_scan_streaming_chunks(
     reader_workers: int | None = None,
     prefetch_chunks: int | None = None,
     compute_p_values: bool = True,
-    compute_log10_p: bool = False,
     variant_range: tuple[int, int] | None = None,
     already_processed: bool = False,
     reduction=None,
     borrow_results: bool = False,
+    observed_counts: np.ndarray | None = None,
+    _reader_worker_limit: int | None = None,
+    return_df: bool = False,
+    _prevalidated_observed_counts=None,
+    _prevalidated_covariate_basis=...,
+    significance=None,
+    significance_n_traits=None,
+    _chunk_size_selector=None,
+    _chunk_observer=None,
+    return_beta: bool = True,
+    _shared_loader=None,
+    _significance_backend=None,
 ) -> tuple[
     Iterator[tuple[int, int, np.ndarray, np.ndarray, np.ndarray | None]],
     np.ndarray | None,
 ]:
-    if compute_log10_p and reduction is not None:
-        raise ValueError("compute_log10_p is supported only for full result matrices")
-
+    if significance is not None and reduction is not None:
+        raise ValueError('Significance and joint reduction are mutually exclusive')
+    # return_df appends a broadcastable df array to each unreduced chunk.
+    # Its lifetime follows beta/t: borrowed until next() or owned otherwise.
+    if type(return_beta) is not bool or (not return_beta and reduction is not None):
+        raise ValueError('Beta omission requires unreduced chunks and boolean return_beta')
+    if type(return_df) is not bool:
+        raise ValueError('return_df must be boolean')
+    if return_df and reduction is not None:
+        raise ValueError('return_df requires unreduced chunks')
+    if already_processed and _prevalidated_covariate_basis is not ...:
+        raise ValueError('A prevalidated covariate basis requires unprocessed phenotypes')
     # With `reduction` set, every backend yields a six-tuple
     # `(start, end, beta, t, p, trait_index)` whose trait axis is k wide instead
     # of K, and the wide matrix is never copied off the device. The five-tuple
@@ -1093,21 +1146,33 @@ def linear_scan_streaming_chunks(
     # measured between 0.37 s and 10.26 s for the same call at 512 traits, the
     # spread coming from torch's thread pool degrading numpy's threaded GEMM.
     torch_device = choose_device(device)
+    if _chunk_size_selector is not None or _chunk_observer is not None:
+        from .adaptive_chunks import validate_chunk_control
+        validate_chunk_control(genotype, torch_device, compute_dtype, chunk_size,
+                               _chunk_size_selector, _chunk_observer)
+        if hasattr(_chunk_size_selector, 'for_scan'):
+            _chunk_size_selector = _chunk_size_selector.for_scan(str(torch_device),
+                _resolve_variant_range(variant_range, int(genotype.shape[1])), int(phenotype.shape[1]))
+        if hasattr(_chunk_observer, 'for_scan'):
+            _chunk_observer = _chunk_observer.for_scan(str(torch_device),
+                _resolve_variant_range(variant_range, int(genotype.shape[1])), int(phenotype.shape[1]),
+                reader_workers=reader_workers if _reader_worker_limit is None else _reader_worker_limit,
+                capacity=chunk_size,depth=prefetch_chunks)
     if already_processed:
         pheno_proc, q_matrix = phenotype, covariates
     else:
         pheno_proc, q_matrix, phenotype_observed_counts = residualize_and_standardize(
             phenotype, covariates, device=torch_device,
-            return_observed_counts=True)
+            return_observed_counts=True,
+            _prevalidated_observed_counts=_prevalidated_observed_counts,
+            _prevalidated_covariate_basis=_prevalidated_covariate_basis)
     if already_processed:
-        phenotype_observed_counts = np.full(
+        phenotype_observed_counts = (np.full(
             pheno_proc.shape[1], pheno_proc.shape[0], dtype=np.int64)
-    # A reduction that needs a whole-trait-set quantity -- jagwas needs the
-    # K x K trait correlation and its Cholesky factor -- gets one chance to
-    # compute it, here, from the *processed* design the scan will actually use.
-    # Deriving it from the raw phenotype instead would use different columns.
-    if reduction is not None and hasattr(reduction, "prepare"):
-        reduction.prepare(pheno_proc, device=torch_device)
+            if observed_counts is None else np.asarray(observed_counts, dtype=np.int64))
+        if (phenotype_observed_counts.shape != (pheno_proc.shape[1],) or np.any(phenotype_observed_counts < 0) or np.any(phenotype_observed_counts > pheno_proc.shape[0])):
+            raise ValueError("observed_counts must match the phenotype width")
+
     n_samples = pheno_proc.shape[0]
     n_markers = genotype.shape[1]
     covariate_rank = 0 if q_matrix is None else q_matrix.shape[1]
@@ -1122,57 +1187,60 @@ def linear_scan_streaming_chunks(
     if np.any(trait_df <= 0):
         raise ValueError("non-positive phenotype-specific residual degrees of freedom")
     phenotype_has_missing = bool(np.any(phenotype_observed_counts != n_samples))
-    if phenotype_has_missing and reduction is not None:
+    # JAGWAS takes the mean-imputed panel's t with the scan's common df as it
+    # is: z = t / sqrt(1 + t^2/df) = sqrt(df) r, whose null correlation is the
+    # Gram of that same panel, i.e. its R, unit diagonal included. Rescaling t
+    # by sqrt(trait_df / df), as full output does, would leave z a null
+    # variance of trait_df / df against R's 1. Other reductions need
+    # pair-specific df and still refuse missingness.
+    if phenotype_has_missing and reduction is not None and getattr(reduction, "mode", None) != "jagwas":
         raise ValueError(
-            "phenotype missingness is supported in full mode; trait reductions "
-            "need pair-specific df and are not yet supported")
+            "phenotype missingness is supported in full mode and for jagwas; other trait "
+            "reductions need pair-specific df and are not yet supported")
+    if getattr(reduction, "mode", None) == "jagwas" and pheno_proc.shape[1] > n_samples-covariate_rank-1:
+        raise ValueError("jagwas trait count exceeds the residual phenotype rank")
+    # Validate rank and missingness before allocating a joint factor.
+    if reduction is not None and hasattr(reduction, "prepare"):
+        reduction.prepare(pheno_proc, device=torch_device)
     trait_scale = np.sqrt(trait_df / float(df)).astype(np.float32)
 
     def apply_phenotype_missingness(iterator):
-        if not phenotype_has_missing:
-            yield from iterator
+        if not phenotype_has_missing or reduction is not None:
+            if return_beta:
+                yield from iterator
+            else:
+                try:
+                    for chunk_result in iterator:
+                        index=4 if len(chunk_result)==7 else 2
+                        if chunk_result[index] is not None:
+                            chunk_result=(*chunk_result[:index],None,*chunk_result[index+1:])
+                        yield chunk_result
+                finally:
+                    if hasattr(iterator,'close'):iterator.close()
             return
         for chunk_result in iterator:
-            if compute_log10_p:
-                start, end, beta, t_stat, _p, _logp = chunk_result
-            else:
-                start, end, beta, t_stat, _p = chunk_result
+            start, end, beta, t_stat, _p = chunk_result[:5]
             t_stat *= trait_scale[None, :]
-            if compute_log10_p:
-                t_tail = torch.as_tensor(
-                    t_stat, dtype=torch.float64, device=torch_device)
-                df_tail = torch.as_tensor(
-                    trait_df[None, :], dtype=torch.float64,
-                    device=torch_device)
-                logp = upper_tail_log10_from_t_torch(t_tail, df_tail).cpu().numpy()
-                p_value = None
-                if compute_p_values:
-                    with np.errstate(under="ignore"):
-                        p_value = np.power(10.0, -logp)
-                yield start, end, beta, t_stat, p_value, logp
-            else:
-                p_value = (
-                    _two_sided_t_pvalue(t_stat, df=trait_df[None, :])
-                    if compute_p_values else None
-                )
-                yield start, end, beta, t_stat, p_value
+            pair_df=(np.asarray(chunk_result[5])*(trait_df[None,:]/float(df))
+                     if len(chunk_result)==6 else trait_df[None,:])
+            p_value = (
+                _two_sided_t_pvalue(t_stat, df=pair_df)
+                if compute_p_values else None
+            )
+            result = (start, end, beta if return_beta else None, t_stat, p_value)
+            yield (*result, pair_df) if return_df else result
     np_dtype, torch_dtype = _resolve_compute_dtypes(compute_dtype)
 
-    # Both CUDA fast paths stage results through a preallocated `chunk x k`
-    # pinned ring, so a significance threshold -- whose result length is a
-    # property of the data -- does not fit here. It is not handled by a second
-    # transport either: an earlier version routed it to the generic device path
-    # and that measured **307x slower** (1362.75 s against 4.44 s on the same
-    # 200,000-variant scan). `run_linear_gwas` instead turns a significance
-    # request into an ordinary top-k reduction, which this path already runs at
-    # full speed, and applies the threshold in the writer. Exact whenever fewer
-    # than k traits at a variant clear it, and the writer reports the variants
-    # where it cannot be sure.
+    # Native decoded inputs can filter on the device before transfer. Other
+    # paths retain dense chunks and use the same exact host selector. The
+    # experimental backend is explicit until end-to-end controls are complete.
     if (
         torch_device.type == "cuda"
         and compute_dtype == "float32"
         and hasattr(genotype, "iter_packed_chunks")
     ):
+        if _shared_loader is not None:
+            raise ValueError('Shared decode applies only to the native dosage pipeline')
         return (
             apply_phenotype_missingness(_packed_bed_cuda_iterator(
                 genotype,
@@ -1182,10 +1250,12 @@ def linear_scan_streaming_chunks(
                 torch_device,
                 reader_workers,
                 compute_p_values,
-                compute_log10_p,
                 variant_range,
                 reduction=reduction,
                 borrow_results=borrow_results,
+                return_df=return_df,
+                chunk_size_selector=_chunk_size_selector,
+                chunk_observer=_chunk_observer,
             )),
             q_matrix,
         )
@@ -1196,10 +1266,19 @@ def linear_scan_streaming_chunks(
         return apply_phenotype_missingness(dosage_cuda_iterator(genotype, pheno_proc, q_matrix, chunk,
                                     torch_device, reader_workers, prefetch_chunks,
                                     compute_p_values,
-                                    compute_log10_p,
                                     variant_range=variant_range,
-                                    reduction=reduction)), q_matrix
+                                    reduction=reduction, reader_worker_limit=_reader_worker_limit,
+                                    borrow_results=borrow_results, return_df=return_df,
+                                    significance=(significance if not phenotype_has_missing and
+                                        (_significance_backend or os.environ.get('TORCHGWAS_SIGNIFICANCE_BACKEND','host'))=='device'
+                                        else None),
+                                    significance_n_traits=significance_n_traits,
+                                    chunk_size_selector=_chunk_size_selector,
+                                    chunk_observer=_chunk_observer, return_beta=return_beta,
+                                    shared_loader=_shared_loader)), q_matrix
 
+    if _shared_loader is not None:
+        raise ValueError('Shared decode applies only to the native dosage pipeline')
     pheno_t = torch.as_tensor(pheno_proc, dtype=torch_dtype, device=torch_device)
     q_t = None if q_matrix is None else torch.as_tensor(q_matrix, dtype=torch_dtype, device=torch_device)
 
@@ -1207,13 +1286,28 @@ def linear_scan_streaming_chunks(
         # Only ask for a range when one was requested: not every source
         # implements the parameter, and an unranged scan must call as before.
         extra = {} if variant_range is None else {"variant_range": variant_range}
-        for start, end, geno_chunk in genotype.iter_chunks(
-            chunk_size=chunk,
-            dtype=np_dtype,
-            prefetch_chunks=prefetch_chunks,
-            reader_workers=reader_workers,
-            **extra,
-        ):
+        if _chunk_size_selector is not None and hasattr(genotype, "read_chunk"):
+            # Adaptive sizes through the source's range reader.
+            from .streaming import SelectedRangeLoader
+            chunks = SelectedRangeLoader(genotype.read_chunk, chunk, _chunk_size_selector, np_dtype,
+                                         prefetch_chunks or 4, reader_workers or 4,
+                                         _resolve_variant_range(variant_range, n_markers))
+        else:
+            chunks = genotype.iter_chunks(
+                chunk_size=chunk,
+                dtype=np_dtype,
+                prefetch_chunks=prefetch_chunks,
+                reader_workers=reader_workers,
+                **extra,
+            )
+
+        def observed(start, end):
+            if _chunk_observer is not None:
+                from .adaptive_chunks import MinimalChunkObservation
+                _chunk_observer(MinimalChunkObservation(int(start), int(end), int(chunk),
+                                                        str(torch_device), time.perf_counter()))
+
+        for start, end, geno_chunk in chunks:
             geno_t = torch.as_tensor(geno_chunk, dtype=torch_dtype, device=torch_device)
             beta_t, t_chunk_t, df_chunk_t = linear_chunk_kernel(
                 geno_t, pheno_t, q_t, df, covariate_rank=covariate_rank)
@@ -1227,7 +1321,7 @@ def linear_scan_streaming_chunks(
                 beta_t, t_chunk_t, index_t, _, _ = reduction.reduce(
                     beta_t, t_chunk_t, clear, df_chunk_t, width)
                 index_chunk = index_t.cpu().numpy()
-            beta_chunk = beta_t.cpu().numpy()
+            beta_chunk = beta_t.cpu().numpy() if return_beta else None
             t_chunk = t_chunk_t.cpu().numpy()
             df_chunk = df_chunk_t.cpu().numpy()
             if reduction is not None:
@@ -1235,18 +1329,12 @@ def linear_scan_streaming_chunks(
                 p_chunk = (_two_sided_t_pvalue(t_chunk, df=df_chunk[:, None])
                            if compute_p_values else None)
                 yield start, end, beta_chunk, t_chunk, p_chunk, index_chunk
-                continue
-            if compute_log10_p:
-                logp_chunk = upper_tail_log10_from_t_torch(
-                    t_chunk_t, df_chunk_t[:, None]).cpu().numpy()
-                p_chunk = None
-                if compute_p_values:
-                    with np.errstate(under="ignore"):
-                        p_chunk = np.power(10.0, -logp_chunk)
-                yield start, end, beta_chunk, t_chunk, p_chunk, logp_chunk
+                observed(start, end)
                 continue
             p_chunk = (_two_sided_t_pvalue(t_chunk, df=df_chunk)
                        if compute_p_values else None)
-            yield start, end, beta_chunk, t_chunk, p_chunk
+            result = (start, end, beta_chunk, t_chunk, p_chunk)
+            yield (*result, df_chunk[:, None]) if return_df else result
+            observed(start, end)
 
     return apply_phenotype_missingness(_iterator()), q_matrix

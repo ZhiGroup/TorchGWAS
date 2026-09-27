@@ -1,0 +1,1 @@
+bed_hcstore|--path /data/zxie3/torchgwas_bench/full_hardcall.bed --hardcall-store /data/zxie3/torchgwas_bench/hcstore/full

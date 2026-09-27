@@ -1,0 +1,2 @@
+zstd|--path /data/zxie3/torchgwas_bench/full_zstd/full_dosage_pgen_efa599586748
+bed_hcstore|--path /data/zxie3/torchgwas_bench/full_hardcall.bed --hardcall-store /data/zxie3/torchgwas_bench/hcstore/full
