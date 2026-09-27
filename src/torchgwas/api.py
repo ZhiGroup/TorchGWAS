@@ -1883,7 +1883,7 @@ def run_linear_gwas(
                     finalize_reduced()
             elif (significance is not None or jagwas is not None or reduction is not None
                   or p_value_threshold is not None):
-                from .sumstats_indexed import write_indexed_sumstats,IndexedOutputPartition,COALESCE_ROWS
+                from .sumstats_indexed import write_indexed_sumstats,IndexedOutputPartition,COALESCE_BYTES
                 kind = ("significant" if significance is not None else "jagwas" if jagwas is not None
                         else "reduced" if reduction is not None else "filtered")
                 indexed_observed=output_progress is not None and kind in ('jagwas','significant')
@@ -1917,7 +1917,7 @@ def run_linear_gwas(
                     partition_for_range=partition_for_range,variant_offset=source_start,
                     live_progress=indexed_live_progress,
                     # Large parts unless the JIT path observes each chunk's write.
-                    coalesce_rows=None if indexed_observed else COALESCE_ROWS,
+                    coalesce_bytes=None if indexed_observed else COALESCE_BYTES,
                     variant_source=variant_source, embed_variant_ids=embed_variant_ids)
             else:
                 n_rows, sumstats_summary = _write_linear_binary_streaming(

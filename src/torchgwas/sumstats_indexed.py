@@ -62,7 +62,13 @@ class IndexedChunkWrite:
  source_variant_range: tuple[int,int] | None = None
 
 
-COALESCE_ROWS=1<<18  # rows per part when no per-chunk durability is observed
+COALESCE_ROWS=1<<18  # rows per part (explicit callers)
+# Default part size when no per-chunk durability is observed. Rows differ in
+# width by output (16 bytes per JAGWAS variant, ~28 per significant pair), so
+# the target is bytes: fsyncs are total bytes / 64 MiB plus one per producer
+# (a full-scale JAGWAS store, ~130 MB, is a handful rather than ~35 at 2**18
+# rows), and a producer buffers at most 64 MiB.
+COALESCE_BYTES=64<<20
 MERGE_WINDOW_VARIANTS=1<<16  # variant span merged at a time when parts overlap
 
 
@@ -70,7 +76,7 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
                            *,kind,df,chi2_df=None,extra_manifest=None,
                            p_value_threshold=None,variant_metadata=None,fsync=True,store_beta=True,before_publish=None,
                            on_chunk_written=None,partition_for_range=None,variant_offset=0,live_progress=None,
-                           coalesce_rows=None,variant_source=None,embed_variant_ids=None):
+                           coalesce_rows=None,variant_source=None,embed_variant_ids=None,coalesce_bytes=None):
  """variant_source (variant_source.variant_source_record): rows keep their
  variant_index and the manifest records the input they index; the IDs and
  variant metadata are then the genotype's own and are not rewritten.
@@ -119,21 +125,27 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
  # starts, so interleaved variant shards or phenotype tiles keep their own.
  if coalesce_rows is not None and (on_chunk_written is not None or type(coalesce_rows) is not int or coalesce_rows<1):
   raise ValueError('coalesce_rows needs a positive row count and no per-chunk observer')
+ if coalesce_bytes is not None and (on_chunk_written is not None or type(coalesce_bytes) is not int or coalesce_bytes<1):
+  raise ValueError('coalesce_bytes needs a positive byte count and no per-chunk observer')
+ coalescing=coalesce_rows is not None or coalesce_bytes is not None
  lanes={}
  def flush(lane):
   if lane['values']:
    emit({key:np.concatenate([v[key] for v in lane['values']]) for key in lane['values'][0]},
         lane['start'],lane['end'])
  def add(values,start,end):
-  if coalesce_rows is None:return emit(values,start,end)
+  if not coalescing:return emit(values,start,end)
   waiting=lanes.get(start)
-  lane=waiting.pop() if waiting else dict(start=start,end=start,values=[],rows=0)
+  lane=waiting.pop() if waiting else dict(start=start,end=start,values=[],rows=0,bytes=0)
   if waiting is not None and not waiting:del lanes[start]
   count=len(values['variant_index'])
-  if count:lane['values'].append(values);lane['rows']+=count
+  if count:
+   lane['values'].append(values);lane['rows']+=count
+   lane['bytes']+=sum(np.asarray(value).nbytes for value in values.values())
   lane['end']=end
-  if lane['rows']>=coalesce_rows:
-   flush(lane);lane=dict(start=end,end=end,values=[],rows=0)
+  if ((coalesce_rows is not None and lane['rows']>=coalesce_rows) or
+      (coalesce_bytes is not None and lane['bytes']>=coalesce_bytes)):
+   flush(lane);lane=dict(start=end,end=end,values=[],rows=0,bytes=0)
   lanes.setdefault(end,[]).append(lane)
   return None
  def completed(start,end,began,part,partition):
@@ -201,7 +213,7 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
  # Publication steps are timed: they follow the scan, so their fsyncs are
  # exposed to other writers' data on the same filesystem (ext4 data=ordered).
  publication={};step=time.perf_counter()
- parts,ordering=_order_parts(directory,parts,fsync,merge=ordered_rows and coalesce_rows is not None)
+ parts,ordering=_order_parts(directory,parts,fsync,merge=ordered_rows and coalescing)
  publication['order_parts_seconds']=time.perf_counter()-step
  embed=variant_source is None if embed_variant_ids is None else bool(embed_variant_ids)
  if embed:
@@ -279,8 +291,9 @@ def _order_parts(directory,parts,fsync,*,merge=True):
   if taken:
    rows={key:np.concatenate([values[key] for values in taken]) for key in taken[0]}
    order=np.lexsort((rows['trait_index'],rows['variant_index']))
-   out.append((cursor,{key:value[order] for key,value in rows.items()}));buffered+=len(order)
-   if buffered>=COALESCE_ROWS:
+   out.append((cursor,{key:value[order] for key,value in rows.items()}))
+   buffered+=sum(value.nbytes for value in rows.values())
+   if buffered>=COALESCE_BYTES:
     drain(end);buffered=0
   cursor=end
  drain(cursor)
