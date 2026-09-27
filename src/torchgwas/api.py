@@ -438,11 +438,13 @@ def _write_linear_binary_streaming(
     )
     try:
         for chunk in chunk_iterator:
-            start, end, beta_chunk, t_chunk, _p_chunk = chunk[:5]
-            if store_variant_df and len(chunk)!=6:
+            # (start, end, beta, t, p, -log10 P[, df]): the scan computed
+            # -log10 P on the device (compute_log10_p).
+            start, end, beta_chunk, t_chunk, _p_chunk, logp_chunk = chunk[:6]
+            if store_variant_df and len(chunk)!=7:
                 raise ValueError('Per-variant df output requires scan df metadata')
-            writer.write_chunk(start, end, beta_chunk, t_chunk,
-                               variant_df=chunk[5] if store_variant_df else None)
+            writer.write_chunk(start, end, beta_chunk, t_chunk, logp_chunk,
+                               variant_df=chunk[6] if store_variant_df else None)
     except BaseException:
         writer.abort()
         raise
@@ -717,6 +719,15 @@ def run_linear_gwas(
         if reduce != 'jagwas':
             trait_block = autotuner.qc_trait_block
     resolved_device = choose_device(autotuner.devices[0] if autotuner else variant_devices[0] if variant_devices else device)
+    # Dense binary output stores -log10 P computed on each scan device
+    # (tails.neg_log10_p_device); compiling it for a GPU takes seconds, so it
+    # starts here and overlaps input loading and preparation.
+    if (output_dir is not None and sumstats_format == "binary" and reduce is None
+            and significance_threshold is None and p_value_threshold is None
+            and _internal_reduction is None):
+        from .tails import prepare_device_tail_async
+        prepare_device_tail_async(autotuner.devices if autotuner else
+                                  variant_devices or trait_devices or [resolved_device])
     genotype_meta = {}
     requested_sample_ids = _coerce_vector_or_path(sample_ids)
     # Streaming stores record this input instead of rewriting its variant IDs
@@ -1198,7 +1209,11 @@ def run_linear_gwas(
                                        else np.asarray(covariates).shape[1]),
                     transfer_bytes_per_variant=per_variant,
                     device_memory_bytes=float(free_bytes),
-                    reduced=(reduction is not None or significance is not None))
+                    reduced=(reduction is not None or significance is not None),
+                    # Dense binary output stages -log10 P as well.
+                    compute_log10_p=(output_dir is not None and sumstats_format == "binary"
+                                     and reduction is None and significance is None
+                                     and p_value_threshold is None))
         except ImportError:
             pass
         # PlanTooLarge is NOT caught: refusing early with a workable setting is
@@ -1567,6 +1582,7 @@ def run_linear_gwas(
                 iterator,_=linear_scan_streaming_chunks(source,tile_phenotype,covariates,
                     chunk_size=chunk_size,device=str(tile_device),compute_dtype=resolved_compute_dtype,
                     reader_workers=workers,prefetch_chunks=prefetch_chunks,compute_p_values=False,
+                    compute_log10_p=True,log10_p_dtype='float32',
                     variant_range=variant_range if _variant_span is None else _variant_span,borrow_results=True,return_df=True,_reader_worker_limit=workers,
                     _prevalidated_observed_counts=tile_observed_counts[first:first+width],
                     _prevalidated_covariate_basis=q_matrix,
@@ -1652,6 +1668,8 @@ def run_linear_gwas(
             full_binary_df = (sumstats_format == 'binary' and reduction is None
                               and significance is None
                               and p_value_threshold is None and trait_block is None)
+            dense_log10_p = (sumstats_format == 'binary' and reduction is None
+                             and significance is None and p_value_threshold is None)
 
             def _scan(trait_slice=None, device=None, *, source=None, workers=None,
                       observed_counts=None, basis=..., shared_loader=None):
@@ -1682,6 +1700,8 @@ def run_linear_gwas(
                     # cards idle, disk idle, worse as K grows, unaffected by
                     # running one process per card) and it was not one.
                     compute_p_values=False,
+                    # Dense binary output stores -log10 P, computed on the device.
+                    compute_log10_p=dense_log10_p, log10_p_dtype='float32',
                     variant_range=variant_range,
                     reduction=reduction,
                     borrow_results=borrow_results,
@@ -1853,7 +1873,9 @@ def run_linear_gwas(
                     from .sumstats_indexed import PartitionedIndexedChunk
                     try:
                         for chunk in source:
-                            if len(chunk) == 7:
+                            # Dense chunks with -log10 P and df are seven long
+                            # too; only selected pairs carry variant indices.
+                            if len(chunk) == 7 and significance is not None:
                                 payload=(chunk[0]-offset,chunk[1]-offset,chunk[2]-offset,*chunk[3:])
                             else:
                                 payload=(chunk[0]-offset,chunk[1]-offset,*chunk[2:])
@@ -1977,7 +1999,7 @@ def run_linear_gwas(
                 raise ValueError(
                     "variant_range requires output_dir: the in-memory result "
                     "path scans the whole file and would silently ignore it")
-            beta, t_stat, p_value, q_matrix = linear_scan_streaming(
+            beta, t_stat, logp, q_matrix = linear_scan_streaming(
                 genotype,
                 phenotype,
                 covariates,
@@ -1986,8 +2008,8 @@ def run_linear_gwas(
                 compute_dtype=resolved_compute_dtype,
                 reader_workers=reader_workers,
                 prefetch_chunks=prefetch_chunks,
+                return_log10_p=True,
             )
-            logp = upper_tail_log10(p_value)
             table = []
             for marker_index, marker_name in enumerate(marker_names):
                 for trait_index, trait_name in enumerate(trait_names):
@@ -1995,7 +2017,6 @@ def run_linear_gwas(
                         "marker_id": marker_name,
                         "trait": trait_name,
                         "n": int(genotype_shape[0]),
-                        "p_value": float(p_value[marker_index, trait_index]),
                         "-log10_p": float(logp[marker_index, trait_index]),
                     }
                     if return_beta:
@@ -2019,16 +2040,16 @@ def run_linear_gwas(
             qc["n_variants_excluded"] = int(sum(scan_exclusions.values()))
     else:
         genotype, phenotype, covariates, qc = prepare_inputs(genotype, phenotype, covariates)
-        beta, t_stat, p_value, q_matrix = linear_scan(
+        beta, t_stat, logp, q_matrix = linear_scan(
             genotype,
             phenotype,
             covariates,
             chunk_size=chunk_size,
             device=str(resolved_device),
             compute_dtype=resolved_compute_dtype,
+            return_log10_p=True,
         )
         genotype_shape = list(genotype.shape)
-        logp = upper_tail_log10(p_value)
         # Zero-variance columns are dropped by prepare_inputs, so labels follow
         # the retained indices rather than a prefix of the original order.
         kept_markers = qc.get("genotype_kept_column_indices")
@@ -2051,7 +2072,6 @@ def run_linear_gwas(
                     "marker_id": marker_name,
                     "trait": trait_name,
                     "n": int(genotype_shape[0]),
-                    "p_value": float(p_value[marker_index, trait_index]),
                     "-log10_p": float(logp[marker_index, trait_index]),
                 }
                 if return_beta:
@@ -2212,7 +2232,7 @@ def run_linear_gwas(
                     marker_names=marker_names,
                     trait_names=trait_names,
                     n_samples=genotype_shape[0],
-                    chunk_iterator=iter([(0, n_variants, beta, t_stat, None)]),
+                    chunk_iterator=iter([(0, n_variants, beta, t_stat, None, logp)]),
                     n_variants=n_variants,
                     df=genotype_shape[0]
                     - (0 if q_matrix is None else q_matrix.shape[1])

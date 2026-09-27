@@ -63,8 +63,8 @@ def test_dense_payload_df_and_sequential_device_windows(input_path,count,block_b
     original=deepcopy(windows);graph=evaluate(windows,options,return_graph=True);solved=graph.solve()
     report=evaluate(windows,options)
     assert windows==original
-    assert report['payload_bytes']==4*10*(2*5+3)
-    assert sum(r['fsync_calls'] for r in report['windows'])==9
+    assert report['payload_bytes']==4*10*(3*5+3)
+    assert sum(r['fsync_calls'] for r in report['windows'])==12  # beta, t, -log10 P, df per window
     assert report['source_chunks']==9 and report['estimated_window_seconds']==solved['seconds']
     assert solved['start'][f'window:{count}:submit_decode:0']>=solved['end']['window:0:complete']
     for i in range(3):
@@ -252,8 +252,8 @@ def test_equal_work_compares_different_tiles_devices_and_chunkening(input_path):
     assert result['coverage']==[dict(variant_range=[0,10],trait_ranges=[[0,4]])]
     assert result['baseline']['source_chunks']==6 and result['candidate']['source_chunks']==8
     # Same associations, with one df stream per phenotype tile.
-    assert result['baseline']['payload_bytes']==4*10*(2*4+2)
-    assert result['candidate']['payload_bytes']==4*10*(2*4+4)
+    assert result['baseline']['payload_bytes']==4*10*(3*4+2)
+    assert result['candidate']['payload_bytes']==4*10*(3*4+4)
     assert result['calculation_wall_seconds']>0 and result['calculation_cpu_seconds']>0
     assert not result['selection_validated']
 
@@ -267,7 +267,7 @@ def test_equal_dense_work_can_compare_trait_and_variant_partitions(input_path):
     with patch('torchgwas.mechanistic_torch.tensor_stage_service',side_effect=component):
         report=compare_prepared_windows(dict(windows=before,partition_axis='trait'),
             dict(windows=after,partition_axis='variant'),**options)
-    assert report['candidate']['payload_bytes']==4*10*(2*5+1)
+    assert report['candidate']['payload_bytes']==4*10*(3*5+1)
     assert report['coverage']==[dict(variant_range=[0,10],trait_ranges=[[0,5]])]
     after[1]['device']='cuda:0'
     with pytest.raises(ValueError,match='one window'):evaluate(after,options,partition_axis='variant')

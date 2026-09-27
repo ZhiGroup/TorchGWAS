@@ -450,7 +450,8 @@ def output_write_rates(directory, *, n_traits, store_beta=True, writers=4, probe
     import tempfile
     from pathlib import Path
     from .sumstats import BinarySumstatsWriter
-    per_variant = n_traits * (8 if store_beta else 4) + 4
+    # beta (optional), t and -log10 P per cell, and one df per variant.
+    per_variant = n_traits * (12 if store_beta else 8) + 4
     rows = max(chunk_rows, int(probe_bytes // per_variant) // chunk_rows * chunk_rows)
     beta = np.zeros((chunk_rows, n_traits), dtype=np.float32)
     df = np.full((chunk_rows, 1), 100.0, dtype=np.float32)
@@ -464,7 +465,7 @@ def output_write_rates(directory, *, n_traits, store_beta=True, writers=4, probe
             for start in range(0, rows, chunk_rows):
                 end = min(rows, start + chunk_rows)
                 writer.write_chunk(start, end, beta[:end - start] if store_beta else None,
-                                   beta[:end - start], df[:end - start])
+                                   beta[:end - start], beta[:end - start], variant_df=df[:end - start])
             writer.close()
         except BaseException:
             writer.abort()

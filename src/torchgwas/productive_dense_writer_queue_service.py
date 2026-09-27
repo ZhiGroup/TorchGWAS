@@ -24,7 +24,7 @@ def price_dense_writer_queue_observation(observation, profile):
             observation.get('atomic_writer_streams') is not True or
             not isinstance(observation.get('streams'), dict) or
             not observation['streams'] or
-            set(observation['streams']) - {'beta', 't_stat', 'df'} or
+            set(observation['streams']) - {'beta', 't_stat', 'neg_log10_p', 'df'} or
             't_stat' not in observation['streams']):
         raise ValueError('One valid atomic native dense writer observation required')
     started = observation.get('capture_started_seconds')
@@ -103,7 +103,7 @@ def price_bracketed_dense_writer_queues(bracket, profiles_by_device):
         q, _, _, _, writeback, _, _ = services[row['device']]
         streams = {}
         for name, pair in row['streams'].items():
-            if (name not in ('beta', 't_stat', 'df') or
+            if (name not in ('beta', 't_stat', 'neg_log10_p', 'df') or
                     not isinstance(pair, list) or len(pair) != 2 or
                     any(type(value) is not int or value < 0 for value in pair) or
                     pair[0] > pair[1]):

@@ -63,8 +63,8 @@ def test_full_output_computes_basis_once_and_all_workers_share_it(tmp_path,axis,
     assert basis.call_count==1
     assert len(passed)==(3 if axis=='trait' else len(devices))
     assert all(value is passed[0] for value in passed)
-    ref_b,ref_t,_=open_binary_sumstats(tmp_path/'reference'/'sumstats')
-    actual_b,actual_t,_=open_binary_sumstats(tmp_path/'partition'/'sumstats')
+    ref_b,ref_t,_logp,_=open_binary_sumstats(tmp_path/'reference'/'sumstats')
+    actual_b,actual_t,_logp,_=open_binary_sumstats(tmp_path/'partition'/'sumstats')
     for actual,expected in [(actual_b,ref_b),(actual_t,ref_t)]:
         np.testing.assert_allclose(np.asarray(actual),expected,rtol=3e-5,atol=3e-6)
     np.testing.assert_array_equal(np.asarray(open_binary_df(tmp_path/'partition'/'sumstats')),

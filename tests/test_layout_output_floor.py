@@ -42,11 +42,11 @@ def test_dense_writer_counts_df_and_fixed_chunk_writeback_without_expansion(tmp_
                   fsync=True, writeback_bytes=64, sync_file_range=True,
                   store_variant_df=True)
     report = priced(layout, dense_writer_options=writer)
-    assert report['total_output_array_payload_bytes'] == [8 * 12 * 5 + 4 * 12 * 2] * 2
-    assert report['payload_floor_seconds'] == [(8 * 12 * 5 + 4 * 12 * 2) / 80] * 2
+    assert report['total_output_array_payload_bytes'] == [12 * 12 * 5 + 4 * 12 * 2] * 2
+    assert report['payload_floor_seconds'] == [(12 * 12 * 5 + 4 * 12 * 2) / 80] * 2
     assert len(report['dense_writer_work']) == 2
-    assert sum(row['work']['payload_bytes'] for row in report['dense_writer_work']) == 576
-    assert all(row['work']['fsync_calls'] == 3 for row in report['dense_writer_work'])
+    assert sum(row['work']['payload_bytes'] for row in report['dense_writer_work']) == 816
+    assert all(row['work']['fsync_calls'] == 4 for row in report['dense_writer_work'])
 
 
 def test_selected_output_rejects_dense_writer_settings(tmp_path):

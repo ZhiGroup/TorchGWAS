@@ -153,7 +153,7 @@ def test_api_applies_selection_after_bounded_mmap_qc(tmp_path,monkeypatch,partit
         **(dict(trait_block=4,trait_devices=['cpu']) if partition_axis=='trait' else {}))
     actual=open_binary_sumstats(tmp_path/'auto'/'sumstats')
     expected=open_binary_sumstats(tmp_path/'explicit'/'sumstats')
-    for i in (0,1):np.testing.assert_array_equal(np.asarray(actual[i]),np.asarray(expected[i]))
+    for i in (0,1,2):np.testing.assert_array_equal(np.asarray(actual[i]),np.asarray(expected[i]))
     np.testing.assert_array_equal(np.asarray(open_binary_df(tmp_path/'auto'/'sumstats')),
                                   np.asarray(open_binary_df(tmp_path/'explicit'/'sumstats')))
 

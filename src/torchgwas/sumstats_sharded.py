@@ -77,9 +77,11 @@ def write_variant_sharded_sumstats(directory, *, n_variants, trait_names, n_samp
             iterator=iter(scan_factory(start,end,device,workers))
             for chunk in iterator:
                 if stop.is_set():raise RuntimeError('variant shard cancelled after peer failure')
-                if len(chunk)!=6:raise ValueError('Full variant shards require scan df metadata')
-                first,last,beta,t_stat,_,variant_df=chunk
-                writer.write_chunk(first,last,beta,t_stat,variant_df if trait_df is None else None)
+                # (start, end, beta, t, p, -log10 P, df); without -log10 P
+                # (six long) the writer computes it.
+                if len(chunk) not in (6,7):raise ValueError('Full variant shards require scan df metadata')
+                first,last,beta,t_stat=chunk[:4];variant_df=chunk[-1];logp=chunk[5] if len(chunk)==7 else None
+                writer.write_chunk(first,last,beta,t_stat,logp,variant_df=variant_df if trait_df is None else None)
             summary=writer.close()
             return dict(variant_range=[start,end],directory=relative,device=device,
                 reader_workers=workers,seconds=time.perf_counter()-began,write=summary)
@@ -105,7 +107,7 @@ def write_variant_sharded_sumstats(directory, *, n_variants, trait_names, n_samp
     if before_publish is not None:before_publish()
     manifest=dict(format='torchgwas-binary-sumstats',version=2,layout='variant_shards',
         shape=[n_variants,len(trait_names)],dtype='float32',byte_order='little',
-        arrays=['beta','t_stat'] if store_beta else ['t_stat'],traits=list(trait_names),
+        arrays=['beta','t_stat','neg_log10_p'] if store_beta else ['t_stat','neg_log10_p'],traits=list(trait_names),
         n_samples=int(n_samples),shards=completed,
         **(dict(df=dict(layout='per_shard',axis='variant'),
                 p_value='not stored; two-sided Student t using the matching variant df sidecar')
@@ -182,7 +184,7 @@ class VariantShardedArray:
                 path=self.directory/shard['directory']
                 if self.field=='df':values=open_binary_df(path)
                 else:
-                    b,t,_=open_binary_sumstats(path);values=b if self.field=='beta' else t
+                    b,t,logp,_=open_binary_sumstats(path);values={'beta':b,'t_stat':t,'neg_log10_p':logp}[self.field]
                 result[first:last]=values[local_rows,column_slice]
         if scalars[0]:result=result[0]
         if scalars[1]:result=result[...,0]
@@ -201,7 +203,7 @@ def open_variant_sharded_sumstats(directory,manifest):
     if (manifest.get('version')!=2 or len(shape)!=2 or min(shape)<1
         or len(manifest['traits'])!=shape[1] or manifest.get('dtype')!='float32'
         or manifest.get('byte_order')!='little'
-        or manifest.get('arrays') not in [['t_stat'],['beta','t_stat']]
+        or manifest.get('arrays') not in [['t_stat'],['beta','t_stat'],['t_stat','neg_log10_p'],['beta','t_stat','neg_log10_p']]
         or not (manifest.get('df')==dict(layout='per_shard',axis='variant')
                 or (isinstance(manifest.get('df'),list) and len(manifest['df'])==shape[1]))):
         raise ValueError('Invalid sharded sumstats manifest')
@@ -212,8 +214,9 @@ def open_variant_sharded_sumstats(directory,manifest):
         start,end=shard['variant_range']
         if start!=offset or not start<end<=shape[0]:raise ValueError('Variant shards overlap or leave a gap')
         path=_child_path(directory,shard['directory']);child=read_manifest(path)
-        # A per-trait df child has no df sidecar and keeps the version-1 format.
-        if (child.get('version')!=(FORMAT_VERSION if per_trait else 2) or child.get('layout') is not None
+        # Children are version 2; per-trait df children written before
+        # neglog10p.f32 was stored are version 1.
+        if (child.get('version') not in ((1, FORMAT_VERSION) if per_trait else (FORMAT_VERSION,)) or child.get('layout') is not None
                 or child.get('format')!='torchgwas-binary-sumstats'):
             raise ValueError('Invalid shard child format')
         if (child['shape']!=[end-start,shape[1]] or child['traits']!=manifest['traits']
@@ -231,4 +234,6 @@ def open_variant_sharded_sumstats(directory,manifest):
         offset=end
     if offset!=shape[0]:raise ValueError('Incomplete variant coverage')
     return (VariantShardedArray(directory,manifest,'beta') if 'beta' in manifest['arrays'] else None,
-            VariantShardedArray(directory,manifest,'t_stat'),manifest)
+            VariantShardedArray(directory,manifest,'t_stat'),
+            VariantShardedArray(directory,manifest,'neg_log10_p') if 'neg_log10_p' in manifest['arrays'] else None,
+            manifest)

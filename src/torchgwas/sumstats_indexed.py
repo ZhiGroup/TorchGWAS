@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import json,os,time
 import numpy as np
 from scipy import special
+from .tails import upper_tail_log10_from_t
 
 
 @dataclass(frozen=True)
@@ -194,6 +195,8 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
     values={'variant_index':np.asarray(vi,dtype=np.int64),'trait_index':np.asarray(ti,dtype=np.int64)}
     if store_beta:values['beta']=np.asarray(beta)
     values.update(t_stat=np.asarray(t),df=np.broadcast_to(np.asarray(_chunk_df),np.asarray(t).shape).copy())
+    # The exact tail at each pair's own df, on the host: pairs are few.
+    values['neg_log10_p']=upper_tail_log10_from_t(values['t_stat'],values['df']).astype(np.float32)
     if live_progress is not None:live_progress.begin_emit()
     part=add(values,start,end)
     completed(start,end,began,part,partition)
@@ -202,7 +205,9 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
    if critical is not None:keep &= np.abs(t)>=critical
    vi,ti=np.nonzero(keep)
    trait_index=np.asarray(chunk[5])[vi,ti] if kind=='reduced' else ti
-   add({'variant_index':(start+vi).astype(np.int64),'trait_index':np.asarray(trait_index,dtype=np.int64),'beta':beta[vi,ti],'t_stat':t[vi,ti]},start,end)
+   selected_t=t[vi,ti]
+   add({'variant_index':(start+vi).astype(np.int64),'trait_index':np.asarray(trait_index,dtype=np.int64),'beta':beta[vi,ti],'t_stat':selected_t,
+        'neg_log10_p':upper_tail_log10_from_t(selected_t,df).astype(np.float32)},start,end)
   for waiting in list(lanes.values()):
    for lane in waiting:flush(lane)
  except BaseException:
@@ -232,13 +237,16 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
  if kind=='jagwas':
   joint_df=chi2_df() if callable(chi2_df) else chi2_df
   joint_df=[int(value) for value in joint_df] if isinstance(joint_df,(list,tuple)) else int(joint_df)
- manifest={'format':'torchgwas-indexed-sumstats','version':1,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':joint_df if kind=='jagwas' else int(df),'traits':list(trait_names),'parts':parts,'rows':total,'p_value':'derived from chi2 and df' if kind=='jagwas' else 'two-sided Student t on t_stat with df'}
+ manifest={'format':'torchgwas-indexed-sumstats','version':1,'kind':'jagwas' if kind=='jagwas' else 'linear','shape':[len(marker_names),len(trait_names)],'n_samples':int(n_samples),'df':joint_df if kind=='jagwas' else int(df),'traits':list(trait_names),'parts':parts,'rows':total,'significance':'chi-square tail derived from chi2 and df' if kind=='jagwas' else 'neg_log10_p is -log10 of the exact two-sided Student-t tail at df'}
+ # Version 2: linear parts carry neg_log10_p (the release's indexed format).
+ if kind!='jagwas':manifest['version']=2
  if embed:manifest['variant_ids']='variant_ids.npy'
  if variant_source is not None:manifest['variant_source']=dict(variant_source)
  if extra_manifest is not None:
   manifest.update(extra_manifest() if callable(extra_manifest) else extra_manifest)
  if kind=='significant':
-  manifest.update(version=2,df={'layout':'per_part','axis':'pair','field':'df'},nominal_df=int(df),p_value='two-sided Student t on t_stat with per-pair df in each part')
+  manifest.update(version=2,df={'layout':'per_part','axis':'pair','field':'df'},nominal_df=int(df),
+                  significance='neg_log10_p is -log10 of the exact two-sided Student-t tail at the per-pair df in each part')
  if (ordered_rows or kind=='jagwas') and ordering['globally_ordered']:
   manifest['row_order']='variant_index then trait_index, across parts in manifest order'
  if before_publish is not None:before_publish()

@@ -25,10 +25,10 @@ def test_cli_full_output_tiling_runs_and_preserves_trait_tail(tmp_path):
         '--chunk-size','4','--reader-workers','2','--prefetch-chunks','2',
         '--output-dir',str(tmp_path/'cli'),'--sumstats-format','binary'])
     assert _run_linear(args)==0
-    _,actual,manifest=open_binary_sumstats(tmp_path/'cli'/'sumstats')
+    _,actual,_logp,manifest=open_binary_sumstats(tmp_path/'cli'/'sumstats')
     run_linear_gwas(str(bed),y,genotype_format='plink',device='cpu',chunk_size=4,
         reader_workers=2,prefetch_chunks=2,output_dir=tmp_path/'reference')
-    _,expected,_=open_binary_sumstats(tmp_path/'reference'/'sumstats')
+    _,expected,_logp,_=open_binary_sumstats(tmp_path/'reference'/'sumstats')
     np.testing.assert_allclose(np.asarray(actual),expected,rtol=3e-5,atol=3e-6)
     assert [t['trait_range'] for t in manifest['tiles']]==[[0,2],[2,4],[4,5]]
 
@@ -54,7 +54,7 @@ def test_tiled_store_slices_preserve_coordinates_and_borrowed_lifetimes(tmp_path
     summary=write_trait_tiled_sumstats(tmp_path,n_variants=m,trait_names=list('abcdefg'),n_samples=40,
         df=37,trait_block=3,devices=['cuda:1','cuda:2'],reader_workers=5,scan_factory=scan,
         block_bytes=32,queue_depth=1,fsync=True,store_beta=store_beta)
-    stored_b,stored_t,manifest=open_binary_sumstats(tmp_path)
+    stored_b,stored_t,_logp,manifest=open_binary_sumstats(tmp_path)
     assert isinstance(stored_t,TiledSumstatsArray)
     if store_beta:
         np.testing.assert_array_equal(np.asarray(stored_b),beta)
@@ -67,7 +67,7 @@ def test_tiled_store_slices_preserve_coordinates_and_borrowed_lifetimes(tmp_path
     np.testing.assert_array_equal(np.asarray(open_binary_df(tmp_path)),np.broadcast_to(df,t.shape))
     assert sorted(assignments)==[(0,3,'cuda:1',3),(3,3,'cuda:2',2),(6,1,'cuda:1',3)]
     assert summary['cells']==m*k
-    assert summary['payload_bytes']==m*k*(8 if store_beta else 4)+m*4*3
+    assert summary['payload_bytes']==m*k*(12 if store_beta else 8)+m*4*3
     assert manifest['genotype_passes']==3
 
 
@@ -117,8 +117,8 @@ def test_full_api_tiling_matches_untiled_with_genotype_missingness_and_tails(tmp
     with pytest.warns(RuntimeWarning,match='linearly dependent'):
         run_linear_gwas(PlinkBedGenotype(bed),pheno_path,cov,output_dir=tmp_path/'tiled',
                         trait_block=3,trait_devices=devices,**kwargs)
-    whole_b,whole_t,whole_meta=open_binary_sumstats(tmp_path/'whole'/'sumstats')
-    tile_b,tile_t,tile_meta=open_binary_sumstats(tmp_path/'tiled'/'sumstats')
+    whole_b,whole_t,_logp,whole_meta=open_binary_sumstats(tmp_path/'whole'/'sumstats')
+    tile_b,tile_t,_logp,tile_meta=open_binary_sumstats(tmp_path/'tiled'/'sumstats')
     assert tile_meta['traits']==whole_meta['traits']==[f'trait_{i}' for i in range(k) if i!=2]
     assert tile_meta['shape']==[17,7]
     for actual,expected in [(tile_t,whole_t),(tile_b,whole_b)] if store_beta else [(tile_t,whole_t)]:
@@ -191,9 +191,9 @@ def test_native_pgen_full_tiles_preserve_variant_df_and_source_lifetime(tmp_path
     run_linear_gwas(source,y,c,output_dir=tmp_path/'tiles',trait_block=5,trait_devices=['cuda:1','cuda:2'],**common)
     # Reuse the very same source after every tile has closed its scan.
     run_linear_gwas(source,y,c,output_dir=tmp_path/'after',**common)
-    ref_b,ref_t,_=open_binary_sumstats(tmp_path/'whole'/'sumstats')
+    ref_b,ref_t,_logp,_=open_binary_sumstats(tmp_path/'whole'/'sumstats')
     for name in ('tiles','after'):
-        b,t,_=open_binary_sumstats(tmp_path/name/'sumstats')
+        b,t,_logp,_=open_binary_sumstats(tmp_path/name/'sumstats')
         np.testing.assert_allclose(np.asarray(b),ref_b,rtol=3e-5,atol=3e-6)
         np.testing.assert_allclose(np.asarray(t),ref_t,rtol=3e-5,atol=3e-6)
     expected=np.sum(calls!=3,axis=1)[:,None]-4

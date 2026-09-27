@@ -354,7 +354,7 @@ def output(path,reduction):
         order=(np.lexsort((values['trait_index'],values['variant_index'])) if reduction=='significant'
                else np.argsort(values['variant_index']))
         return {key:value[order] for key,value in values.items()}
-    beta,t,_=open_binary_sumstats(path/'sumstats')
+    beta,t,_logp,_=open_binary_sumstats(path/'sumstats')
     return dict(t_stat=np.asarray(t),df=np.asarray(open_binary_df(path/'sumstats')),
                 **({} if beta is None else dict(beta=np.asarray(beta))))
 

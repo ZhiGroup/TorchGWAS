@@ -62,7 +62,7 @@ def significant_output_work(samples,markers,traits,chunk_markers,*,backend,
             block['retained']=count
         retained=sum(retained_per_block);parts=sum(v>0 for v in retained_per_block)
     else:retained=parts=None
-    payload_per_pair=28 if store_beta else 24  # int64 variant/trait, FP32 beta/t/df
+    payload_per_pair=32 if store_beta else 28  # int64 variant/trait; FP32 beta, t, df and -log10 P (host)
     maximum=markers*traits
     return dict(mode='significant',backend=backend,source_chunks=chunks,blocks=blocks if include_blocks else None,
         selection_cells=maximum,selection_blocks=block_count,retained_pairs=retained,

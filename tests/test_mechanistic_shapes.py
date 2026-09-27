@@ -142,7 +142,7 @@ def test_wide_runtime_requires_and_uses_blocked_setup_primitives():
     assert result['source_work']['pinned_bytes']==2*(32*8+(8*3+5)*8)
     assert result['source_work']['setup']['traits']==3
     assert result['source_work']['setup']['h2d_bytes']==4*32*(2*3+2*8)
-    assert result['schedule']['writer_payload_bytes']==8*10*3+4*10
+    assert result['schedule']['writer_payload_bytes']==12*10*3+4*10
     assert result['stage_seconds']['gpu_design']==result['source_work']['setup_service']['seconds']
     assert not result['prediction_complete']
 

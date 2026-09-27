@@ -34,7 +34,7 @@ def test_binary_df_reconstructs_scan_probabilities_with_missing_calls(tmp_path, 
     run_linear_gwas(source,phenotype,covariates,output_dir=out,device=device,
                     compute_dtype='float32',chunk_size=4,reader_workers=2,prefetch_chunks=2,
                     sumstats_fsync=True)
-    _,tstat,manifest=open_binary_sumstats(out/'sumstats')
+    _,tstat,_logp,manifest=open_binary_sumstats(out/'sumstats')
     assert isinstance(manifest['df'],dict), 'binary output lost variant-specific degrees of freedom'
     from torchgwas.sumstats import open_binary_df
     df=open_binary_df(out/'sumstats')

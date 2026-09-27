@@ -45,7 +45,7 @@ def run(tmp_path, name, genotype, **kwargs):
     out = tmp_path/name
     run_linear_gwas(genotype=genotype, phenotype=tmp_path/'y.npy', covariates=tmp_path/'c.npy',
                     compute_dtype='float32', device='cuda:0', output_dir=out, **kwargs)
-    beta, t, _ = open_binary_sumstats(out/'sumstats')
+    beta, t, _logp, _ = open_binary_sumstats(out/'sumstats')
     return json.loads((out/'run.json').read_text()), np.asarray(t, dtype=np.float64)
 
 

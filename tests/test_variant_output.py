@@ -28,7 +28,7 @@ def synthetic(directory, *, store_beta=True,before_publish=None):
         n_samples=100,df=90,chunk_size=4,devices=['cuda:1','cuda:2'],reader_workers=5,
         scan_factory=scan,queue_depth=1,block_bytes=48,fsync=True,store_beta=store_beta,before_publish=before_publish)
     assert sorted(calls)==[(0,12,'cuda:1',3),(12,23,'cuda:2',2)]
-    assert summary['payload_bytes']==m*k*(8 if store_beta else 4)+m*4
+    assert summary['payload_bytes']==m*k*(12 if store_beta else 8)+m*4
     assert summary['genotype_passes']==1 and summary['df_payload_bytes']==m*4
     return b,t,df,summary
 
@@ -36,7 +36,7 @@ def synthetic(directory, *, store_beta=True,before_publish=None):
 @pytest.mark.parametrize('store_beta',[True,False])
 def test_variant_store_preserves_borrowed_buffers_coordinates_and_slices(tmp_path,store_beta):
     b,t,df,_=synthetic(tmp_path,store_beta=store_beta)
-    actual_b,actual_t,manifest=open_binary_sumstats(tmp_path);actual_df=open_binary_df(tmp_path)
+    actual_b,actual_t,_logp,manifest=open_binary_sumstats(tmp_path);actual_df=open_binary_df(tmp_path)
     assert isinstance(actual_t,VariantShardedArray) and actual_df.shape==(23,1)
     if store_beta:np.testing.assert_array_equal(np.asarray(actual_b),b)
     else:assert actual_b is None
@@ -142,12 +142,12 @@ def test_full_api_variant_shards_match_serial_with_missing_genotypes_and_ranges(
     serial=run_linear_gwas(path,tmp_path/'y.npy',cov,device=devices[0],output_dir=tmp_path/'serial',**options)
     parallel=run_linear_gwas(path,tmp_path/'y.npy',cov,variant_devices=devices,output_dir=tmp_path/'sharded',**options)
     expected=open_binary_sumstats(tmp_path/'serial'/'sumstats');actual=open_binary_sumstats(tmp_path/'sharded'/'sumstats')
-    for index in ([0,1] if fields=='beta+t' else [1]):
+    for index in ([0,1,2] if fields=='beta+t' else [1,2]):
         np.testing.assert_allclose(np.asarray(actual[index]),np.asarray(expected[index]),rtol=3e-5,atol=3e-6,equal_nan=True)
     np.testing.assert_array_equal(np.asarray(open_binary_df(tmp_path/'sharded'/'sumstats')),
                                   np.asarray(open_binary_df(tmp_path/'serial'/'sumstats')))
-    assert actual[2]['shape']==[17,6]
-    assert actual[2]['traits']==[f'trait_{i}' for i in range(k) if i!=2]
+    assert actual[3]['shape']==[17,6]
+    assert actual[3]['traits']==[f'trait_{i}' for i in range(k) if i!=2]
     np.testing.assert_array_equal(store_variant_ids(tmp_path/'sharded'/'sumstats'),store_variant_ids(tmp_path/'serial'/'sumstats'))
     assert parallel.run_metadata['variant_devices']==devices
     for key in ['dropped_genotype_columns','genotype_columns_kept']:
@@ -245,7 +245,7 @@ def test_bgen_dosage_variant_shards_match_serial_and_trim_idle_devices(tmp_path,
     result=run_linear_gwas(path,y,variant_devices=devices,output_dir=tmp_path/'shards',**options)
     expected=open_binary_sumstats(tmp_path/'serial'/'sumstats')
     actual=open_binary_sumstats(tmp_path/'shards'/'sumstats')
-    for index in (0,1):
+    for index in (0,1,2):
         np.testing.assert_allclose(np.asarray(actual[index]),np.asarray(expected[index]),rtol=3e-5,atol=3e-6,equal_nan=True)
     np.testing.assert_array_equal(np.asarray(open_binary_df(tmp_path/'shards'/'sumstats')),
                                   np.asarray(open_binary_df(tmp_path/'serial'/'sumstats')))
@@ -277,8 +277,8 @@ def test_full_api_partitions_keep_the_missing_phenotype_contract(tmp_path,layout
     layout_options=(dict(variant_devices=devices) if layout=='shards' else dict(trait_block=3,trait_devices=devices))
     run_linear_gwas(path,tmp_path/'y.npy',output_dir=tmp_path/'parts',**layout_options,**options)
     expected=open_binary_sumstats(tmp_path/'serial'/'sumstats');actual=open_binary_sumstats(tmp_path/'parts'/'sumstats')
-    for index in [0,1]:
+    for index in [0,1,2]:
         np.testing.assert_allclose(np.asarray(actual[index]),np.asarray(expected[index]),rtol=3e-5,atol=3e-6,equal_nan=True)
-    assert isinstance(expected[2]['df'],list) and actual[2]['df']==expected[2]['df']
+    assert isinstance(expected[3]['df'],list) and actual[3]['df']==expected[3]['df']
     np.testing.assert_array_equal(open_binary_df(tmp_path/'parts'/'sumstats'),open_binary_df(tmp_path/'serial'/'sumstats'))
     assert serial.qc_summary['phenotype_missing_cells']==17
