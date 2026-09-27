@@ -246,3 +246,25 @@ def test_live_significant_writer_keeps_tile_owner_without_range_resolver(tmp_pat
     manifest, parts = open_indexed_sumstats(tmp_path)
     assert manifest['rows'] == 2
     np.testing.assert_array_equal(next(parts)['trait_index'], [2, 3])
+
+
+def test_default_parts_follow_bytes_not_rows(tmp_path):
+    # 40 chunks of 100 pairs with a 16 kB target: parts hold whole chunks until
+    # the target is crossed, so their count follows bytes.
+    from torchgwas.sumstats_indexed import write_indexed_sumstats, open_indexed_sumstats
+    rng = np.random.default_rng(3)
+    chunks = []
+    for c in range(40):
+        vi = np.repeat(np.arange(c * 10, c * 10 + 10), 10)
+        ti = np.tile(np.arange(10), 10)
+        chunks.append((c * 10, c * 10 + 10, vi, ti, rng.normal(size=100).astype(np.float32),
+                       rng.normal(size=100).astype(np.float32), np.full(100, 20.0, np.float32)))
+    names = [f'v{i}' for i in range(400)]
+    total, summary = write_indexed_sumstats(tmp_path, names, [f't{i}' for i in range(10)], 24, iter(chunks),
+                                            kind='significant', df=20, coalesce_bytes=16_000)
+    manifest, parts = open_indexed_sumstats(tmp_path)
+    # 28 bytes per pair (two int64 indices, beta, t and df as float32): 2,800
+    # per chunk, so a part closes after 6 chunks (16,800 bytes): 7 parts.
+    assert total == 4000 and len(manifest['parts']) == 7
+    rows = np.concatenate([part['variant_index'] for part in parts])
+    assert np.all(np.diff(rows) >= 0)
