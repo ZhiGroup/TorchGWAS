@@ -43,6 +43,14 @@ Reductions write NumPy parts listed in the manifest
   with `variant_index`, `trait_index`, `t_stat`, `neg_log10_p` (float32),
   `beta` (unless `--sumstats-fields t`) and, for significant pairs, the
   pair's `df`.
+- `reduce='min-p'`: one row per valid variant, holding the trait with the
+  smallest p: the same columns as significant pairs, `df` included, and
+  `manifest["reduction"] == "min-p"`. `neg_log10_p` is the exact tail at
+  that pair's df, computed on the device. With a complete phenotype panel
+  every trait of a variant shares its df, so the winner is the largest |t|.
+  With missing phenotypes df differs by trait (full output's convention:
+  variant df times trait_df / df, t rescaled by sqrt(trait_df / df)), so
+  the winner is chosen by the tail itself.
 - `reduce='jagwas'`: one row per variant, with `variant_index` and `chi2`, a
   column per JAGWAS group. The manifest `df` is the joint test's df, a list
   with one entry per group when groups are used, and `groups` names them.

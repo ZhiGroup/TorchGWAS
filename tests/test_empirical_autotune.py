@@ -300,6 +300,25 @@ def test_jagwas_two_gpu_variant_shards_match_single_fixed(tmp_path, native):
     np.testing.assert_allclose([actual[k] for k in expected], list(expected.values()), rtol=2e-4, atol=2e-4)
 
 
+def test_min_p_two_gpu_variant_shards_match_single_fixed(tmp_path, native):
+    if torch.cuda.device_count() < 2:
+        pytest.skip('two CUDA devices required')
+    path = _fixture(tmp_path)
+    _run(tmp_path, 'fixed', path, device='cuda:0', chunk_size=32, reduce='min-p')
+    _, _, run = _run(tmp_path, 'tuned', path, reduce='min-p', autotune=True,
+                     autotune_options=dict(OPTIONS, devices=['cuda:0', 'cuda:1'], min_tile_traits=8, cpus_per_device=1,
+                                           shard_setup_seconds=0, trial_fraction=0.9), **RING)
+    assert run['autotune']['layout']['variant_devices'] == ['cuda:0', 'cuda:1'] and run['reduce'] == 'min-p'
+    # Keyed by variant: chunk sizes change the GEMM's rounding, which may swap
+    # near-tied winners but not the minimum p itself.
+    def per_variant(directory):
+        return {v: (t, logp) for (v, t), logp in _pairs(directory, 'neg_log10_p').items()}
+    expected, actual = per_variant(tmp_path/'fixed'), per_variant(tmp_path/'tuned')
+    assert actual.keys() == expected.keys() and len(expected) == 8192
+    np.testing.assert_allclose([actual[v][1] for v in expected], [expected[v][1] for v in expected], rtol=2e-4, atol=2e-4)
+    assert sum(actual[v][0] == expected[v][0] for v in expected) >= 8180
+
+
 def test_autotune_argument_validation(tmp_path):
     from torchgwas.api import run_linear_gwas
     with pytest.raises(ValueError, match='requires output_dir'):

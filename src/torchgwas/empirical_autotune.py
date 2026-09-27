@@ -665,7 +665,7 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
                 cpu_cores=None, cpu_load=None, output_rates=None, group_sizes=None):
     """Choose GPUs and the phenotype/variant partition for one job.
 
-    mode is 'full', 'significant' or 'jagwas'. Returns a dict with
+    mode is 'full', 'significant', 'min-p' or 'jagwas'. Returns a dict with
     trait_block, trait_devices, variant_devices, device, reader_workers and a
     'why' list. The memory model is pipeline_model.device_ring_bytes (via
     auto_trait_block) evaluated at the largest chunk candidate.
@@ -821,7 +821,10 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
     if cpu_demand is not None:
         result['cpu_demand'] = cpu_demand
     min_shard_variants = 8*capacity
-    if mode == 'jagwas' or (mode == 'full' and fit >= n_traits):
+    # min-p writes one row per variant: like JAGWAS its shards need no
+    # writer of their own, and like full output it tiles phenotypes (merged
+    # per variant) only when the panel does not fit.
+    if mode == 'jagwas' or (mode in ('full', 'min-p') and fit >= n_traits):
         if mode == 'jagwas' and fit < n_traits:
             raise ValueError(f'The full phenotype panel ({n_traits} traits) does not fit one GPU at chunk {capacity}; '
                              'JAGWAS cannot tile phenotypes')
@@ -859,8 +862,9 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
                 why.append(f'{best} shards minimize {shard_setup_seconds:.2f} s setup per GPU + {work:.1f} s GPU work / GPUs')
             usable = best
         if n_traits < 2*min_tile_traits and not (mode == 'full' and output_rates):
-            # Without a write measurement: the RTX 2080 Ti host rule above.
-            usable = min(usable, 2) if mode == 'jagwas' else 1
+            # Without a write measurement: the RTX 2080 Ti host rule above; min-p
+            # output is as small as JAGWAS's.
+            usable = min(usable, 2) if mode in ('jagwas', 'min-p') else 1
         if usable > 1:
             result['variant_devices'] = devices[:usable]
             why.append(f'full panel fits one GPU: {usable} variant shards, genotype read once')

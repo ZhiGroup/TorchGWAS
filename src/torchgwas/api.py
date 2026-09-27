@@ -122,8 +122,11 @@ def _resolve_linear_compute_dtype(genotype, compute_dtype: str) -> str:
 
 
 def _accumulate(accumulated, order, reduction, chunk, offset, guard=None):
-    """Merge one reduced chunk into the running per-variant accumulator."""
-    start, end, beta, t, p, index = chunk
+    """Merge one reduced chunk into the running per-variant accumulator.
+
+    A chunk with -log10 P carries it and the kept pairs' df after the index.
+    """
+    start, end, beta, t, p, index, *pair = chunk
 
     def as_tensor(array):
         return (None if array is None
@@ -135,7 +138,7 @@ def _accumulate(accumulated, order, reduction, chunk, offset, guard=None):
                 # and NaN is scrubbed to -inf before the merge picks, so it can
                 # never win a row.
                 torch.zeros(end - start, dtype=torch.uint8),
-                torch.zeros(end - start))
+                torch.zeros(end - start), *(as_tensor(value) for value in pair))
     key = (start, end)
     if guard is None:
         if key not in accumulated:
@@ -372,9 +375,9 @@ def _trait_blocked_reduced_chunks(scan_once, reduction, n_traits, trait_block,
             raise failures[0]
         for key in sorted(order):
             start, end = key
-            beta, t, p, index, _status, _df = accumulated[key]
+            beta, t, p, index, _status, _df, *pair = accumulated[key]
             yield (start, end, beta.numpy(), t.numpy(),
-                   None if p is None else p.numpy(), index.numpy())
+                   None if p is None else p.numpy(), index.numpy(), *(value.numpy() for value in pair))
         return
 
     for offset, width in blocks:
@@ -382,9 +385,9 @@ def _trait_blocked_reduced_chunks(scan_once, reduction, n_traits, trait_block,
             _accumulate(accumulated, order, reduction, chunk, offset)
     for key in order:
         start, end = key
-        beta, t, p, index, _status, _df = accumulated[key]
+        beta, t, p, index, _status, _df, *pair = accumulated[key]
         yield (start, end, beta.numpy(), t.numpy(),
-               None if p is None else p.numpy(), index.numpy())
+               None if p is None else p.numpy(), index.numpy(), *(value.numpy() for value in pair))
 
 
 def _write_linear_binary_streaming(
@@ -637,6 +640,11 @@ def run_linear_gwas(
     min_free_bytes, tuner, probe_chunks and split.
     """
     _api_entered=time.perf_counter()
+    if isinstance(reduce, str) and reduce.replace("_", "-").lower() == "min-p":
+        reduce = "min-p"
+        if autotune_profile is not None or initial_calibration is not None or pipeline_profile is not None:
+            raise ValueError("reduce='min-p' supports autotune=True; the detailed autotune profile, "
+                             "initial calibration and coarse pipeline profile do not model it")
     if jagwas_groups is not None and reduce != "jagwas":
         raise TypeError("jagwas_groups needs reduce='jagwas'")
     # JAGWAS has one joint statistic over the complete retained phenotype
@@ -652,11 +660,11 @@ def run_linear_gwas(
             or len(set(map(str,variant_devices)))!=len(variant_devices)):
             raise ValueError('variant_devices must be a nonempty unique device list')
         variant_devices=list(map(str,variant_devices))
-        if (trait_block is not None or trait_devices is not None or reduce not in (None, "jagwas", "significant")
+        if (trait_block is not None or trait_devices is not None or reduce not in (None, "jagwas", "significant", "min-p")
             or _internal_reduction is not None or pipeline_profile is not None
             or output_dir is None or sumstats_format!='binary'
             or p_value_threshold is not None):
-            raise ValueError('variant_devices requires full, significant or jagwas binary output without trait tiling, row filters or coarse profiles')
+            raise ValueError('variant_devices requires full, significant, min-p or jagwas binary output without trait tiling, row filters or coarse profiles')
     empirical = None
     empirical_tuner = None
     if autotune not in (None, False):
@@ -843,7 +851,7 @@ def run_linear_gwas(
                 per_variant = float((int(genotype.shape[0]) + 3) // 4)
             else:
                 per_variant = float(genotype.shape[0]) * 4.0
-            mode = 'jagwas' if reduce == 'jagwas' else 'significant' if reduce == 'significant' else 'full'
+            mode = reduce if reduce in ('jagwas', 'significant', 'min-p') else 'full'
             _cpu_thread.join()
             cpus, cpu_detail = _cpu_sample['value']
             unfiltered = (sumstats_format == 'binary'
@@ -900,7 +908,7 @@ def run_linear_gwas(
                 decode_cpu_per_variant=decode_cpu, gpu_seconds_per_variant=gpu_per_variant,
                 shard_setup_seconds=setup, cpu_cores=cpu_detail.get('affinity'),
                 cpu_load=cpu_detail.get('load_1min'), allow_partitions=unfiltered, output_rates=output_rates,
-                group_sizes=group_sizes)
+                group_sizes=group_sizes, reduction_width=1 if mode == 'min-p' else None)
             layout['cpus'] = cpu_detail
             sizes = layout.get('chunk_sizes') or sizes  # sizes whose rings do not fit are dropped
             layout['per_variant_transfer_bytes'] = per_variant
@@ -1020,6 +1028,25 @@ def run_linear_gwas(
         # quietly lost rows with a warning standing in for a guarantee.
         # There is now no `k` anywhere in this mode.
         reduce = None
+    if reduce == "min-p":
+        from .min_p import MinPReduction
+
+        if output_dir is None:
+            raise ValueError(
+                "reduce='min-p' requires output_dir: it is a streaming "
+                "reduction, and the in-memory path returns the full matrix")
+        if reduce_top_k is not None:
+            raise ValueError("reduce_top_k does not apply to 'min-p': it keeps one trait per variant")
+        if significance_threshold is not None:
+            raise ValueError("significance_threshold applies to reduce='significant', not 'min-p'")
+        if p_value_threshold is not None:
+            raise ValueError("p_value_threshold filters full output; reduce='min-p' writes every "
+                             "variant's winner (reduce='significant' keeps passing pairs)")
+        # One row per variant: the trait with the smallest p, its beta, t, df
+        # and exact -log10 P (min_p.py; ranked by the tail itself when
+        # phenotypes are missing).
+        reduction = MinPReduction()
+        reduce = None
     if _internal_reduction is not None:
         # INTERNAL ONLY, and deliberately awkward to reach.
         #
@@ -1030,39 +1057,40 @@ def run_linear_gwas(
         # nothing if it bypasses the scan. So the tests hand a pre-built
         # `VariantReduction` in here rather than going through `reduce=`, which
         # stays closed to callers.
-        if reduce is not None:
+        if reduce is not None or reduction is not None:
             raise ValueError("pass reduce= or _internal_reduction=, not both")
         if output_dir is None:
             raise ValueError("_internal_reduction requires output_dir")
         reduction = _internal_reduction
     elif reduce is not None:
-        # THE REDUCTION IS TWO MODES: 'significant' and 'jagwas'. Both are
-        # handled above and set `reduce` back to None, so anything still set
-        # here is one of the per-variant top-k spellings ('max-abs-t',
-        # 'max-t2', 'min-p', 'top-k'). Those remain as MACHINERY --
-        # SignificantPairs is built on top-k, and `VariantReduction` is still
-        # used internally by the trait-blocked paths -- but they are not a
-        # user-facing answer and are no longer accepted here.
+        # THE REDUCTION IS THREE MODES: 'significant', 'jagwas' and 'min-p'.
+        # All are handled above and set `reduce` back to None, so anything
+        # still set here is one of the other per-variant spellings
+        # ('max-abs-t', 'max-t2', 'top-k'). Those remain as MACHINERY --
+        # `VariantReduction` is still used internally by the trait-blocked
+        # paths -- but they are not a user-facing answer and are not
+        # accepted here.
         #
-        # This is a standing decision, and every stress run today broke it by
-        # passing reduce='max-abs-t'. Refusing it at the entry point is what
-        # stops that recurring: a decision that lives only in a document gets
-        # violated by whoever did not reread the document, which this time
-        # was me.
+        # This is a standing decision: stress runs once broke it by passing
+        # reduce='max-abs-t'. Refusing it at the entry point is what stops
+        # that recurring. min-p was opened on request (2026-09-27): one row
+        # per variant, ranked by the exact p even where missing phenotypes
+        # give traits different df, which max-abs-t is not.
         raise ValueError(
             f"reduce={reduce!r} is not a user-facing mode. The reduction has "
-            "two: reduce='significant' (significant pairs; the threshold "
-            "defaults to 5e-8/K) and reduce='jagwas'. The per-variant top-k "
-            "spellings are internal machinery that significant pairs is built "
-            "on -- if you want one trait per variant, that is a significance "
-            "threshold, not a separate mode.")
+            "three: reduce='significant' (significant pairs; the threshold "
+            "defaults to 5e-8/K), reduce='min-p' (the smallest-p trait per "
+            "variant) and reduce='jagwas'. The other per-variant spellings "
+            "are internal machinery.")
     if reduce_top_k is not None:
         raise ValueError(
             "reduce_top_k does not apply: the user-facing reductions are "
-            "'significant' and 'jagwas', and neither takes a k")
+            "'significant', 'min-p' and 'jagwas', and none takes a k")
     full_tiled_output = trait_block is not None and reduction is None and significance is None
-    full_variant_output = variant_devices is not None and jagwas is None and significance is None
+    full_variant_output = variant_devices is not None and reduction is None and significance is None
     jagwas_variant_output = variant_devices is not None and jagwas is not None
+    # min-p: one kept pair per variant on each shard, stateless across shards.
+    minp_variant_output = variant_devices is not None and reduction is not None and jagwas is None
     # Significant pairs are selected per (variant, phenotype) cell: variant
     # shards need no cross-shard state, only the shared indexed writer.
     significant_variant_output = variant_devices is not None and significance is not None
@@ -1218,10 +1246,14 @@ def run_linear_gwas(
                     transfer_bytes_per_variant=per_variant,
                     device_memory_bytes=float(free_bytes),
                     reduced=(reduction is not None or significance is not None),
-                    # Dense binary output stages -log10 P as well.
-                    compute_log10_p=(output_dir is not None and sumstats_format == "binary"
-                                     and reduction is None and significance is None
-                                     and p_value_threshold is None))
+                    # Dense binary output stages -log10 P as well, and so
+                    # does min-p (its kept pairs).
+                    compute_log10_p=((output_dir is not None and sumstats_format == "binary"
+                                      and reduction is None and significance is None
+                                      and p_value_threshold is None)
+                                     or getattr(reduction, "stages_log10_p", False)),
+                    reduction_width=(None if reduction is None or jagwas is not None
+                                     else reduction.resolved_width(int(phenotype.shape[1]))))
         except ImportError:
             pass
         # PlanTooLarge is NOT caught: refusing early with a workable setting is
@@ -1298,7 +1330,8 @@ def run_linear_gwas(
             trait_devices = settings.get('trait_devices')
             variant_devices = settings.get('variant_devices')
             jagwas_variant_output = variant_devices is not None and jagwas is not None
-            full_variant_output = variant_devices is not None and jagwas is None and significance is None
+            full_variant_output = variant_devices is not None and reduction is None and significance is None
+            minp_variant_output = variant_devices is not None and reduction is not None and jagwas is None
             significant_variant_output = variant_devices is not None and significance is not None
             full_tiled_output = trait_block is not None and reduction is None and significance is None
             effective_chunk_size = chunk_size
@@ -1678,6 +1711,11 @@ def run_linear_gwas(
                               and p_value_threshold is None and trait_block is None)
             dense_log10_p = (sumstats_format == 'binary' and reduction is None
                              and significance is None and p_value_threshold is None)
+            # min-p stages its kept pairs' exact -log10 P and df. Trait
+            # blocks merge by that -log10 P, so they carry it in float64
+            # (MinPReduction.merge).
+            reduced_log10_p = getattr(reduction, 'stages_log10_p', False)
+            log10_p_dtype = 'float64' if reduced_log10_p and trait_block is not None else 'float32'
 
             def _scan(trait_slice=None, device=None, *, source=None, workers=None,
                       observed_counts=None, basis=..., shared_loader=None):
@@ -1709,7 +1747,7 @@ def run_linear_gwas(
                     # running one process per card) and it was not one.
                     compute_p_values=False,
                     # Dense binary output stores -log10 P, computed on the device.
-                    compute_log10_p=dense_log10_p, log10_p_dtype='float32',
+                    compute_log10_p=dense_log10_p or reduced_log10_p, log10_p_dtype=log10_p_dtype,
                     variant_range=variant_range,
                     reduction=reduction,
                     borrow_results=borrow_results,
@@ -1739,16 +1777,19 @@ def run_linear_gwas(
 
             blocked_significance = False
             finalize_reduced = None
-            if jagwas_variant_output or significant_variant_output:
+            if jagwas_variant_output or significant_variant_output or minp_variant_output:
                 from .linear import linear_scan_multigpu, multigpu_variant_ranges
                 ranges = multigpu_variant_ranges(genotype_shape[1], int(effective_chunk_size), len(variant_devices))
                 active_variant_devices = variant_devices[:len(ranges)]
                 # JAGWAS keeps a joint factor per device; significant pairs are
-                # selected cell by cell on each device (stateless).
+                # selected cell by cell on each device (stateless), and min-p
+                # variant by variant (stateless).
                 if jagwas_variant_output:
                     # Shards share the run's kept-trait decision (collinear traits dropped once).
                     shard_output = dict(reduction_factory=jagwas.spawn,
                                         column_groups=getattr(jagwas, 'column_groups', None))
+                elif minp_variant_output:
+                    shard_output = dict(reduction=reduction, compute_log10_p=True, log10_p_dtype='float32')
                 else:
                     from .linear import _significant_pairs_iterator
                     # Select pairs on each shard's thread, as trait tiles do;
@@ -1949,7 +1990,8 @@ def run_linear_gwas(
                     chi2_df=(lambda: jagwas.degrees_of_freedom) if jagwas is not None else None,
                     extra_manifest=((lambda: dict(jagwas_rank=jagwas.rank_report(trait_names),
                                                   **({} if jagwas_groups is None else dict(groups=jagwas.names))))
-                                    if jagwas is not None else None),
+                                    if jagwas is not None else
+                                    dict(reduction=reduction.mode) if reduction is not None else None),
                     p_value_threshold=p_value_threshold,
                     variant_metadata=variant_metadata,fsync=sumstats_fsync,
                     store_beta=sumstats_fields != "t", before_publish=finalize_reduced,
@@ -1985,13 +2027,14 @@ def run_linear_gwas(
                 sumstats_summary['execution_layout'] = layout
             if jagwas is not None:
                 sumstats_summary['jagwas_rank'] = jagwas.rank_report(trait_names)
-            if jagwas_variant_output or significant_variant_output:
+            if jagwas_variant_output or significant_variant_output or minp_variant_output:
                 sumstats_summary.update(devices=active_variant_devices, genotype_passes=1,
                     execution_layout=dict(partition_axis='variant', variant_ranges=[list(span) for span in ranges],
                         devices=active_variant_devices, reader_workers=int(reader_workers),
                         shared_result_queue_depth=(DEFAULT_SUMSTATS_QUEUE_DEPTH if sumstats_queue_depth is None else sumstats_queue_depth)
                             if len(active_variant_devices) > 1 else 0,
                         reduction_state=('independent factor per active device' if jagwas_variant_output
+                                         else 'stateless per-variant selection' if minp_variant_output
                                          else 'stateless per-cell selection'), writer_workers=1))
             table: list[dict] = []
             p_value = None
@@ -2155,7 +2198,7 @@ def run_linear_gwas(
         # argued from the fact that 75,000 is 600,000/8 -- an inference, when
         # the run already knew the answer and simply never wrote it down.
         "variant_devices": (sumstats_summary.get('devices') if full_variant_output or jagwas_variant_output
-                            or significant_variant_output else None),
+                            or significant_variant_output or minp_variant_output else None),
         "trait_devices": (None if not trait_devices
                           else [str(d) for d in trait_devices]),
         "genotype_shape": genotype_shape,
