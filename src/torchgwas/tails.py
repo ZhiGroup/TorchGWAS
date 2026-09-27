@@ -227,3 +227,167 @@ def upper_tail_log10_from_t_torch(t, df):
             (1.0 - upper).clamp(_TINY, 1.0)) / float(np.log(10.0))
         result = torch.where(reflect, alternative, result)
     return result
+
+
+# -- the scan's device tail ---------------------------------------------------
+#
+# upper_tail_log10_from_t_torch is the reference, and it is slow in a scan: 40
+# iterations of eager FP64 elementwise work, each materialising a chunk-sized
+# temporary, and both branches for every cell. H100, one 8.4M-cell chunk
+# (1024 x 8192, per-variant df 22,238): 181 ms, against ~10.7 ms for the
+# chunk's GEMM (benchmarks/logp_device_cost_20260927.py). The same identity and
+# fraction are rearranged here so each cell evaluates ONE fraction -- the
+# direct K(a, 1/2, x) or the reflected K(1/2, a, 1 - x), parameters swapped per
+# cell -- and the iterations run as a compiled block of four reused ten times:
+# 4.1 ms per chunk, 4.7 s to compile in a fresh process with a warm inductor
+# cache (benchmarks/logp_blocked_probe_20260927.py). Against scipy's stdtr the
+# result is within 1.3e-11 absolute at df 22,238 (2e-13 at 500, 1e-14 at 30),
+# and within 4.4e-7 of the reference over a scan chunk, below float32 storage
+# resolution. On the CPU, or with TORCHGWAS_COMPILE_TAILS=0 or a failed
+# compile, the same stages run eagerly.
+
+DEVICE_TAIL_BLOCK = 4
+# Row strips bound the FP64 transient (~90 bytes per cell) to ~190 MB.
+DEVICE_TAIL_MAX_CELLS = 1 << 21
+
+_STAGES = {}
+_STAGE_LOCK = None
+
+
+def _guard(value):
+    import torch
+
+    return torch.where(value.abs() < _TINY, _TINY, value)
+
+
+def _tail_prologue(t, df):
+    import torch
+
+    t = t.double().abs()
+    df = df.double()
+    a = df * 0.5
+    squared = t * t
+    total = df + squared
+    x = df / total
+    y = squared / total  # 1 - x, without the cancellation
+    reflect = x >= (a + 1.0) / (a + 2.5)
+    first = torch.where(reflect, 0.5, a)
+    second = torch.where(reflect, a, 0.5)
+    argument = torch.where(reflect, y, x)
+    d = 1.0 / _guard(1.0 - (first + second) * argument / (first + 1.0))
+    return first, second, argument, torch.ones_like(argument), d, d.clone(), x, y, reflect
+
+
+def _tail_block(first, second, argument, c, d, h, start):
+    qab, qap, qam = first + second, first + 1.0, first - 1.0
+    for offset in range(DEVICE_TAIL_BLOCK):
+        m = start + offset
+        m2 = 2.0 * m
+        step = m * (second - m) * argument / ((qam + m2) * (first + m2))
+        d = 1.0 / _guard(1.0 + step * d)
+        c = _guard(1.0 + step / c)
+        h = h * d * c
+        step = -(first + m) * (qab + m) * argument / ((first + m2) * (qap + m2))
+        d = 1.0 / _guard(1.0 + step * d)
+        c = _guard(1.0 + step / c)
+        h = h * d * c
+    return c, d, h
+
+
+def _tail_epilogue(df, x, y, reflect, h):
+    import torch
+
+    a = df.double() * 0.5
+    log_beta = torch.lgamma(a) + float(special.gammaln(0.5)) - torch.lgamma(a + 0.5)
+    log_direct = (a * torch.log(x.clamp_min(_TINY)) + 0.5 * torch.log(y.clamp_min(_TINY))
+                  - torch.log(a) - log_beta + torch.log(h))
+    upper = 2.0 * torch.exp(-log_beta + 0.5 * torch.log(y.clamp_min(_TINY)) + a * torch.log1p(-y)) * h
+    log_reflect = torch.log((1.0 - upper).clamp(_TINY, 1.0))
+    return -torch.where(reflect, log_reflect, log_direct) / float(np.log(10.0))
+
+
+def _eager_stages():
+    return (_tail_prologue, _tail_block, _tail_epilogue)
+
+
+def _starts(device):
+    import torch
+
+    return [torch.tensor(float(m), dtype=torch.float64, device=device)
+            for m in range(1, _TORCH_ITERATIONS + 1, DEVICE_TAIL_BLOCK)]
+
+
+def _evaluate(stages, t, df, starts):
+    prologue, block, epilogue = stages
+    first, second, argument, c, d, h, x, y, reflect = prologue(t, df)
+    for start in starts:
+        c, d, h = block(first, second, argument, c, d, h, start)
+    return epilogue(df, x, y, reflect, h)
+
+
+def prepare_device_tail(device):
+    """Compile (or load) the device tail for `device` once; later calls are free.
+
+    Thread-safe. Returns True when the compiled stages serve this device and
+    False when the eager stages will.
+    """
+    import os
+    import threading
+
+    import torch
+
+    global _STAGE_LOCK
+    device = torch.device(device)
+    if device.type == 'cuda' and device.index is None:
+        device = torch.device('cuda', torch.cuda.current_device())
+    if _STAGE_LOCK is None:
+        _STAGE_LOCK = threading.Lock()
+    with _STAGE_LOCK:
+        if device in _STAGES:
+            return _STAGES[device][0] is not None
+        compiled = None
+        if device.type == 'cuda' and os.environ.get('TORCHGWAS_COMPILE_TAILS', '1') != '0':
+            try:
+                compiled = tuple(torch.compile(stage, dynamic=True) for stage in _eager_stages())
+                starts = _starts(device)
+                with torch.cuda.device(device):
+                    probe = torch.linspace(0.0, 40.0, 64, device=device, dtype=torch.float32)[:, None]
+                    probe_df = torch.full((64, 1), 30.0, device=device)
+                    fast = _evaluate(compiled, probe, probe_df, starts)
+                    slow = _evaluate(_eager_stages(), probe, probe_df, starts)
+                    if not bool(torch.allclose(fast, slow, rtol=1e-10, atol=1e-10)):
+                        compiled = None
+            except Exception:  # noqa: BLE001 - no compiler, no Triton: the eager stages are exact too
+                compiled = None
+        _STAGES[device] = (compiled, _starts(device))
+        return compiled is not None
+
+
+def neg_log10_p_device(t, df, *, out=None, max_cells=DEVICE_TAIL_MAX_CELLS):
+    """`-log10 P(|T| > |t|)` for a scan chunk on t's device, into float32 `out`.
+
+    `t` is (rows, traits); `df` broadcasts against it, one per variant (rows,
+    1), per pair (rows, traits) or per trait (1, traits). NaN t gives NaN.
+    Values are computed in FP64 and stored at `out`'s dtype (float32 unless
+    an `out` says otherwise).
+    """
+    import torch
+
+    rows, traits = t.shape
+    device = t.device
+    if device.type == 'cuda' and device.index is None:
+        device = torch.device('cuda', torch.cuda.current_device())
+    if device not in _STAGES:
+        prepare_device_tail(device)
+    compiled, starts = _STAGES[device]
+    stages = compiled or _eager_stages()
+    df = torch.as_tensor(df, device=t.device)
+    if df.dim() < 2:
+        df = df.reshape(1, -1) if df.dim() == 1 and df.shape[0] == traits and traits != rows else df.reshape(-1, 1)
+    result = torch.empty((rows, traits), dtype=torch.float32, device=t.device) if out is None else out
+    step = max(1, int(max_cells) // max(1, traits))
+    for first in range(0, rows, step):
+        last = min(rows, first + step)
+        strip_df = df[first:last] if df.shape[0] == rows else df
+        result[first:last] = _evaluate(stages, t[first:last], strip_df, starts)
+    return result
