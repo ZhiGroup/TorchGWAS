@@ -124,6 +124,8 @@ class DeviceStudentTailTestCase(unittest.TestCase):
         np.testing.assert_allclose(device, host, rtol=1e-12)
         self.assertTrue(np.all(np.isfinite(device)))
         self.assertTrue(np.all(np.diff(device) > 0))
+        self.assertGreater(device[2], 1000.0,
+                           "the device tail must remain finite above -log10(P)=1000")
 
     def test_device_broadcasts_degrees_of_freedom_per_variant(self):
         t = np.array([[10.0, 40.0], [80.0, 5.0]])
@@ -145,6 +147,62 @@ class DeviceStudentTailTestCase(unittest.TestCase):
         few = _betacf_torch(a, 0.5, x, iterations=40)
         many = _betacf_torch(a, 0.5, x, iterations=300)
         np.testing.assert_allclose(few.numpy(), many.numpy(), rtol=1e-10)
+
+
+
+class ScanDeviceTailTestCase(unittest.TestCase):
+    """neg_log10_p_device: one fraction per cell, compiled in blocks on CUDA."""
+
+    GRID = np.concatenate([np.linspace(0.0, 8.0, 801), np.linspace(8.0, 120.0, 300)])
+
+    def _check(self, device):
+        import torch
+        from torchgwas.tails import neg_log10_p_device
+
+        for df in (3.0, 30.0, 500.0, 22238.0):
+            t = torch.as_tensor(self.GRID, dtype=torch.float32, device=device)[:, None]
+            value = neg_log10_p_device(t, torch.full((t.shape[0], 1), df, device=device))
+            reference = upper_tail_log10_from_t(t.cpu().double().numpy(), df)
+            self.assertEqual(value.dtype, torch.float32)
+            np.testing.assert_allclose(value.cpu().numpy(), reference.astype(np.float32),
+                                       rtol=2e-7, atol=1e-7, err_msg=f"df={df}")
+
+    def test_matches_the_reference_on_the_cpu(self):
+        self._check("cpu")
+
+    @unittest.skipUnless(__import__("torch").cuda.is_available(), "CUDA required")
+    def test_matches_the_reference_on_cuda(self):
+        self._check("cuda")
+
+    def test_pair_df_strips_and_nan(self):
+        import torch
+        from torchgwas.tails import neg_log10_p_device
+
+        rng = np.random.default_rng(3)
+        t = rng.normal(scale=6.0, size=(37, 11)).astype(np.float32)
+        t[4, 2] = np.nan
+        df = (rng.integers(20, 2000, size=(37, 1)) * rng.uniform(0.5, 1.0, size=(1, 11)))
+        value = neg_log10_p_device(torch.as_tensor(t), torch.as_tensor(df), max_cells=50).numpy()
+        reference = upper_tail_log10_from_t(t.astype(np.float64), df)
+        self.assertTrue(np.isnan(value[4, 2]))
+        finite = np.isfinite(reference)
+        np.testing.assert_allclose(value[finite], reference[finite].astype(np.float32), rtol=2e-7, atol=1e-7)
+
+    @unittest.skipUnless(__import__("torch").cuda.is_available(), "CUDA required")
+    def test_compiled_stages_agree_with_the_eager_stages(self):
+        import torch
+        from torchgwas import tails
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        tails.prepare_device_tail(device)
+        compiled, starts = tails._STAGES[device]
+        if compiled is None:
+            self.skipTest("no compiler for this device")
+        t = torch.as_tensor(np.random.default_rng(5).normal(scale=8.0, size=(64, 33)), device=device)
+        df = torch.full((64, 1), 22238.0, device=device)
+        fast = tails._evaluate(compiled, t, df, starts)
+        slow = tails._evaluate(tails._eager_stages(), t, df, starts)
+        np.testing.assert_allclose(fast.cpu().numpy(), slow.cpu().numpy(), rtol=1e-10, atol=1e-10)
 
 
 if __name__ == "__main__":
