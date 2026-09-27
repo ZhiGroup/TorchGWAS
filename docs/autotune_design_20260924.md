@@ -1773,6 +1773,121 @@ Measured (H100 GPUs 4-7, full scale, K = 8,192 in 22 groups;
   per-chunk cost, which autotune's larger chunks amortize (43% faster than
   chunk 1024).
 
+### min-P, the device tail's host calls, and pricing the scan (2026-09-27, evening)
+
+H100 GPUs 4-7, full scale (22,250 x 8.09M hard calls), fresh interleaved
+processes, executor seconds; the host was quiet (load 1.5-5).
+
+**`reduce='min-p'` (user-facing, on request).**
+- One indexed row per variant: the smallest-p trait, its beta, t, df and
+  -log10 P, all from the device (`min_p.MinPReduction`).
+- For a complete panel the df is per variant, so the winner is the largest
+  |t| and the tail runs on the winners only.
+- With missing phenotypes, df differs by trait, so the winner is ranked by
+  the exact tail of every cell.
+- It runs on one GPU, on variant shards or on trait tiles. Trait tiles merge
+  by float64 -log10 P.
+- It lives in its own module because reduce.py's bytes identify the recorded
+  selector census (`device_significance_work.source_sha256`). Editing
+  reduce.py failed 35 census tests.
+- **Check** (`results/min_p_check_*`): on the first 200,000 variants, the
+  dense store's argmax matched on 200,000/200,000 for both K = 512 panels, the
+  complete one and the one with 64 traits 2% missing. -log10 P agreed within
+  2e-6 relative, t was bit-identical, and one GPU matched two shards row for
+  row.
+- **Convention, flagged and not changed:** for missing phenotypes, full
+  output's t is the mean-imputed t times sqrt(trait_df / df). At 250 of 400
+  observed samples that is about sqrt(observed / n) below a complete-case fit:
+  2.60 against 3.22 (`benchmarks/missing_phenotype_t_check_20260927.py`).
+  min-p ranks the p-values full output reports.
+
+**The device tail held the GIL across shards.**
+- Each AOT call holds the GIL while it launches, and the block build makes 12
+  calls per strip.
+- A min-p winner column (4096 x 1) took 0.59 ms on one GPU and 2.89 ms per
+  call on each of four (`tail_thread_scaling_20260927.py`). Four-shard min-p
+  at K = 8,192 therefore ran 28.2-28.8 s, against 20.4 s for significant pairs.
+- The build now also exports the whole tail as one graph. It costs one host
+  call (~0.1 ms) but 0.83 ns per cell of GPU time, against 0.38 for the
+  blocks: Inductor fuses the 40 iterations with recomputation. The best fusion
+  option tried reached 0.56 (`tail_whole_build_options_20260927.py`).
+- The block form's host time grows with the strip: 0.51 ms at 4K cells and
+  1.44 ms at 4M.
+- `prepare_device_tail` times both forms once per device. Each strip takes the
+  form with the lower host seconds x (CUDA devices sharing the GIL) + GPU
+  seconds per cell x cells. On the H100 that is:
+  - one GPU: the whole graph up to about 1M cells, blocks above;
+  - four GPUs: the whole graph throughout.
+  - A busy A100 measured equal per-cell cost for the two forms and chooses
+    the whole graph.
+- Result: four-shard min-p at K = 8,192 now runs 20.7-22.0 s against 20.4 s for
+  significant pairs, and at K = 512 it runs 7.0-8.5 s, down from 9.6-10.3.
+
+**The planner priced the GEMM alone.**
+- `gpu_seconds_per_variant` was 2nK / GEMM rate: 0.47 us per variant at
+  K = 512. The scan's own profile shows about 3.4x that. With one GPU and 8
+  readers, GPU compute was 1.58-1.65 us for min-p and 1.85 us for dense output,
+  and the loader wait 0.23 us (`gpu_pipeline_profile_20260927.py`). The torch
+  statistics make about ten elementwise passes over chunk x n besides the
+  GEMM.
+- The low price inflated CPU demand per GPU (decode 6.7 us of CPU per variant
+  over 0.47 us, i.e. 14.6 cores). That held K = 512 min-p to 2 GPUs: 18.4-21.0 s,
+  against 9.6-10.3 s on four fixed shards.
+- `scan_device_seconds_per_variant` now times the scan's per-chunk device
+  work with CUDA events on a synthetic chunk: conversion, statistics, and the
+  mode's tail, reduction or selection. It is timed at 256 and 2,048 traits and
+  extended linearly in K, in about 50 ms. The price is the larger of that and
+  the GEMM.
+- H100 prices (us per variant, dense / min-p / significant / JAGWAS):
+  - K = 512: 2.26 / 1.85 / 1.86 / 1.77;
+  - K = 8,192: 12.4 / 9.65 / 9.71 / 10.7.
+- The narrow-panel cap (at most 2 shards below 4,096 traits, from the
+  lab-2080ti) now applies only without measurements. With them, the
+  setup/work model decides.
+
+**K = 512 on four GPUs is host-bound.**
+- Readers x depth factorial for min-p, chunk 4096
+  (`host_stage_attribution_20260927.py`):
+  - one GPU: r4d4 24.5-25.0, r8d8 21.2, r16d16 22.0, r16d32 22.2-22.7;
+  - two shards: r4d4 13.3-13.5, r8d8 12.1-12.8, r16d16 14.8, r16d32 14.7-15.3.
+  - Pinning a depth-32 ring of 4096-row slots costs 1.1 s.
+- The chunk size dominates. At 1024 the tuner estimated a 27.9 s job, against
+  7.1 s fixed at 4096. That fits a shared host cost of about 3.4 ms per chunk:
+  1,975 chunks at 4096 take 6.9 s. The device-op issue time accounts for
+  0.7-0.9 ms of it on one thread and 2-2.5 ms with four
+  (`chunk_host_dispatch_20260927.py`).
+- The tuner's warmup and revisit at its 1024 start put about 16% of the job at
+  the slow sizes. A job estimated under min_job_seconds never probed away at
+  all.
+- The tuner now starts at the largest size whose rings fit
+  (`autotune_options['start_chunk']` overrides). With a per-chunk cost a >= 0,
+  per-row time a/c + b cannot fall as the chunk shrinks. Pinning, the only
+  counter-cost, is paid once and bounded by the ring check.
+
+Autotune against fixed four shards (chunk 4096, 4 readers per GPU, depth 4),
+executor seconds (`results/autotune_vs_fixed_v2_20260927/`):
+
+| job | fixed 4 | fixed 4, r8d8 | autotune (its layout) | autotune before |
+|---|---|---|---|---|
+| min-p, K = 512 | 7.0, 8.5 | 7.5, 8.1 | 9.5, 10.5 (4 GPUs, r6d12) | 18.4, 21.0 (2 GPUs) |
+| dense, K = 512, `/data` | 11.1, 10.7 | 10.7, 12.0 | 12.9, 11.8 (2 GPUs, r6d12) | 16.6, 23.5 |
+| min-p, K = 8,192 | 21.4, 22.2 | 21.4, 21.7 | 22.2, 22.6 (4, r2d4) | 30.3 |
+| JAGWAS, K = 8,192 | 24.5, 24.4 | 25.6, 25.1 | 24.3, 24.3 (4, r2d4) | — |
+| significant, K = 8,192 | 20.4, 20.4 | 21.0, 21.0 | 19.7, 19.7 (4, r2d4) | — |
+
+**Still open.**
+- *Readers and depth at K = 512.* Erlang-C sizes readers for each GPU running
+  at its device rate, and depth doubles them. In the host-bound regime the
+  shards run slower than that, and more threads or slots cost time: 6 readers
+  and depth 12 against 4 and 4.
+- *A per-chunk host model.* `T = max(N (s + h/c) / G, N h / c)` with h about
+  3.4 ms reproduces one GPU (21.7 s modelled, 21.2 s measured), two (10.8 /
+  12.1-12.8) and four (6.7 / 7.0-8.5). The device-op probe measures only about
+  a quarter of h, so h itself still needs measuring.
+- *Dense shard count.* The write model priced 2, 3 and 4 shards within 0.4 s
+  of each other (10.5, 10.7, 10.9) and chose 2. The unmodelled per-shard host
+  cost favours more shards.
+
 ### GIL and process start
 
 - **Correction (2026-09-26):** hold time understates the GIL's cost. With
