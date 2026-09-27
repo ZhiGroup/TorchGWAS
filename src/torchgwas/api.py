@@ -551,8 +551,10 @@ def _drain_linear_chunks(chunk_iterator) -> tuple[int, dict]:
 
 
 from .initial_chunk_autotune import productive_api_lifecycle
+from .host_pages import numpy_hugepage_advice, without_numpy_hugepages
 
 
+@without_numpy_hugepages
 @productive_api_lifecycle
 def run_linear_gwas(
     genotype,
@@ -2138,6 +2140,8 @@ def run_linear_gwas(
             else significance.resolved_threshold(len(trait_names))),
         "reduce_top_k": None if reduction is None else reduction.width,
         "jagwas_groups": None if jagwas_groups is None else jagwas.names,
+        # host_pages.py: NumPy's MADV_HUGEPAGE advice during the run.
+        "numpy_hugepage_advice": numpy_hugepage_advice(),
         "phenotype_outlier_sd": phenotype_outlier_sd,
         "phenotype_outlier_rows": None if outlier_rows is None else int(outlier_rows.sum()),
         # Recorded because it changes how many passes the run made over the
