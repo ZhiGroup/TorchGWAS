@@ -91,3 +91,40 @@ def test_lookback_scenario_changes_source_traffic_without_changing_launches():
     b=selection_gpu_work(work,kernels,compute_capability=[8,0],lookback_windows=3)
     assert a['kernel_count']==b['kernel_count']
     assert b['logical_bytes']-a['logical_bytes']==2*32*8*((455-1)+(2-1))
+
+
+def whole_chunk(index):
+    census=json.loads((Path(__file__).parent/'fixtures/device_selection_whole_chunk_a100.json').read_text())
+    row=census['rows'][index]
+    work=device_significant_tensor_work(row['N'],row['B'],row['K'],[b['retained'] for b in row['blocks']],max_cells=row['max_cells'])
+    return census,row,work,selection_gpu_census(work,census,census['context'])
+
+
+@pytest.mark.parametrize('index',range(7))
+def test_whole_chunk_blocks_above_1m_cells_are_assigned_once(index):
+    # One nonzero per chunk (DEVICE_SELECTION_MAX_CELLS): 2.1M to 33.5M cells.
+    census,row,work,kernels=whole_chunk(index)
+    assert len(work['blocks'])==1 and work['blocks'][0]['cells']==row['B']*row['K']>1<<20
+    ledger=selection_gpu_work(work,kernels,compute_capability=census['context']['compute_capability'])
+    used=[i for indices in ledger['operations'].values() for i in indices]
+    used+=[i for group in ledger['nonzero_groups'] for indices in group.values() for i in indices]
+    assert sorted(used)==list(range(len(kernels)))
+    sweep=ledger['kernels'][ledger['nonzero_groups'][0]['flagged_select'][1]]
+    assert sweep['cub_tiles']==-(-row['B']*row['K']//(384*6))
+
+
+def test_count_grid_saturates_at_the_cub_occupancy_bound():
+    census,row,work,kernels=whole_chunk(6)
+    assert (row['B'],row['K'],row['mode'])==(4096,8192,'dense')
+    ledger=selection_gpu_work(work,kernels,compute_capability=[8,0])
+    count=ledger['kernels'][ledger['nonzero_groups'][0]['count'][0]]
+    # 108 SMs x 8 resident blocks x subscription 5, below ceil(cells / 4096) = 8192.
+    assert count['kernel']['geometry']['grid'][0]==4320
+    assert count['read_bytes']==row['B']*row['K'] and count['write_bytes']==4*4320
+
+
+def test_blocks_beyond_the_cuda_nonzero_limit_are_refused():
+    census,row,work,kernels=whole_chunk(0)
+    work=copy.deepcopy(work);work['blocks'][0]['cells']=1<<31
+    with pytest.raises(ValueError,match='nonzero limit'):
+        selection_gpu_work(work,kernels,compute_capability=[8,0])

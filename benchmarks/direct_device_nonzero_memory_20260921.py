@@ -6,20 +6,22 @@ from pathlib import Path
 import torch
 from torchgwas.detailed_calibration import sha256_file,source_identity
 from torchgwas.geometry_collection import write_record
+from torchgwas.selection_geometry import DEVICE_SELECTION_MAX_CELLS
 
 parser=argparse.ArgumentParser()
 parser.add_argument('--out',required=True)
 parser.add_argument('--device',default='cuda:0')
 parser.add_argument('--cells',nargs='+',type=int,default=[32,4093,1048576])
 args=parser.parse_args()
-if not args.cells or any(c<1 or c>1<<20 for c in args.cells) or len(set(args.cells))!=len(args.cells):
-    raise ValueError('Unique positive counts no larger than 1M required')
+if not args.cells or any(c<1 or c>DEVICE_SELECTION_MAX_CELLS for c in args.cells) or len(set(args.cells))!=len(args.cells):
+    raise ValueError('Unique positive counts within the CUDA nonzero limit required')
 root=Path(args.out);root.mkdir(parents=True,exist_ok=False)
 (root/'harness.py').write_bytes(Path(__file__).read_bytes())
 torch.set_num_threads(2);torch.set_num_interop_threads(1)
 torch.cuda.set_device(args.device)
 prop=torch.cuda.get_device_properties(args.device)
-limit=256<<20
+# The dense control holds the mask and 16 bytes of coordinates per cell.
+limit=max(256<<20,24*max(args.cells)+(64<<20))
 torch.cuda.set_per_process_memory_fraction(limit/prop.total_memory,args.device)
 if torch.cuda.mem_get_info(args.device)[0]<limit:raise ValueError('Insufficient free memory')
 source=source_identity()

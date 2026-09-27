@@ -14,14 +14,19 @@ from torch.utils._pytree import tree_flatten
 from torchgwas.detailed_calibration import source_identity,sha256_file
 from torchgwas.geometry_collection import kernel_census, write_record
 from torchgwas.reduce import device_significant_pairs
+from torchgwas.selection_geometry import DEVICE_SELECTION_MAX_CELLS
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--out', required=True)
 parser.add_argument('--device', default='cuda:0')
+# B,K,max_cells; max_cells 'max' is the production whole-chunk block.
+parser.add_argument('--shapes', nargs='+', default=['13,7,17', '5,37,11', '257,4093,1048576'])
+parser.add_argument('--memory-limit-mib', type=int, default=512)
 args = parser.parse_args()
+shapes = [tuple(int(v) if v != 'max' else DEVICE_SELECTION_MAX_CELLS for v in shape.split(',')) for shape in args.shapes]
 root = Path(args.out); root.mkdir(parents=True, exist_ok=False)
 device = args.device
-limit = 512 << 20
+limit = args.memory_limit_mib << 20
 torch.cuda.set_device(device)
 torch.cuda.set_per_process_memory_fraction(limit / torch.cuda.get_device_properties(device).total_memory, device)
 if torch.cuda.mem_get_info(device)[0] < limit:
@@ -54,7 +59,7 @@ class Observe(TorchDispatchMode):
 
 
 rows = []
-for b, k, cells in [(13, 7, 17), (5, 37, 11), (257, 4093, 1 << 20)]:
+for b, k, cells in shapes:
     for mode in ['empty', 'sparse', 'dense', 'invalid']:
         ids = np.arange(b*k, dtype=np.int64).reshape(b, k)
         beta = (ids % 1009).astype(np.float32)
