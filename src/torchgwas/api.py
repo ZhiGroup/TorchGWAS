@@ -989,6 +989,26 @@ def run_linear_gwas(
             else marker_ids[: genotype.shape[1]]
         )
         trait_names = trait_columns or [f"trait_{i}" for i in range(phenotype.shape[1])]
+        if 'phenotype_kept_column_indices' in qc:
+            # QC can drop traits (constant or empty columns): names follow the
+            # kept columns, and JAGWAS groups, which index the input panel, are
+            # mapped onto the scanned one (before, a removed trait shifted every
+            # later group and the scan failed with IndexError).
+            kept_traits = [int(i) for i in qc['phenotype_kept_column_indices']]
+            trait_names = ([trait_columns[i] for i in kept_traits] if trait_columns
+                           else [f"trait_{i}" for i in kept_traits])
+            if jagwas_groups is not None:
+                position = {original: i for i, original in enumerate(kept_traits)}
+                remapped = []
+                for name, columns, cutoff in zip(jagwas.names, jagwas.columns, jagwas.cutoffs):
+                    kept = [position[int(column)] for column in columns if int(column) in position]
+                    if len(kept) < len(columns):
+                        warnings.warn(f"jagwas group {name}: {len(columns) - len(kept)} of {len(columns)} "
+                                      f"traits removed by phenotype QC", UserWarning, stacklevel=2)
+                    if not kept:
+                        raise ValueError(f"jagwas group {name} has no trait left after phenotype QC")
+                    remapped.append((name, kept, cutoff))
+                jagwas = reduction = JagwasGroups(remapped)
         genotype_shape = list(genotype.shape)
         # A ranged scan reports on its range, not on the file. The variant count
         # and the marker names both have to be narrowed here, or the sumstats

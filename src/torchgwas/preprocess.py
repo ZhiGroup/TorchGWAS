@@ -156,6 +156,9 @@ def prepare_inputs_for_prep(
     }
 
     if not pheno_mask.all():
+        # Retained input columns, as prepare_inputs records them: trait names
+        # and JAGWAS groups index the input panel, not the scanned one.
+        qc["phenotype_kept_column_indices"] = np.flatnonzero(pheno_mask).tolist()
         phenotype = phenotype[:, pheno_mask]
     if phenotype.shape[1] == 0:
         raise ValueError("all phenotype columns were dropped due to zero variance")

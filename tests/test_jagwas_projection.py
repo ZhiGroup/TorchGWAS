@@ -581,3 +581,24 @@ def test_api_refuses_groups_without_jagwas(tmp_path):
     with pytest.raises(TypeError, match='jagwas_groups'):
         run_linear_gwas(_ArrayStream(genotype), phenotype, reduce='significant', output_dir=tmp_path / 'bad',
                         device='cpu', jagwas_groups={'a': [0, 1]})
+
+
+def test_api_groups_follow_phenotype_qc(tmp_path):
+    # A constant trait in group a is removed by phenotype QC; the groups index
+    # the input panel, so b must stay b (before: IndexError past the last column).
+    genotype, phenotype = _api_inputs(traits=6)
+    panel = phenotype.copy()
+    panel[:, 1] = 1.0
+    with pytest.warns(UserWarning, match='jagwas group a: 1 of 3 traits removed by phenotype QC'):
+        _api_run(genotype, panel, tmp_path / 'grouped', jagwas_groups=[('a', [0, 1, 2]), ('b', [3, 4, 5])])
+    _api_run(genotype, phenotype[:, 3:], tmp_path / 'b')
+    import json
+    manifest = json.loads((tmp_path / 'grouped' / 'sumstats' / 'manifest.json').read_text())
+    assert manifest['df'] == [2, 3] and manifest['groups'] == ['a', 'b']
+    from torchgwas.sumstats_indexed import open_indexed_sumstats
+    _, parts = open_indexed_sumstats(tmp_path / 'grouped' / 'sumstats')
+    grouped = np.full(manifest['shape'][0], np.nan)
+    for part in parts:
+        grouped[np.asarray(part['variant_index'])] = np.asarray(part['chi2'])[:, 1]
+    _, alone = _api_statistic(tmp_path / 'b')
+    np.testing.assert_allclose(grouped, alone, rtol=1e-6, atol=0)
