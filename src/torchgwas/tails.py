@@ -407,11 +407,26 @@ def neg_log10_p_device(t, df, *, out=None, max_cells=DEVICE_TAIL_MAX_CELLS):
             last = min(rows, first + step)
             strip_t = t[first:last]
             strip_df = df[first:last] if df.shape[0] == rows else df
-            if aot:
-                # The build takes FP64 (rows, traits) of at least 2 x 2.
-                if min(strip_t.shape) < 2:
+            if compiled is not None and min(strip_t.shape) < 2:
+                # The tail is elementwise, so a column (a reduction's winners)
+                # runs as a (cells / 2, 2) block, padded by one cell when odd:
+                # the build takes at least 2 x 2, and a new shape would
+                # recompile the jit stages.
+                cells = strip_t.numel()
+                if cells < 4:
                     result[first:last] = _evaluate(_eager_stages(), strip_t, strip_df, starts)
                     continue
+                # Contiguous copies: a broadcast df reshapes to a zero-stride
+                # view, which the build would read past (NaN).
+                flat_t = strip_t.double().reshape(-1).contiguous()
+                flat_df = strip_df.double().expand(strip_t.shape).reshape(-1).contiguous()
+                if cells % 2:
+                    flat_t, flat_df = torch.cat((flat_t, flat_t[-1:])), torch.cat((flat_df, flat_df[-1:]))
+                values = _evaluate(stages, flat_t.view(-1, 2), flat_df.view(-1, 2), starts)
+                result[first:last] = values.reshape(-1)[:cells].view(strip_t.shape)
+                continue
+            if aot:
+                # The build takes FP64 (rows, traits) of at least 2 x 2.
                 strip_t = strip_t.double().contiguous()
                 strip_df = strip_df.double().expand(strip_t.shape).contiguous()
             result[first:last] = _evaluate(stages, strip_t, strip_df, starts)

@@ -96,7 +96,8 @@ def check_plan(*, chunk_variants: int, depth: int, n_samples: int,
                trait_devices: int = 1,
                headroom: float = 0.85,
                decode_on_gpu: bool = False,
-               compute_log10_p: bool = False) -> dict:
+               compute_log10_p: bool = False,
+               reduction_width: int | None = None) -> dict:
     """Report whether this plan fits, and what to do when it does not.
 
     `reduced` says whether a reduction or significance filter is active, which
@@ -113,7 +114,7 @@ def check_plan(*, chunk_variants: int, depth: int, n_samples: int,
         n_traits=n_traits, covariate_rank=covariate_rank,
         transfer_bytes_per_variant=transfer_bytes_per_variant,
         decode_on_gpu=decode_on_gpu, trait_devices=trait_devices,
-        compute_log10_p=compute_log10_p)
+        compute_log10_p=compute_log10_p, reduction_width=reduction_width)
     budget = device_memory_bytes * headroom
     fits = peak["gpu_bytes_per_device"] <= budget
 
@@ -166,7 +167,7 @@ def require_fit(**kwargs) -> dict:
     if largest and largest >= 1:
         advice = (
             f"reduce the trait count to {largest:,} or fewer, or pass "
-            f"reduce= (top-k, max-abs-t or significant), which lets the scan "
+            f"reduce='significant' or reduce='min-p', which lets the scan "
             f"block the traits automatically and merge the blocked results")
     else:
         advice = (

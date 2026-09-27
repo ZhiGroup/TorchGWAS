@@ -294,12 +294,14 @@ def host_pinned_bytes(*, chunk_variants: int, depth: int, n_traits: int,
     # optional float32 -log10(P), plus a uint8 status and a float32 residual
     # df per VARIANT. Reduced: the narrow width carries an extra int32
     # trait-index column, and the whole point of the mode is that `width`
-    # replaces `K` here.
+    # replaces `K` here; with -log10 P each kept pair adds it (float32) and
+    # its float32 df.
     if reduction_width is None:
         result_bytes_per_test = 12.0 if compute_log10_p else 8.0
         total += depth * chunk * (result_bytes_per_test * n_traits + 5.0)
     else:
-        total += depth * chunk * (12.0 * max(int(reduction_width), 1) + 5.0)
+        kept_bytes = 20.0 if compute_log10_p else 12.0
+        total += depth * chunk * (kept_bytes * max(int(reduction_width), 1) + 5.0)
     return total
 
 
@@ -332,9 +334,13 @@ def predicted_peak_bytes(*, chunk_variants: int, depth: int, n_samples: int,
         # -log10 P on the device: the chunk's float32 result plus the tail's
         # FP64 transient, which row strips bound (tails.DEVICE_TAIL_MAX_CELLS;
         # 747 MB measured for one unstripped 8.4M-cell chunk, 89 B per cell).
+        # A reduction (min-p) ranks by the tail when phenotypes are missing:
+        # rescaled float32 t, FP64 pair df and FP64 scores per cell
+        # (VariantReduction.reduce); with a complete panel it needs far less.
         from .tails import DEVICE_TAIL_MAX_CELLS, DEVICE_TAIL_TRANSIENT_BYTES_PER_CELL
         cells = int(chunk_variants) * block
-        gpu += 4.0 * cells + DEVICE_TAIL_TRANSIENT_BYTES_PER_CELL * min(cells, DEVICE_TAIL_MAX_CELLS)
+        per_cell = 4.0 if reduction_width is None else 20.0
+        gpu += per_cell * cells + DEVICE_TAIL_TRANSIENT_BYTES_PER_CELL * min(cells, DEVICE_TAIL_MAX_CELLS)
     host = host_pinned_bytes(
         chunk_variants=chunk_variants, depth=depth, n_traits=block,
         transfer_bytes_per_variant=transfer_bytes_per_variant,

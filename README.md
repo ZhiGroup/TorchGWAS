@@ -19,7 +19,8 @@ instead.
 - Direct hard-call PGEN decoding, with `pgenlib` used for dosage records.
 - Optional reusable zstd stores for BGEN, PGEN, and lossless packed BED input.
 - Binary, tiled summary-statistic output for large scans.
-- Optional device-side significance and joint-trait reductions.
+- Optional device-side reductions across traits: significant pairs, the
+  minimum-p trait per variant, and the JAGWAS joint test.
 
 ## Benchmark
 

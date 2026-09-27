@@ -1,9 +1,9 @@
-"""The reduction has two user-facing modes and refuses the rest.
+"""The reduction has three user-facing modes and refuses the rest.
 
-Standing decision: `significant` and `jagwas`. The per-variant top-k spellings
-(`max-abs-t`, `max-t2`, `min-p`, `top-k`) stay as machinery -- SignificantPairs
-is built on top-k and the trait-blocked paths still construct
-`VariantReduction` -- but they are not an answer a caller should reach for.
+Standing decision: `significant`, `min-p` (opened 2026-09-27) and `jagwas`.
+The other per-variant spellings (`max-abs-t`, `max-t2`, `top-k`) stay as
+machinery -- the trait-blocked paths still construct `VariantReduction` --
+but they are not an answer a caller should reach for.
 
 These tests exist because the decision was written down and then broken by
 every stress run in a single day, all of which passed `reduce='max-abs-t'`. A
@@ -31,15 +31,16 @@ def _tiny():
 class RejectedModesTestCase(unittest.TestCase):
     def test_every_top_k_spelling_is_refused(self):
         genotype, phenotype = _tiny()
-        for mode in ("max-abs-t", "max-t2", "min-p", "top-k"):
+        for mode in ("max-abs-t", "max-t2", "top-k"):
             with self.subTest(mode=mode):
                 with self.assertRaises(ValueError) as caught:
                     run_linear_gwas(genotype, phenotype, reduce=mode,
                                     output_dir="/tmp/should-not-be-created")
                 message = str(caught.exception)
-                # The error has to name the two real modes, or it sends the
+                # The error has to name the real modes, or it sends the
                 # caller looking through source for what to use instead.
                 self.assertIn("significant", message)
+                self.assertIn("min-p", message)
                 self.assertIn("jagwas", message)
 
     def test_the_refusal_names_the_offending_value(self):
@@ -79,14 +80,14 @@ class MachineryStillWorksTestCase(unittest.TestCase):
 
 
 class CliSurfaceTestCase(unittest.TestCase):
-    def test_cli_offers_the_two_modes_and_not_the_machinery(self):
+    def test_cli_offers_the_three_modes_and_not_the_machinery(self):
         from torchgwas.cli import _build_parser
 
         parser = _build_parser()
         # Parse rather than introspect argparse internals: this checks what a
         # user's command line actually does, which is the thing that was broken
         # (the CLI offered four machinery spellings and NEITHER real mode).
-        for mode in ("significant", "jagwas"):
+        for mode in ("significant", "min-p", "jagwas"):
             with self.subTest(mode=mode):
                 args = parser.parse_args(
                     ["linear", "--genotype", "g", "--phenotype", "p",
@@ -97,7 +98,7 @@ class CliSurfaceTestCase(unittest.TestCase):
         from torchgwas.cli import _build_parser
 
         parser = _build_parser()
-        for mode in ("max-abs-t", "max-t2", "min-p", "top-k"):
+        for mode in ("max-abs-t", "max-t2", "top-k"):
             with self.subTest(mode=mode):
                 with self.assertRaises(SystemExit):
                     parser.parse_args(

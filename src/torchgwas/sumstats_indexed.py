@@ -158,6 +158,8 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
                     began,time.perf_counter(),bool(fsync and name is not None),partition,
                     (int(start)+variant_offset,int(end)+variant_offset)))
  critical=(abs(float(special.stdtrit(df,p_value_threshold/2))) if p_value_threshold is not None else None)
+ # Set once a per-variant reduction's parts carry their pairs' own df.
+ pair_df_parts=False
  iterator=iter(chunks)
  try:
   for chunk in iterator:
@@ -200,6 +202,20 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
     if live_progress is not None:live_progress.begin_emit()
     part=add(values,start,end)
     completed(start,end,began,part,partition)
+    continue
+   if kind=='reduced' and len(chunk)>=8:
+    # A per-variant reduction (min-p): each kept pair carries its exact
+    # -log10 P and df from the device (VariantReduction.reduce), per-variant
+    # or, with missing phenotypes, per pair. Nothing is recomputed here.
+    t=np.asarray(chunk[3]);logp=np.asarray(chunk[6]);keep=np.isfinite(t)
+    if p_value_threshold is not None:keep &= logp>=-np.log10(p_value_threshold)
+    vi,ti=np.nonzero(keep)
+    values={'variant_index':(start+vi).astype(np.int64),'trait_index':np.asarray(chunk[5])[vi,ti].astype(np.int64)}
+    if store_beta:values['beta']=np.asarray(chunk[2])[vi,ti]
+    values.update(t_stat=t[vi,ti],df=np.asarray(chunk[7],dtype=np.float32)[vi,ti],
+                  neg_log10_p=logp[vi,ti].astype(np.float32))
+    pair_df_parts=True
+    add(values,start,end)
     continue
    beta=np.asarray(chunk[2]);t=np.asarray(chunk[3]);keep=np.isfinite(t)
    if critical is not None:keep &= np.abs(t)>=critical
@@ -244,7 +260,7 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
  if variant_source is not None:manifest['variant_source']=dict(variant_source)
  if extra_manifest is not None:
   manifest.update(extra_manifest() if callable(extra_manifest) else extra_manifest)
- if kind=='significant':
+ if kind=='significant' or pair_df_parts:
   manifest.update(version=2,df={'layout':'per_part','axis':'pair','field':'df'},nominal_df=int(df),
                   significance='neg_log10_p is -log10 of the exact two-sided Student-t tail at the per-pair df in each part')
  if (ordered_rows or kind=='jagwas') and ordering['globally_ordered']:

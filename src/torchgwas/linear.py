@@ -1219,8 +1219,11 @@ def linear_scan_streaming_chunks(
     # device-to-host bytes). p follows compute_p_values, as 10^-(-log10 P).
     if significance is not None and reduction is not None:
         raise ValueError('Significance and joint reduction are mutually exclusive')
-    if compute_log10_p and (reduction is not None or significance is not None):
-        raise ValueError('compute_log10_p is supported only for full result matrices')
+    # min-p (min_p.MinPReduction) stages its kept pairs' -log10 P and df:
+    # (start, end, beta, t, p, trait_index, -log10 P, df).
+    if compute_log10_p and (significance is not None or (reduction is not None
+                                                         and not getattr(reduction, 'stages_log10_p', False))):
+        raise ValueError('compute_log10_p is supported for full result matrices and per-variant reductions')
     if log10_p_dtype not in ('float32', 'float64'):
         raise ValueError('log10_p_dtype must be float32 or float64')
     # return_df appends a broadcastable df array to each unreduced chunk.
@@ -1295,9 +1298,11 @@ def linear_scan_streaming_chunks(
     # by sqrt(trait_df / df), as full output does, would leave z a null
     # variance of trait_df / df against R's 1. Other reductions need
     # pair-specific df and still refuse missingness.
-    if phenotype_has_missing and reduction is not None and getattr(reduction, "mode", None) != "jagwas":
+    # min-p with -log10 P ranks by the exact tail at each pair's df (min_p.py).
+    if (phenotype_has_missing and reduction is not None and getattr(reduction, "mode", None) != "jagwas"
+            and not (getattr(reduction, "stages_log10_p", False) and compute_log10_p)):
         raise ValueError(
-            "phenotype missingness is supported in full mode and for jagwas; other trait "
+            "phenotype missingness is supported in full mode, for jagwas and for min-p; other trait "
             "reductions need pair-specific df and are not yet supported")
     if getattr(reduction, "mode", None) == "jagwas" and pheno_proc.shape[1] > n_samples-covariate_rank-1:
         raise ValueError("jagwas trait count exceeds the residual phenotype rank")
@@ -1432,17 +1437,24 @@ def linear_scan_streaming_chunks(
                 width = reduction.resolved_width(beta_t.shape[1])
                 clear = torch.zeros(beta_t.shape[0], dtype=torch.uint8,
                                     device=beta_t.device)
-                beta_t, t_chunk_t, index_t, _, _ = reduction.reduce(
-                    beta_t, t_chunk_t, clear, df_chunk_t, width)
+                beta_t, t_chunk_t, index_t, _, _, *kept_pairs = reduction.reduce(
+                    beta_t, t_chunk_t, clear, df_chunk_t, width,
+                    **({} if log10_p is None else dict(log10_p=(logp_scale_t, logp_factor_t,
+                                                                _log10_p_dtype(log10_p)))))
                 index_chunk = index_t.cpu().numpy()
             beta_chunk = beta_t.cpu().numpy() if return_beta else None
             t_chunk = t_chunk_t.cpu().numpy()
             df_chunk = df_chunk_t.cpu().numpy()
             if reduction is not None:
                 # df is per variant, so it broadcasts across the k kept traits.
-                p_chunk = (_two_sided_t_pvalue(t_chunk, df=df_chunk[:, None])
-                           if compute_p_values else None)
-                yield start, end, beta_chunk, t_chunk, p_chunk, index_chunk
+                if kept_pairs:
+                    # -log10 P and df of the kept pairs, from the reduction.
+                    kept_pairs = [value.cpu().numpy() for value in kept_pairs]
+                    p_chunk = _p_from_log10(kept_pairs[0]) if compute_p_values else None
+                else:
+                    p_chunk = (_two_sided_t_pvalue(t_chunk, df=df_chunk[:, None])
+                               if compute_p_values else None)
+                yield (start, end, beta_chunk, t_chunk, p_chunk, index_chunk, *kept_pairs)
                 observed(start, end)
                 continue
             if log10_p is not None:

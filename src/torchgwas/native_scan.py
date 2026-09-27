@@ -222,7 +222,9 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                     *((torch.empty((rows, traits), dtype=logp_dtype, pin_memory=True),) if log10_p is not None else ()))
     else:
         def make_result(rows):
-            return reduction.host_buffers(rows, reduction_width)
+            if log10_p is None:
+                return reduction.host_buffers(rows, reduction_width)
+            return reduction.host_buffers(rows, reduction_width, log10_p_dtype=logp_dtype)
     # Pinned on a slot's first chunk and grown once to the capacity, like the
     # input ring (streaming.PinnedDosageLoader); dense output at K = 512 and
     # depth 32 pins 537 MB per GPU at chunk 4096.
@@ -317,7 +319,10 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
             logp = staged[4] if log10_p is not None else None
             trait_index = None
         else:
-            beta, t, trait_index, status, variant_df = staged
+            beta, t, trait_index, status, variant_df, *kept_pairs = staged
+            if kept_pairs:
+                # The kept pairs' -log10 P and df, from the device (VariantReduction.reduce).
+                logp, pair_df = kept_pairs
         malformed = np.flatnonzero(status == 3)
         if malformed.size:
             raise ValueError(f"invalid native ALT1 dosage at variant {start + int(malformed[0])}")
@@ -337,7 +342,7 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                      result_start[slot].elapsed_time(result_done[slot]),
                      0.0 if device_source else conversion_start[slot].elapsed_time(compute_start[slot])) if profiling else None
         emitted = ((start, end, beta, t, p, *((logp,) if logp is not None else ())) if reduction is None
-                   else (start, end, beta, t, p, trait_index))
+                   else (start, end, beta, t, p, trait_index, *((logp, pair_df) if logp is not None else ())))
         if return_df:
             emitted = (*emitted, variant_df[:, None])
         return emitted, int((status == 1).sum()), int((status == 2).sum()), gpu_times
@@ -492,9 +497,10 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                 # Reduce on the compute stream, before compute_done is recorded,
                 # so the narrow result is what the copy stream waits for and the
                 # wide (chunk x K) tensors are freed here rather than travelling.
-                beta, t, index_t, status, variant_df = reduction.reduce(
-                    beta, t, status, variant_df, reduction_width)
-                staged_values = (beta, t, index_t, status, variant_df)
+                staged_values = reduction.reduce(
+                    beta, t, status, variant_df, reduction_width,
+                    **({} if log10_p is None else dict(log10_p=(logp_scale_t, logp_factor_t, logp_dtype))))
+                del beta, t
             else:
                 staged_values = (beta if return_beta else None, t, status, variant_df)
                 if log10_p is not None:

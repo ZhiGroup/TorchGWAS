@@ -104,19 +104,20 @@ def _build_parser() -> argparse.ArgumentParser:
     linear.add_argument('--autotune-options', default=None,
                         help='JSON object for --autotune (chunk_sizes, devices, min_tile_traits, ...)')
     linear.add_argument("--p-value-threshold", type=float, default=None)
-    # TWO MODES, and the CLI previously offered NEITHER of them: it exposed
-    # only the internal top-k spellings, so the reduction a user actually wants
-    # was unreachable from the command line while four pieces of machinery
-    # were. `significant` is the default answer; `jagwas` needs the whole
+    # THREE MODES. The CLI once exposed only the internal top-k spellings, so
+    # the reductions a user actually wants were unreachable from the command
+    # line while four pieces of machinery were. `significant` is the default
+    # answer; `min-p` keeps one row per variant; `jagwas` needs the whole
     # phenotype resident and refuses when it will not fit.
     linear.add_argument(
         "--reduce",
-        choices=("significant", "jagwas"),
+        choices=("significant", "min-p", "jagwas"),
         default=None,
         help="reduce across traits on the device instead of writing the full "
              "variant x trait table: 'significant' keeps the pairs clearing "
-             "the threshold (default 5e-8/K), 'jagwas' computes the quadratic "
-             "form over the whole trait set",
+             "the threshold (default 5e-8/K), 'min-p' keeps each variant's "
+             "smallest-p trait with its beta, t, df and -log10 P, 'jagwas' "
+             "computes the quadratic form over the whole trait set",
     )
     linear.add_argument(
         "--significance-threshold", type=float, default=None,
