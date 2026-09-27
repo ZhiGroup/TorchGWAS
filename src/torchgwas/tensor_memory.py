@@ -158,12 +158,17 @@ def eager_memory_plan(samples, chunk, traits, covariates, depth, device_profile,
         joint=4*samples*traits+factor_setup['distinct_temporary_bytes']
         from .reduction_tensor_work import jagwas_cutoff_method
         method=factor_setup['method'] if 'method' in factor_setup else jagwas_cutoff_method()
-        # The census is xpotrf's (the rounding cutoff's Cholesky); the default
-        # eigen factor's syevd/geqrf workspace has no census yet.
+        # Each cutoff has its own census: xpotrf for the rounding cutoff's
+        # Cholesky, xsyevd and xgeqrf for the default eigen factor.
         if method=='rounding' and 'jagwas_factor_workspace_census' in device_profile:
             from .cusolver_memory import jagwas_factor_workspace
             factor_workspace=jagwas_factor_workspace(
                 device_profile['jagwas_factor_workspace_census'],traits,device_profile)
+            joint+=factor_workspace['device_rounded_bytes']
+        elif method=='eigen' and 'jagwas_eigen_workspace_census' in device_profile:
+            from .cusolver_memory import jagwas_eigen_factor_workspace
+            factor_workspace=jagwas_eigen_factor_workspace(
+                device_profile['jagwas_eigen_workspace_census'],traits,device_profile)
             joint+=factor_workspace['device_rounded_bytes']
         setup_peak=max(full['residual_device_live_bytes_upper'],joint,
             setup['design_device_live_bytes_upper']+scan['persistent_factor_bytes'])+library
@@ -185,5 +190,7 @@ def eager_memory_plan(samples, chunk, traits, covariates, depth, device_profile,
         else:
             result['factor_workspace']=factor_workspace
             result['factor_host_workspace_bytes']=factor_workspace['host_requested_bytes']
-            result['unresolved_memory_terms'].append('JAGWAS factor info/error tensors, triangular-solve workspace and per-row reduction workspace')
+            result['unresolved_memory_terms'].append(
+                'JAGWAS factor info tensors and per-row reduction workspace' if factor_workspace.get('method')=='eigen'
+                else 'JAGWAS factor info/error tensors, triangular-solve workspace and per-row reduction workspace')
     return result

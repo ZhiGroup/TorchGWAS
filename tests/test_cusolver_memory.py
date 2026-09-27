@@ -1,6 +1,6 @@
 import copy
 import pytest
-from torchgwas.cusolver_memory import jagwas_factor_workspace
+from torchgwas.cusolver_memory import jagwas_eigen_factor_workspace, jagwas_factor_workspace
 from torchgwas.tensor_memory import eager_memory_plan
 
 
@@ -58,3 +58,51 @@ def test_unknown_or_mismatched_evidence_rejected(change):
     if change=='timing':census['durations_recorded']=True
     if change=='shape':census['rows'][0]['traits']=True
     with pytest.raises(ValueError):jagwas_factor_workspace(census,7,profile)
+
+
+def eigen_evidence():
+    census,profile=evidence()
+    census=dict(census,method='eigen',rows=[dict(traits=7,syevd_device_workspace_bytes=278512,syevd_host_workspace_bytes=0,
+        geqrf_rows_queried=7,geqrf_max_device_workspace_bytes=1572992,geqrf_max_host_workspace_bytes=0,
+        matrix_allocated=False)])
+    return census,profile
+
+
+def test_eigen_factor_needs_the_larger_of_its_two_workspaces():
+    census,profile=eigen_evidence()
+    result=jagwas_eigen_factor_workspace(census,7,profile)
+    assert result['device_requested_bytes']==1572992
+    assert result['device_rounded_bytes']==1573376
+    census['rows'][0]['syevd_device_workspace_bytes']=2**30
+    assert jagwas_eigen_factor_workspace(census,7,profile)['device_rounded_bytes']==2**30
+    with pytest.raises(ValueError,match='not queried'):jagwas_eigen_factor_workspace(census,8,profile)
+
+
+@pytest.mark.parametrize('change',['rows','allocated','method','negative'])
+def test_eigen_census_must_cover_every_kept_row_count(change):
+    census,profile=eigen_evidence()
+    if change=='rows':census['rows'][0]['geqrf_rows_queried']=6
+    if change=='allocated':census['rows'][0]['matrix_allocated']=True
+    if change=='method':census.pop('method')
+    if change=='negative':census['rows'][0]['syevd_host_workspace_bytes']=-1
+    with pytest.raises(ValueError):jagwas_eigen_factor_workspace(census,7,profile)
+
+
+def test_each_cutoff_reads_only_its_own_census():
+    census,profile=eigen_evidence()
+    with pytest.raises(ValueError,match='xpotrf'):jagwas_factor_workspace(census,7,profile)
+
+
+def test_default_eigen_factor_adds_its_workspace_to_preparation_only(monkeypatch):
+    monkeypatch.delenv('TORCHGWAS_JAGWAS_RCOND',raising=False)
+    census,profile=eigen_evidence();old=eager_memory_plan(257,13,7,2,2,profile,reduction='jagwas')
+    assert old['factor_setup']['method']=='eigen'
+    assert any('syevd' in term for term in old['unresolved_memory_terms'])
+    census['rows'][0]['syevd_device_workspace_bytes']=2**30
+    profile['jagwas_eigen_workspace_census']=census
+    new=eager_memory_plan(257,13,7,2,2,profile,reduction='jagwas')
+    assert new['setup_bytes']==4*257*7+new['factor_setup']['distinct_temporary_bytes']+2**30+new['cublas']['total_bytes']
+    assert new['scan']==old['scan']
+    assert new['factor_workspace']['method']=='eigen'
+    assert not any('syevd' in term for term in new['unresolved_memory_terms'])
+    assert any('info tensors' in term for term in new['unresolved_memory_terms'])
