@@ -85,6 +85,11 @@ def child(data, out, config):
                   genotype_format=manifest.get('genotype_format', 'auto'))
     if source['genotype_format'] in ('auto', 'pgen'):
         source['pgen_mode'] = config.get('pgen_mode', manifest.get('pgen_mode', 'hardcall'))
+    # One metadata cache per dataset: without it every run re-parses the
+    # 8.09M-line pvar (8-14 s of api_seconds at full scale).
+    if 'genotype_cache_dir' not in kwargs:
+        (data / 'metadata_cache').mkdir(exist_ok=True)
+        source['genotype_cache_dir'] = str(data / 'metadata_cache')
     result = run_linear_gwas(**source, phenotype=data/'phenotype.npy',
                              covariates=data/'covariates.npy',
                              compute_dtype='float32',
