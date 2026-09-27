@@ -1647,6 +1647,107 @@ GPU in the tuner's decisions: 9.8-33.7k rows/s at 1024, 13.5-33.6k at 2048,
 H100 run. Four pairs lie at the p = 1e-5 boundary, where FP32 rounding differs
 by GPU and GEMM shape.
 
+### Quiet-window measurements (2026-09-27, midday)
+
+H100 GPUs 4-7, from the snapshot (pre-log10-p code). Load was 3-10, memory PSI
+1-6%, IO PSI 4-15%, and another user's job held GPU 3. Three repeats, executor
+seconds (`results/quiet_20260927/`).
+
+| job | fixed 1 GPU | fixed 2 shards | fixed 4 shards | autotune |
+|---|---|---|---|---|
+| JAGWAS K = 8,192 | — | — | 24.6, 24.7, 24.6 | 25.2, 24.9, 26.2 |
+| significant pairs | — | — | 20.0, 24.5, 20.3 | 20.7, 34.8, 20.8 |
+| dense K = 512, tmpfs | 15.4, 15.3, 15.3 | 10.3, 10.1, 10.8 | 17.0, 13.2, 13.4 | 17.6, 20.4, 19.7 (2 shards) |
+| dense K = 512, missing | 16.1, 15.7 | — | 14.1, 13.9 | 19.8, 18.9 (2 shards) |
+| dense K = 2,048, `/data` | 91.0, 80.1 | 38.8, 35.9 | 27.9, 28.0 | 37.1, 37.9 (2 shards) |
+
+- **JAGWAS and significant pairs** stay within 0.3-1.6 s of the fixed layout,
+  apart from one 34.8 s run.
+- **Dense K = 512: the planner chose the right layout.** Two shards were the
+  fastest layout at 10.1-10.8 s, yet autotune took 17.6-20.4 s with them. It
+  estimated a 17.9 s job, below min_job_seconds (20 s), so it never probed and
+  stayed at chunk 1024, where the fixed layouts ran 4096. Its layout record
+  also shows readers 26 against 16.
+- **Dense K = 2,048: the planner chose the wrong layout.** The write probe
+  measured an aggregate of 3.65 GB/s (one writer 2.02 GB/s) and predicted no
+  gain beyond two shards. Four shards sustained 4.7 GB/s (132.5 GB in 28 s).
+- **The write probe misjudges sustained rates in both directions.** On tmpfs
+  it measured 5.74 GB/s for one writer where the run sustained 2.2 GB/s; with
+  nodes 1-3 full, sustained tmpfs writes pay page reclaim that a 264 MB probe
+  does not. On disk it measured 3.65 GB/s for four writers where the run
+  sustained 4.7 GB/s.
+- **The CPU-demand cap also misjudged.** It limited the K = 512 run to 2 GPUs
+  (10.6 cores per GPU) on a per-variant service time of 0.71 us, where one
+  GPU averaged 1.9 us.
+
+Not yet changed: the probe and its short-job rule should be revisited with the
+12-byte cells of the log10-p store (below).
+
+### Exact -log10 P from the release (2026-09-27)
+
+The public release stores `neglog10p.f32` beside beta and t (upstream 7c0dd01,
+7abf2b1, ed8a5c9, 4a3e410), and this line now does too. The stored format,
+openers, indexed fields and in-memory rows follow the release; see
+`docs/sumstats-format.md`.
+
+**The device tail.** The release computes the tail with
+`upper_tail_log10_from_t_torch`. That function runs 40 continued-fraction
+iterations of eager FP64 elementwise work, materializes a chunk-sized
+temporary per operation, and evaluates the direct and the reflected fraction
+for every cell. Timings on one 8.4M-cell chunk (H100):
+
+| form | ms per chunk | notes |
+|---|---|---|
+| release, eager | 181 | 1.1 GB transient; about 17x the chunk's GEMM |
+| release, `torch.compile` | 31.8 | 5.5 GB transient; 18 s to compile per process |
+| one fraction per cell, compiled 4-iteration blocks | 4.1 | 4.7 s to compile per process |
+| same, AOTInductor build | 3.3 | loads in 0.7 s, then 0.2 s per further GPU |
+
+- `tails.neg_log10_p_device` evaluates one fraction per cell: the direct
+  K(a, 1/2, x), or the reflected K(1/2, a, 1 - x) with the parameters swapped.
+- It stays within 1.3e-11 of scipy's `stdtr` at df 22,238, and within 4.4e-7
+  of the release's function.
+- The stages are built per GPU architecture with `build_device_tail.sh` into
+  `.build-libs/device_tail_<key>`. The key covers torch, CUDA, the
+  architecture and the stage source.
+- Without a build the stages compile per process: about 8 s for two GPUs,
+  started at API entry. Calls then share the compile lock, because PyTorch's
+  FX-tracing flag is process-wide and a compiled call during another thread's
+  compile is refused.
+- Loading an Inductor library turns on flush-to-zero in the loading thread,
+  because it is linked with `-ffast-math` (crtfastmath). That changed NumPy
+  results for subnormal thresholds in the test suite. The loader now restores
+  the mode.
+
+**Staging.** Stores stage -log10 P as float32, cast on the device. That is the
+stored precision and bit-identical to a host cast, so dense output moves 12
+bytes per cell to the host rather than the release's 16. In-memory results
+stage FP64.
+
+**Missing phenotypes.** The device scales t and df per trait exactly as the
+host does afterwards.
+
+**Models.** The writer, schedule, queue and planner models count the -log10 P
+stream: payload, staging, write calls, fsyncs, the indexed part size (now 32
+bytes per pair), the pinned ring and the device transient. The
+first-principles calculator lists the tail's compute and staging as unpriced.
+
+**Measured cost** (H100, K = 512, 2 variant shards, tmpfs output; same window,
+same layout):
+
+| | executor seconds |
+|---|---|
+| without -log10 P (pre-port snapshot) | 9.6, 10.9 |
+| with it, per-process compile | 25.6 |
+| with it, AOT build | 18.0, 19.6, 18.1 |
+
+- Stored -log10 P against the host tail on 1.02M sampled cells: max relative
+  error 6.0e-8 (float32), with the same NaN pattern.
+- The store is 50% larger (49.7 against 33.2 GB), and the run is write-bound:
+  the GPUs were about 60% busy.
+- On writer-bound dense runs, storing -log10 P costs roughly its share of the
+  bytes. GPU-bound runs pay about 3.3 ms per 8.4M cells.
+
 ### GIL and process start
 
 - **Correction (2026-09-26):** hold time understates the GIL's cost. With

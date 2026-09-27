@@ -1,5 +1,23 @@
 # TorchGWAS JIT autotune handoff — 2026-09-23
 
+## Update (2026-09-27, afternoon): in line with main, exact -log10 P stored
+
+Details are in the design doc's "Exact -log10 P from the release" and
+"Quiet-window measurements" sections.
+- **Upstream commits.** main's commits since the release are on this line:
+  cherry-picked where they applied (NumPy genotype input removed,
+  `_QUOTE_TRIGGERS`), ported otherwise (log10-p, the top-k tests, the
+  predictor accounting).
+- **Stores are the release's format.** Dense stores hold `neglog10p.f32` (12
+  bytes per cell), and `open_binary_sumstats` returns four values.
+- **Device tail.** `tails.neg_log10_p_device`, built ahead of time per GPU
+  architecture: run `build_device_tail.sh` once per host type, or it compiles
+  per process.
+- **Dense planner.** Autotune's layout was right at K = 512 but it skipped
+  probing and kept chunk 1024 (17.6-20.4 s against 10.1-10.8 s fixed). At
+  K = 2,048 the write probe underestimated four writers (2 shards 37 s, 4
+  shards 28 s).
+
 ## Update (2026-09-27): git repo, stores, selection, workspace, host pages
 
 Details are in the design doc's "Stores, selection, factor workspace and host

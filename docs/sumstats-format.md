@@ -1,26 +1,34 @@
 # Binary summary-statistic format (jagwas-dev)
 
 TorchGWAS writes association scans as binary arrays under
-`OUTPUT_DIR/sumstats/`, described by `manifest.json`. This line differs from
-the public release: stores hold `beta` and `t_stat` (no `neg_log10_p`), and
-streaming stores record where their variants come from instead of rewriting
-the variant IDs.
+`OUTPUT_DIR/sumstats/`, described by `manifest.json`. The stored fields follow
+the public release. This line adds a per-variant df sidecar for missing
+genotype calls, and streaming stores record where their variants come from
+instead of rewriting the variant IDs.
 
 ## Dense stores
 
-`--sumstats-fields beta+t` (the default) writes float32 `beta.f32` and
-`tstat.f32`, `t` writes `tstat.f32` only. Both are `(n_variants, n_traits)`,
-little-endian, C order. Excluded variants carry NaN. P-values are not stored:
-they are the two-sided Student t tail of `t_stat` at the store's df, which is a
-scalar, one value per trait (missing phenotypes), or a per-variant `df.f32`
-column (missing genotype calls).
+With `--sumstats-fields beta+t` (the default) a store holds float32
+`beta.f32`, `tstat.f32` and `neglog10p.f32`, 12 bytes per variant-trait cell.
+With `t` it holds `tstat.f32` and `neglog10p.f32`, 8 bytes per cell. All three
+arrays are `(n_variants, n_traits)`, little-endian, C order, and excluded
+variants carry NaN in each.
+
+`neg_log10_p` is -log10 of the exact two-sided Student-t tail. It is computed
+in FP64 on the scan device and stored as float32. Raw P values are not stored,
+because they underflow for strong associations. The manifest (version 2)
+records the df the tail was taken at. That is a scalar, one value per trait
+for missing phenotypes, or a per-variant `df.f32` column for missing genotype
+calls.
 
 ```python
 from torchgwas.sumstats import open_binary_df, open_binary_sumstats
 
-beta, t_stat, manifest = open_binary_sumstats("run/sumstats")
+beta, t_stat, neg_log10_p, manifest = open_binary_sumstats("run/sumstats")
 df = open_binary_df("run/sumstats")        # broadcasts against t_stat
 ```
+
+`neg_log10_p` is None for a store written before it was stored (version 1).
 
 A multi-GPU run writes one child store per variant shard (`layout:
 variant_shards`) or per trait tile (`layout: trait_tiles`). The openers above
@@ -31,8 +39,10 @@ read them as one array.
 Reductions write NumPy parts listed in the manifest
 (`format: torchgwas-indexed-sumstats`):
 
-- `reduce='significant'`: one row per passing pair, with `variant_index`,
-  `trait_index`, `t_stat`, `df` and `beta` (unless `--sumstats-fields t`).
+- `reduce='significant'` and `p_value_threshold`: one row per passing pair,
+  with `variant_index`, `trait_index`, `t_stat`, `neg_log10_p` (float32),
+  `beta` (unless `--sumstats-fields t`) and, for significant pairs, the
+  pair's `df`.
 - `reduce='jagwas'`: one row per variant, with `variant_index` and `chi2`, a
   column per JAGWAS group. The manifest `df` is the joint test's df, a list
   with one entry per group when groups are used, and `groups` names them.
@@ -77,3 +87,6 @@ in-memory result path, whose rows follow the QC-kept markers.
 
 Use `--sumstats-format none` to discard statistics after the scan (for timing
 the computation only).
+
+Results returned without `output_dir` report `-log10_p` for each row, from the
+same exact tail in FP64, and no raw `p_value`.
