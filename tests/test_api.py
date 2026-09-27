@@ -20,6 +20,13 @@ from torchgwas.preprocess import prepare_inputs_for_prep
 
 
 class APITestCase(unittest.TestCase):
+    def test_topk_per_trait_is_not_public_api(self):
+        import inspect
+
+        self.assertNotIn(
+            "topk_per_trait", inspect.signature(run_linear_gwas).parameters
+        )
+
     def test_tabular_inputs_align_to_sample_ids(self):
         toy = get_toy_dataset_paths(Path(__file__).resolve().parents[1] / "examples" / "toy")
         linear = run_linear_gwas(
