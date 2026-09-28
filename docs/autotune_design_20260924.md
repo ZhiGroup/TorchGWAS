@@ -1884,6 +1884,20 @@ executor seconds (`results/autotune_vs_fixed_v2_20260927/`):
   3.4 ms reproduces one GPU (21.7 s modelled, 21.2 s measured), two (10.8 /
   12.1-12.8) and four (6.7 / 7.0-8.5). The device-op probe measures only about
   a quarter of h, so h itself still needs measuring.
+  - That h is not the GIL. py-spy --gil on four min-p shards at K = 512
+    (`benchmarks/gil_holders_20260927.py`) found the GIL mostly idle during the
+    scan. Most GIL samples were process start (importing api and io); scan-time
+    holders, the tail's calls and the indexed writer among them, were under
+    10%. The host was loaded (load ~95), so this needs repeating on a quiet
+    host, together with a timeline of where one GPU's 2.6 us per variant goes
+    beyond its 1.6 us of compute.
+- *Pricing every backend* (d9957f2). The device-work probe timed only the
+  torch statistics, so native fused kernels and packed BED input fell back to
+  the GEMM-only price. `scan_statistics_path` names the path the scan
+  dispatches to, and the probe times that path's own kernels. H100, us per
+  variant, dense K = 512 / 8,192: torch 2.26 / 12.4; native dosage
+  1.28 / 11.2; native packed 1.19 / 11.1; BED 1.20 / 11.1; generic
+  1.65 / 12.6.
 - *Dense shard count.* The write model priced 2, 3 and 4 shards within 0.4 s
   of each other (10.5, 10.7, 10.9) and chose 2. The unmodelled per-shard host
   cost favours more shards.
