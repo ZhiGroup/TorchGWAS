@@ -74,7 +74,8 @@ def test_api_selected_pairs_match_full_pgen_statistics_with_missing_calls(tmp_pa
     y=rng.normal(size=(n,k)).astype(np.float32);cov=rng.normal(size=(n,2)).astype(np.float32)
     if missing_pheno:y[:5,0]=np.nan;y[:9,2]=np.nan
     for key,value in [('TORCHGWAS_PGEN_BACKEND','native'),('TORCHGWAS_PGEN_PACKED','0'),('TORCHGWAS_NATIVE_STATS','0')]:monkeypatch.setenv(key,value)
-    options=dict(genotype_format='pgen',pgen_mode='hardcall',device=device,compute_dtype='float32',chunk_size=4,
+    # The release's missing-phenotype convention (pair df), which the reference below recomputes.
+    options=dict(genotype_format='pgen',pgen_mode='hardcall',device=device,compute_dtype='float32',chunk_size=4,missing_phenotype='impute',
         reader_workers=2,prefetch_chunks=2,variant_range=(1,18),sumstats_queue_depth=1)
     run_linear_gwas(path,y,cov,output_dir=tmp_path/'full',**options)
     beta,t,_logp,_=open_binary_sumstats(tmp_path/'full/sumstats');df=np.broadcast_to(open_binary_df(tmp_path/'full/sumstats'),t.shape)
@@ -224,8 +225,9 @@ def test_significant_npy_input_and_qc_stay_trait_bounded(tmp_path, monkeypatch, 
     with patch('numpy.load', side_effect=load), \
          patch('torchgwas.preprocess._phenotype_column_mask', wraps=preprocess._phenotype_column_mask) as qc, \
          patch('torchgwas.api.prepare_inputs_for_prep', side_effect=prepare):
+        # 'impute' keeps the memory-mapped panel as loaded; dropping subjects copies the kept rows.
         result = run_linear_gwas(path, panel, device='cpu', genotype_format='pgen', pgen_mode='hardcall',
-            compute_dtype='float32', trait_block=4, chunk_size=4, reader_workers=2,
+            compute_dtype='float32', trait_block=4, chunk_size=4, reader_workers=2, missing_phenotype='impute',
             reduce='significant', significance_threshold=1., output_dir=tmp_path/'selected')
     assert len(loaded) == 1 and isinstance(loaded[0], np.memmap)
     assert max(call.args[0].shape[1] for call in qc.call_args_list) <= 4

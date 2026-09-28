@@ -91,6 +91,7 @@ class NativePgenReader:
         self._lengths = np.ascontiguousarray(self.header.record_lengths, dtype=np.uint32)
         self._subset = (None if sample_subset is None
                         else np.ascontiguousarray(sample_subset, dtype=np.int64))
+        self._subset_scratch = None
         # One descriptor per reader, read positionally: readers are created per
         # worker thread, and preadv carries its own offset so no seek is shared.
         self._fd = os.open(self.path, os.O_RDONLY)
@@ -155,6 +156,18 @@ class NativePgenReader:
             # is no wide intermediate and no second pass at all.
             pgen_native.expand_hardcall(packed, self.sample_ct, out,
                                         MISSING_VALUE)
+            return out
+        if self._subset is not None and pgen_native.expand_hardcall_available():
+            # A selection: expand every sample once into a reused scratch and
+            # gather the kept columns. Measured at 22,250 samples and 4,096
+            # variants: 0.128 s against 1.50 s for expanding to categories,
+            # fancy-indexing them and mapping through the table.
+            scratch = self._subset_scratch
+            if scratch is None or scratch.shape[0] < end - start:
+                scratch = self._subset_scratch = np.empty((end - start, self.sample_ct), dtype=np.int8)
+            rows = scratch[:end - start]
+            pgen_native.expand_hardcall(packed, self.sample_ct, rows, MISSING_VALUE)
+            np.take(rows, self._subset, axis=1, out=out)
             return out
         categories = pgen_native.expand(packed, self.sample_ct)
         if self._subset is not None:

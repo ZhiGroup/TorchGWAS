@@ -272,7 +272,7 @@ def test_full_api_partitions_keep_the_missing_phenotype_contract(tmp_path,layout
     y=rng.normal(size=(n,k)).astype(np.float32);y[:9,1]=np.nan;y[40:47,4]=np.nan;y[3,6]=np.nan
     np.save(tmp_path/'y.npy',y)
     options=dict(genotype_format='pgen',pgen_mode='hardcall',compute_dtype='float32',chunk_size=4,
-        reader_workers=4,prefetch_chunks=2,sumstats_queue_depth=1,sumstats_block_bytes=64)
+        reader_workers=4,prefetch_chunks=2,sumstats_queue_depth=1,sumstats_block_bytes=64,missing_phenotype='impute')
     serial=run_linear_gwas(path,tmp_path/'y.npy',device=devices[0],output_dir=tmp_path/'serial',**options)
     layout_options=(dict(variant_devices=devices) if layout=='shards' else dict(trait_block=3,trait_devices=devices))
     run_linear_gwas(path,tmp_path/'y.npy',output_dir=tmp_path/'parts',**layout_options,**options)

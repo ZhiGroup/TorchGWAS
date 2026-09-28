@@ -134,9 +134,31 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     # full 2,085,000 voxels one copy is 278 GB, so the difference between one
     # and three decides how many trait blocks a card can take, and therefore
     # how many times the whole genotype has to be re-read.
-    design = torch.empty((n, traits + covariates.shape[1]),
-                         dtype=torch.float32, device=device)
-    design[:, traits:].copy_(covariates)
+    #
+    # A row that carries every sample in file order (a sample selection on
+    # PGEN, e.g. subjects dropped for a missing phenotype; pgen.py): the
+    # unselected samples are marked missing on the device, so they leave every
+    # genotype sum and the observed count, and each design row sits at its
+    # sample's file position. Rows at unselected positions stay zero.
+    physical = getattr(source, 'native_physical_samples', None)
+    positions = packed_missing = unselected = None
+    if physical is not None:
+        positions = torch.as_tensor(source.native_sample_positions, dtype=torch.long, device=device)
+        if native_encoding == 'pgen_2bit':
+            packed_missing = torch.as_tensor(source.native_packed_missing_mask, dtype=torch.uint8, device=device)
+        else:
+            # One-byte-per-sample rows: the unselected columns take the
+            # transport's missing sentinel, which every path already masks.
+            unselected = torch.as_tensor(source.native_unselected_samples, dtype=torch.long, device=device)
+            unselected_value = source.native_missing_value
+    rows = n if physical is None else int(physical)
+    timings['physical_samples'] = rows
+    design = (torch.empty if positions is None else torch.zeros)(
+        (rows, traits + covariates.shape[1]), dtype=torch.float32, device=device)
+    if positions is None:
+        design[:, traits:].copy_(covariates)
+    else:
+        design[positions, traits:] = covariates
     phenotype_t = design[:, :traits]
 
     # Column-blocked: copying a contiguous host array into a STRIDED device
@@ -146,6 +168,13 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     column_block = design_column_block(n, traits)
     for begin in range(0, traits, column_block):
         stop = min(begin + column_block, traits)
+        if positions is not None:
+            columns = (phenotype[:, begin:stop].to(device=device, dtype=torch.float32)
+                       if isinstance(phenotype, torch.Tensor) else torch.as_tensor(
+                           np.ascontiguousarray(phenotype[:, begin:stop]), dtype=torch.float32, device=device))
+            design[positions, begin:stop] = columns
+            torch.sum(columns * columns, dim=0, out=phenotype_ss[begin:stop])
+            continue
         columns = phenotype_t[:, begin:stop]
         if isinstance(phenotype, torch.Tensor):
             columns.copy_(phenotype[:, begin:stop])  # device to device (variant shards)
@@ -448,6 +477,10 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                 if profiling or (delivery is not None and delivery.record_cuda):
                     conversion_start[slot].record(compute_stream)
                 genotype_t = device_buffers[slot][:end-start]
+                if packed_missing is not None:
+                    genotype_t.bitwise_or_(packed_missing)
+                elif unselected is not None:
+                    genotype_t.index_fill_(1, unselected, unselected_value)
                 if not native_statistics and transfer_dtype == torch.int8:
                     genotype_t = torch.where(genotype_t == -9, torch.nan,
                                              genotype_t.to(torch.float32))
@@ -466,7 +499,7 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                            if getattr(source, 'allows_direct_native_fill', False) else None)
                 if native_encoding == 'pgen_2bit':
                     centered, centered_ss, minimum, maximum, present = native_prepare(
-                        genotype_t, encoding='pgen_2bit', n_samples=n)
+                        genotype_t, encoding='pgen_2bit', n_samples=rows)
                 else:
                     centered, centered_ss, minimum, maximum, present = native_prepare(genotype_t, scale, missing)
                 products = centered @ design

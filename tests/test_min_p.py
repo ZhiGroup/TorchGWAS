@@ -44,8 +44,10 @@ def _inputs(tmp_path, *, missing_calls, missing_pheno, n=97, m=80, k=11, seed=51
 
 
 def _options(device):
+    # The release's missing-phenotype convention, which _expected recomputes.
     return dict(genotype_format='pgen', pgen_mode='hardcall', device=device, compute_dtype='float32',
-                chunk_size=4, reader_workers=2, prefetch_chunks=2, sumstats_queue_depth=1)
+                chunk_size=4, reader_workers=2, prefetch_chunks=2, sumstats_queue_depth=1,
+                missing_phenotype='impute')
 
 
 def _expected(tmp_path, path, y, covariates, calls, options, missing_pheno):

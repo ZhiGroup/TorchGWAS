@@ -1318,10 +1318,13 @@ def _validate(w, p, h, plan):
         if h.compute_launch_seconds:
             raise ValueError('resident statistics service already includes submission overhead')
     if p.native_encoding == 'pgen_2bit':
+        # A sample selection travels as whole file-order rows, so a physical
+        # row may be wider than the analysed samples need, never narrower.
         expected_row = ((w.samples + 3) // 4 + 63) // 64 * 64
-        if p.native_row_width != expected_row or p.native_input_bytes_per_value != 1:
+        if (p.native_row_width < expected_row or p.native_row_width % 64
+                or p.native_input_bytes_per_value != 1):
             raise ValueError('packed PGEN requires 64-byte-padded uint8 physical rows')
-        if p.transfer_bytes_per_variant != expected_row or p.decode_on_gpu:
+        if p.transfer_bytes_per_variant != p.native_row_width or p.decode_on_gpu:
             raise ValueError('packed PGEN transfer width or decode placement mismatch')
         if w.statistics_kernel != 'native_fused':
             raise ValueError('packed PGEN requires native fused statistics')
