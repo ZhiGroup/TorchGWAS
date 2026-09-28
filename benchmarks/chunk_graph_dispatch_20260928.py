@@ -15,6 +15,11 @@ CUDA events; the minimum over `--repeats`. Threads run one per device at
 once, like variant shards. The graph's outputs are checked against eager.
 
     python benchmarks/chunk_graph_dispatch_20260928.py --devices cuda:1 cuda:2 cuda:7
+
+Found (2026-09-28): the statistics and min-p's |t| ranking capture; the
+AOTInductor tail does not ("operation not permitted when stream is
+capturing"). Capturing from several threads at once hung and was not
+resolved; the Triton kernels (triton_scan) cut the launches instead.
 """
 import argparse
 import json
