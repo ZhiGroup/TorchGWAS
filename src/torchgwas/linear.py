@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import math
 import os
 import threading
@@ -203,23 +204,38 @@ def _packed_bed_statistics_native(
     df: int,
     sample_byte_indices: torch.Tensor | None,
     sample_bit_shifts: torch.Tensor | None,
+    physical_samples: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The contract of _packed_bed_statistics, served by the CUDA kernel.
 
-    The kernel reads samples in stored order, so a subsetting request is not
-    something it can answer; the caller keeps the Torch path for that.
+    The kernel reads samples in stored order, so it cannot gather a subset.
+    A selection instead travels as whole stored rows (`physical_samples`
+    wide) with the unselected calls marked missing and the design rows at
+    the selected samples' stored positions (_packed_bed_cuda_iterator).
     """
     if sample_byte_indices is not None or sample_bit_shifts is not None:
         raise ValueError("native packed BED does not support sample subsetting")
     from . import scan_gpu
 
     centered, centered_ss, minimum, maximum, present = scan_gpu.prepare(
-        packed, encoding="plink_2bit", n_samples=n_samples)
+        packed, encoding="plink_2bit", n_samples=int(physical_samples or n_samples))
     products = centered @ design
     beta, t_stat, status = scan_gpu.finish(
         products, centered_ss, minimum, maximum, phenotype_ss, present,
         float(df) - float(n_samples))
     return beta, t_stat, status, present.to(torch.float32) + float(df) - float(n_samples)
+
+
+def _native_packed_bed_available():
+    """True when the native BED kernel may run (`TORCHGWAS_BED_NATIVE=0` forbids it)."""
+    if os.environ.get("TORCHGWAS_BED_NATIVE", "1") != "1":
+        return False
+    try:
+        from . import scan_gpu
+
+        return bool(scan_gpu.available())
+    except Exception:  # noqa: BLE001 - availability must never fail a scan
+        return False
 
 
 def _select_packed_bed_statistics(sample_byte_indices, sample_bit_shifts):
@@ -318,6 +334,28 @@ def _packed_bed_cuda_iterator(
     depth = max(3, workers + 2)
     bytes_per_variant = int(getattr(genotype, "_bytes_per_variant"))
 
+    # A sample selection on the native kernel travels as whole stored rows:
+    # the unselected calls are marked missing (code 01) on the device, so they
+    # leave every genotype sum and the observed count, and each design row
+    # sits at its sample's stored position. The Torch path gathers instead.
+    selected_samples = getattr(genotype, "_sample_indices", None)
+    stored_samples = int(getattr(genotype, "_stored_n_samples", n_samples))
+    whole_rows = (selected_samples is not None and _native_packed_bed_available())
+    design_rows = stored_samples if whole_rows else n_samples
+    positions_t = bed_keep_t = bed_missing_t = None
+    if whole_rows:
+        selected_samples = np.asarray(selected_samples, dtype=np.int64)
+        positions_t = torch.as_tensor(selected_samples, dtype=torch.int64, device=torch_device)
+        unselected = np.ones(stored_samples, dtype=bool)
+        unselected[selected_samples] = False
+        unselected = np.flatnonzero(unselected)
+        shifts = 2 * (unselected % 4)
+        keep = np.full(bytes_per_variant, 0xFF, dtype=np.uint8)
+        np.bitwise_and.at(keep, unselected // 4, (0xFF ^ (3 << shifts)).astype(np.uint8))
+        missing = np.zeros(bytes_per_variant, dtype=np.uint8)
+        np.bitwise_or.at(missing, unselected // 4, (1 << shifts).astype(np.uint8))
+        bed_keep_t = torch.as_tensor(keep, device=torch_device)
+        bed_missing_t = torch.as_tensor(missing, device=torch_device)
     intercept_t = torch.full(
         (n_samples, 1),
         1.0 / math.sqrt(n_samples),
@@ -340,9 +378,12 @@ def _packed_bed_cuda_iterator(
     # Copying host-to-device straight into the slice never materialises the
     # separate phenotype tensor at all.
     covariate_width = covariate_t.shape[1]
-    design_t = torch.empty((n_samples, n_traits + covariate_width),
-                           dtype=torch.float32, device=torch_device)
-    design_t[:, n_traits:].copy_(covariate_t)
+    design_t = (torch.zeros if whole_rows else torch.empty)(
+        (design_rows, n_traits + covariate_width), dtype=torch.float32, device=torch_device)
+    if whole_rows:
+        design_t[positions_t, n_traits:] = covariate_t
+    else:
+        design_t[:, n_traits:].copy_(covariate_t)
     phenotype_t = design_t[:, :n_traits]
 
     # Upload and reduce in column blocks. Two reasons, both about bounding a
@@ -355,12 +396,16 @@ def _packed_bed_cuda_iterator(
     column_block = max(1, min(n_traits, (1 << 28) // max(n_samples * 4, 1)))
     for begin in range(0, n_traits, column_block):
         stop = min(begin + column_block, n_traits)
-        columns = phenotype_t[:, begin:stop]
-        columns.copy_(torch.as_tensor(
-            np.ascontiguousarray(pheno_proc[:, begin:stop])))
+        if whole_rows:
+            columns = torch.as_tensor(np.ascontiguousarray(pheno_proc[:, begin:stop]),
+                                      dtype=torch.float32, device=torch_device)
+            design_t[positions_t, begin:stop] = columns
+        else:
+            columns = phenotype_t[:, begin:stop]
+            columns.copy_(torch.as_tensor(
+                np.ascontiguousarray(pheno_proc[:, begin:stop])))
         torch.sum(columns * columns, dim=0, out=phenotype_ss_t[begin:stop])
-    selected_samples = getattr(genotype, "_sample_indices", None)
-    if selected_samples is None:
+    if selected_samples is None or whole_rows:
         sample_byte_indices_t = None
         sample_bit_shifts_t = None
     else:
@@ -480,8 +525,9 @@ def _packed_bed_cuda_iterator(
     compute_end = ([torch.cuda.Event(enable_timing=True)
                     for _ in range(result_depth)] if profiling else [])
 
-    statistics = _select_packed_bed_statistics(
-        sample_byte_indices_t, sample_bit_shifts_t)
+    statistics = (functools.partial(_packed_bed_statistics_native, physical_samples=stored_samples)
+                  if whole_rows else _select_packed_bed_statistics(
+                      sample_byte_indices_t, sample_bit_shifts_t))
     try:
         warm_beta, warm_t, warm_status, warm_df = statistics(
             packed_device[0],
@@ -496,6 +542,10 @@ def _packed_bed_cuda_iterator(
         (warm_beta.sum() + warm_t.sum() + warm_status.sum()
          + warm_df.sum()).item()
     except Exception:
+        if whole_rows:
+            # The design is laid out on stored rows; the Torch path needs it
+            # on the selected samples, so there is no silent fallback here.
+            raise
         statistics = _packed_bed_statistics
     torch.cuda.synchronize(torch_device)
 
@@ -655,6 +705,8 @@ def _packed_bed_cuda_iterator(
             result_slot = iteration % result_depth
             if profiling:
                 compute_start[result_slot].record(compute_stream)
+            if bed_keep_t is not None:
+                packed_device[device_slot][rows].bitwise_and_(bed_keep_t).bitwise_or_(bed_missing_t)
             beta_t, t_t, status_t, df_t = statistics(
                 packed_device[device_slot][rows],
                 design_t,

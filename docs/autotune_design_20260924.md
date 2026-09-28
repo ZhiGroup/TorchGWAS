@@ -1919,6 +1919,94 @@ executor seconds (`results/autotune_vs_fixed_v2_20260927/`):
   executor timing includes this, but every CLI run pays it, and on short jobs
   it exceeds the scan.
 
+### Missing phenotypes: drop the subject (default, 2026-09-28)
+
+**Decision (user).** `missing_phenotype='drop_subject'` is the default.
+- A sample with any missing or outlier-masked phenotype value leaves the
+  analysis for every trait. Under this policy `phenotype_outlier_sd` always
+  masks whole rows.
+- `'impute'` keeps the release convention: the trait mean, t × sqrt(trait_df
+  / df), and pair df.
+- An exact per-trait method is to follow as an opt-in only. The design for it
+  is the phenotype-side Qᵀg correction measured in
+  `benchmarks/missing_value_scaling_20260927.py`.
+
+The reasons: real panels rarely miss phenotypes, but they have outliers, and
+those drop the whole subject. JAGWAS needs one sample set in any case.
+
+**Exact by construction.** The drop is a sample selection. `select_samples`
+is new for PGEN, where it re-decides the transport; BED and BGEN already had
+it. Everything downstream then sees a complete n_kept panel: QC,
+residualization, df, the JAGWAS factor and the writers.
+`tests/test_drop_subject.py` checks, on every backend, that the output equals
+a run on files without those samples:
+- CPU;
+- CUDA Torch;
+- native with int8 transport;
+- native with packed transport;
+- BED on its Torch and native paths.
+
+**The selection is applied on the GPU, not the host.** One thread decoding
+4,096 variants at 22,250 samples (`benchmarks/pgen_subset_decode_20260928.py`):
+
+| decode | s / chunk |
+|---|---|
+| every sample, one pass into the output | 0.022 |
+| the reader's subset path (expand, fancy-index, table) | 1.50 |
+| the cheapest host gather (one pass, then `np.take`) | 0.128 |
+
+So a selection that keeps at least half the file's samples travels as whole
+file-order rows:
+- `native_physical_samples`, `native_sample_positions`;
+- the unselected columns are marked missing on the device:
+  - int8 and dosage rows: `index_fill_` with the transport's sentinel;
+  - packed PGEN: OR 0b11 (code 3);
+  - native BED: AND and OR to code 01;
+- each design row sits at its sample's file position, and every other row is
+  zero.
+
+Because the unselected calls are missing, they leave the mean, Σg², the
+products and the observed count, so the variant df is exact as well.
+
+A smaller selection, such as a sub-cohort, is still decoded on the host: the
+extra transfer and GEMM rows would exceed the kept work. That host path now
+uses the one-pass gather, 12× faster than before.
+
+Packed PGEN and the native BED kernel cannot gather at all. They used to
+refuse any selection (int8 transport, or the Torch BED path). They now take
+whole rows.
+
+`TORCHGWAS_PGEN_WHOLE_ROWS=0` forces the host path, for A/B comparisons.
+
+**Full scale.**
+- Setup: 22,250 × 8.09M hard calls, K=512, `reduce='min-p'`, 4 H100s, chunk
+  4096, 16 readers, the default int8 transport with Torch statistics.
+- 1% of the subjects (222) are given one missing value each.
+- Seven interleaved rounds in fresh processes
+  (`benchmarks/drop_subject_full_scale_20260928.py`); the host load rose from
+  13 to 30 during the run.
+
+| config | executor s, median | best |
+|---|---|---|
+| complete panel | 9.60 | 7.96 |
+| 1% dropped, whole rows (default) | 9.95 | 8.25 |
+| 1% dropped, host gather | 34.35 | 32.29 |
+
+- With whole rows, dropping subjects costs nothing measurable at this
+  host-bound K.
+- Decoding on the host costs 3.6× even with the faster gather.
+- The old subset path is about 12× slower again per chunk, which extrapolates
+  to roughly 185 s of decode at 16 readers.
+
+**Open.**
+- A memory-mapped panel that contains missing values is copied, keeping only
+  the kept rows. That is O(n_kept × K) once, and too much for a voxel-scale
+  panel.
+- Stores without `select_samples` (zstd, the hardcall store) refuse
+  `drop_subject` when a value is missing; the error names `'impute'`.
+- Grouped JAGWAS drops the union of rows across groups, as outlier masking did
+  before.
+
 ## 3. Tuning during the run
 
 ### What the current tuner hides, and what it does not

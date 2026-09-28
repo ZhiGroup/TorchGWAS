@@ -120,6 +120,19 @@ def _build_parser() -> argparse.ArgumentParser:
              "computes the quadratic form over the whole trait set",
     )
     linear.add_argument(
+        "--missing-phenotype", choices=("drop_subject", "impute"), default="drop_subject",
+        help="a sample with a missing or outlier-masked phenotype value: "
+             "'drop_subject' (default) leaves the analysis for every trait, so "
+             "statistics are exact OLS on the kept samples; 'impute' uses the "
+             "trait mean with the trait's own df",
+    )
+    linear.add_argument(
+        "--phenotype-outlier-sd", type=float, default=None,
+        help="mask phenotype values beyond this many SD of their "
+             "covariate-residualised trait (the whole sample under "
+             "--missing-phenotype drop_subject or --reduce jagwas)",
+    )
+    linear.add_argument(
         "--significance-threshold", type=float, default=None,
         help="p-value threshold for --reduce significant; default 5e-8/K, "
              "which already carries the correction for the effective number "
@@ -438,6 +451,8 @@ def _run_linear(args) -> int:
         p_value_threshold=args.p_value_threshold,
         reduce=args.reduce,
         significance_threshold=args.significance_threshold,
+        missing_phenotype=args.missing_phenotype,
+        phenotype_outlier_sd=args.phenotype_outlier_sd,
         trait_block=args.trait_block,
         trait_devices=args.trait_devices,
         variant_devices=args.variant_devices,

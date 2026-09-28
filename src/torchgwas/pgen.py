@@ -388,38 +388,8 @@ class PgenDosageSource:
         self._raw_n_variants = int(metadata["marker_id"].size)
         self._all_metadata = metadata
 
-        if selected_sample_ids is None:
-            requested_indices = np.arange(self._raw_n_samples, dtype=np.uint32)
-        else:
-            requested = np.asarray([str(value) for value in selected_sample_ids], dtype=object)
-            if requested.size == 0:
-                raise ValueError("PGEN sample selection cannot be empty")
-            if len(set(requested.tolist())) != int(requested.size):
-                raise ValueError("PGEN sample selection contains duplicate IID values")
-            index_by_iid = {str(iid): index for index, iid in enumerate(all_sample_ids)}
-            absent = [str(iid) for iid in requested if str(iid) not in index_by_iid]
-            if absent:
-                preview = ", ".join(absent[:5])
-                raise ValueError(
-                    f"PGEN sample selection contains {len(absent)} IID values absent from PSAM "
-                    f"({preview})"
-                )
-            requested_indices = np.asarray(
-                [index_by_iid[str(iid)] for iid in requested], dtype=np.uint32
-            )
-        sorted_indices = np.sort(requested_indices)
-        self._reader_sample_subset = (
-            None
-            if np.array_equal(sorted_indices, np.arange(self._raw_n_samples, dtype=np.uint32))
-            else np.ascontiguousarray(sorted_indices, dtype=np.uint32)
-        )
-        self._sample_reorder = np.searchsorted(sorted_indices, requested_indices)
-        self._reorder_is_identity = np.array_equal(
-            self._sample_reorder, np.arange(requested_indices.size)
-        )
-        self.family_ids = all_family_ids[requested_indices.astype(np.int64)]
-        self.sample_ids = all_sample_ids[requested_indices.astype(np.int64)]
-        self._n_samples = int(self.sample_ids.size)
+        self._psam_family_ids, self._psam_sample_ids = all_family_ids, all_sample_ids
+        self._apply_sample_selection(selected_sample_ids)
 
         # Resolve mode and backend before the first reader exists: `_new_reader`
         # needs both, and they are properties of the file rather than of any
@@ -474,10 +444,55 @@ class PgenDosageSource:
         self.transform_worker_seconds = 0.0
         self.decoded_logical_bytes = 0
 
-    def _new_reader(self):
+    def _apply_sample_selection(self, sample_ids) -> None:
+        """Select and order samples by IID (None keeps every sample in file order)."""
+        if sample_ids is None:
+            requested_indices = np.arange(self._raw_n_samples, dtype=np.uint32)
+        else:
+            requested = np.asarray([str(value) for value in sample_ids], dtype=object)
+            if requested.size == 0:
+                raise ValueError("PGEN sample selection cannot be empty")
+            if len(set(requested.tolist())) != int(requested.size):
+                raise ValueError("PGEN sample selection contains duplicate IID values")
+            index_by_iid = {str(iid): index for index, iid in enumerate(self._psam_sample_ids)}
+            absent = [str(iid) for iid in requested if str(iid) not in index_by_iid]
+            if absent:
+                preview = ", ".join(absent[:5])
+                raise ValueError(
+                    f"PGEN sample selection contains {len(absent)} IID values absent from PSAM "
+                    f"({preview})"
+                )
+            requested_indices = np.asarray(
+                [index_by_iid[str(iid)] for iid in requested], dtype=np.uint32
+            )
+        sorted_indices = np.sort(requested_indices)
+        self._reader_sample_subset = (
+            None
+            if np.array_equal(sorted_indices, np.arange(self._raw_n_samples, dtype=np.uint32))
+            else np.ascontiguousarray(sorted_indices, dtype=np.uint32)
+        )
+        self._sample_reorder = np.searchsorted(sorted_indices, requested_indices)
+        self._reorder_is_identity = np.array_equal(
+            self._sample_reorder, np.arange(requested_indices.size)
+        )
+        self.family_ids = self._psam_family_ids[requested_indices.astype(np.int64)]
+        self.sample_ids = self._psam_sample_ids[requested_indices.astype(np.int64)]
+        self._n_samples = int(self.sample_ids.size)
+        self._sample_file_positions = requested_indices.astype(np.int64)
+
+    def select_samples(self, sample_ids):
+        """Re-select samples by IID after construction; readers opened afterwards use it."""
+        if getattr(self, "_converted", False):
+            raise RuntimeError("PGEN samples cannot change after the conversion stream has run")
+        self._apply_sample_selection(sample_ids)
+        return self
+
+    def _new_reader(self, full=False):
         # One reader per worker thread; the backend is a per-file property and
-        # is resolved once, before the first reader is built.
+        # is resolved once, before the first reader is built. `full` opens it
+        # on every sample in file order, for rows that travel whole.
         backend = self.pgen_backend
+        subset = None if full else self._reader_sample_subset
         if backend == "native":
             from .pgen_native_reader import NativePgenReader
 
@@ -485,14 +500,14 @@ class PgenDosageSource:
                 self.genotype_path,
                 raw_sample_ct=self._raw_n_samples,
                 variant_ct=self._raw_n_variants,
-                sample_subset=self._reader_sample_subset,
+                sample_subset=subset,
                 _prepared_header=self._prepared_native_header,
             )
         return _open_pgen(
             os.fsencode(self.genotype_path),
             raw_sample_ct=self._raw_n_samples,
             variant_ct=self._raw_n_variants,
-            sample_subset=self._reader_sample_subset,
+            sample_subset=subset,
         )
 
     def close(self) -> None:
@@ -767,6 +782,23 @@ class PgenGenotype(PgenDosageSource):
         super().__init__(*args, **kwargs)
         self.prefetch_chunks = max(2, self.reader_workers) if prefetch_chunks is None else int(prefetch_chunks)
         self.decode_workers = self.reader_workers
+        self._configure_native_transport()
+        self.marker_ids = self._all_metadata["marker_id"]
+        self.chromosomes = self._all_metadata["chromosome"]
+        self.positions = self._all_metadata["position"]
+        self.effect_alleles = self._all_metadata["effect_allele"]
+        self.other_alleles = self._all_metadata["other_allele"]
+        # The metadata probe is not an iterator reader and need not remain open.
+        self.close()
+
+    def select_samples(self, sample_ids):
+        """Re-select samples by IID and re-decide the transport for the new selection."""
+        self._apply_sample_selection(sample_ids)
+        self._configure_native_transport()
+        return self
+
+    def _configure_native_transport(self) -> None:
+        """Choose the host-to-device row format for the current sample selection."""
         self.native_dtype = np.dtype(np.int8 if self.mode == "hardcall" else np.float32)
         # OPT-IN uint8 dosage transport. Dosage ships float32 today, which is
         # 141,460 B per variant at N=35,365 -- 1.26 TB over PCIe for the full
@@ -834,11 +866,10 @@ class PgenGenotype(PgenDosageSource):
         # what an A/B of the two needs; `=1` turns an ineligible source into an
         # error rather than a silent fallback.
         requested = os.environ.get("TORCHGWAS_PGEN_PACKED")
+        selection = self._reader_sample_subset is not None or not self._reorder_is_identity
         if self.mode != "hardcall":
             refusal = ("packed PGEN transport requires explicit hardcall mode; "
                        "it carries two-bit calls, not dosages")
-        elif self._reader_sample_subset is not None or not self._reorder_is_identity:
-            refusal = "packed PGEN transport requires all samples in file order"
         elif not self._has_packed_range:
             refusal = ("packed PGEN transport requires a reader providing "
                        "read_packed_range_into()")
@@ -850,6 +881,8 @@ class PgenGenotype(PgenDosageSource):
             # packed transport by name may be driving `native_reader_session`
             # directly and never running a scan at all, so this must not be
             # made conditional on a statistics backend it does not use.
+            if refusal is None and selection:
+                refusal = "packed PGEN transport requires all samples in file order"
             if refusal is not None:
                 self.close()
                 raise ValueError(f"TORCHGWAS_PGEN_PACKED=1 but {refusal}")
@@ -866,10 +899,50 @@ class PgenGenotype(PgenDosageSource):
             # is exactly what the first attempt at this did.
             enable_packed = (refusal is None
                              and os.environ.get("TORCHGWAS_NATIVE_STATS", "0") == "1")
+        # WHOLE ROWS for a sample selection (a subset, a reorder, or subjects
+        # dropped for a missing phenotype): rows travel in file order with
+        # every sample, the scan marks the unselected samples missing on the
+        # device -- so they leave every genotype sum and the observed count --
+        # and places each design row at its sample's file position
+        # (native_scan). Decoding a selection on the host instead expands
+        # every sample anyway and then gathers the kept columns: measured on
+        # the 22,250-sample cohort, one thread and 4,096 variants take 0.022 s
+        # for all samples, 1.50 s for a 1% drop through the reader's subset
+        # path and 0.128 s with the gather at its cheapest, so the selection
+        # is cheaper to apply on the GPU, where it costs the unselected rows
+        # of transfer and GEMM. That cost is bounded by the kept work only
+        # while at least half the samples are kept, so a smaller selection
+        # (a sub-cohort) is still decoded on the host. The packed transport
+        # cannot gather at all, so it takes whole rows or is not used.
+        # Only the automatic path does this: only the scan applies the mask.
+        # `TORCHGWAS_PGEN_WHOLE_ROWS=0` decodes every selection on the host,
+        # which is what an A/B of the two needs.
+        whole_rows = bool(selection and 2 * self._n_samples >= self._raw_n_samples
+                          and os.environ.get("TORCHGWAS_PGEN_WHOLE_ROWS", "1") != "0")
+        if enable_packed and selection and not whole_rows:
+            enable_packed = False
+        physical = self._raw_n_samples if whole_rows else self._n_samples
+        self.native_physical_samples = None
+        self.native_sample_positions = None
+        self.native_unselected_samples = None
+        self.native_packed_missing_mask = None
+        if whole_rows:
+            self.native_physical_samples = physical
+            self.native_sample_positions = self._sample_file_positions.copy()
+            unselected = np.ones(physical, dtype=bool)
+            unselected[self.native_sample_positions] = False
+            self.native_unselected_samples = np.flatnonzero(unselected)
+            self.native_row_width = physical
         if enable_packed:
             self.native_transfer_dtype = np.dtype(np.uint8)
-            self.native_row_width = ((self._n_samples + 3) // 4 + 63) // 64 * 64
+            self.native_row_width = ((physical + 3) // 4 + 63) // 64 * 64
             self.native_encoding = "pgen_2bit"
+            if whole_rows:
+                positions = self.native_unselected_samples
+                # Code 3 is missing: OR-ing both bits in marks the call.
+                mask = np.zeros(self.native_row_width, dtype=np.uint8)
+                np.bitwise_or.at(mask, positions // 4, (3 << (2 * (positions % 4))).astype(np.uint8))
+                self.native_packed_missing_mask = mask
         # -9 is the int8 sentinel. It must NOT be applied to the uint8
         # dosage transport: -9 as a uint8 is 247, which is a legitimate
         # dosage code (247/127 = 1.94), so every masked call would be read
@@ -877,14 +950,8 @@ class PgenGenotype(PgenDosageSource):
         # free there precisely because the scale is 127.0 rather than 127.5.
         if not getattr(self, "dosage_uint8_transport", False):
             self.native_missing_value = -9
-        self.native_host_staging_copies = 0 if self._reorder_is_identity else 1
-        self.marker_ids = self._all_metadata["marker_id"]
-        self.chromosomes = self._all_metadata["chromosome"]
-        self.positions = self._all_metadata["position"]
-        self.effect_alleles = self._all_metadata["effect_allele"]
-        self.other_alleles = self._all_metadata["other_allele"]
-        # The metadata probe is not an iterator reader and need not remain open.
-        self.close()
+        self.native_host_staging_copies = (0 if self._reorder_is_identity
+                                           or self.native_physical_samples is not None else 1)
 
     @property
     def shape(self):
@@ -996,7 +1063,7 @@ class PgenGenotype(PgenDosageSource):
                 if reader is None:
                     init_started = time.perf_counter() if profiling else 0.0
                     init_cpu_started = time.thread_time() if profiling else 0.0
-                    reader = self._new_reader()
+                    reader = self._new_reader(full=self.native_physical_samples is not None)
                     local.reader = reader
                     with condition:
                         readers.append(reader)
@@ -1010,7 +1077,7 @@ class PgenGenotype(PgenDosageSource):
                     reader.read_packed_range_into(start, end, out)
                     return out
                 target = out
-                if not self._reorder_is_identity:
+                if not self._reorder_is_identity and self.native_physical_samples is None:
                     scratch = getattr(local, "scratch", None)
                     if scratch is None or scratch.shape[0] < end - start:
                         scratch = np.empty(out.shape, dtype=self.native_dtype)
@@ -1025,7 +1092,7 @@ class PgenGenotype(PgenDosageSource):
                     # transport row; `floats` never leaves this worker.
                     floats = getattr(local, 'dosage_floats', None)
                     if floats is None or floats.shape[0] < end - start:
-                        floats = np.empty((end - start, self._n_samples),
+                        floats = np.empty((end - start, self.native_row_width),
                                           dtype=np.float32)
                         local.dosage_floats = floats
                     values = floats[:end - start]

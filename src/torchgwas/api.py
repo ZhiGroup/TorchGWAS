@@ -115,6 +115,46 @@ def _select_chunked_samples(genotype, genotype_sample_ids, requested_sample_ids)
     return genotype, genotype_sample_ids, stored
 
 
+def _drop_subjects_missing_phenotypes(phenotype, covariates, genotype, sample_ids):
+    """Remove every sample with a missing phenotype value from all inputs.
+
+    missing_phenotype='drop_subject': the rest of the run then sees a complete
+    panel on the kept samples, so its statistics, df and JAGWAS factor are
+    exactly those of a run on inputs without these samples. Returns the inputs
+    and the number of samples dropped (0 leaves every input untouched).
+    """
+    if phenotype is None or not np.issubdtype(np.asarray(phenotype[:0]).dtype, np.floating):
+        return phenotype, covariates, genotype, sample_ids, 0
+    n = int(phenotype.shape[0])
+    missing = np.zeros(n, dtype=bool)
+    # Column blocks bound the temporary; a memory-mapped panel is read once.
+    block = max(1, (64 << 20) // max(n, 1))
+    for begin in range(0, int(phenotype.shape[1]), block):
+        missing |= np.isnan(np.asarray(phenotype[:, begin:begin + block])).any(axis=1)
+    dropped = int(missing.sum())
+    if not dropped:
+        return phenotype, covariates, genotype, sample_ids, 0
+    if dropped == n:
+        raise ValueError("every sample has a missing phenotype value; missing_phenotype='drop_subject' "
+                         "would leave none (use missing_phenotype='impute' to keep them)")
+    kept = np.flatnonzero(~missing)
+    if isinstance(genotype, ChunkedGenotype):
+        if sample_ids is None or not hasattr(genotype, "select_samples"):
+            raise ValueError(
+                f"{type(genotype).__name__} cannot drop samples with missing phenotypes; "
+                "remove them from the inputs or pass missing_phenotype='impute'")
+        genotype.select_samples(np.asarray([str(value) for value in np.asarray(sample_ids)[kept]], dtype=object))
+        sample_ids = np.asarray(genotype.sample_ids, dtype=object)
+    else:
+        genotype = np.asarray(genotype)[kept]
+        if sample_ids is not None:
+            sample_ids = np.asarray(sample_ids)[kept]
+    phenotype = np.ascontiguousarray(phenotype[kept])
+    if covariates is not None:
+        covariates = np.ascontiguousarray(np.asarray(covariates)[kept])
+    return phenotype, covariates, genotype, sample_ids, dropped
+
+
 def _resolve_linear_compute_dtype(genotype, compute_dtype: str) -> str:
     if compute_dtype != "auto":
         return compute_dtype
@@ -616,9 +656,17 @@ def run_linear_gwas(
     jagwas_groups=None,
     # Opt-in: mask phenotype values beyond this many SD of their
     # covariate-residualised trait before the scan (preprocess.
-    # mask_phenotype_outliers). reduce='jagwas' drops the sample's whole
-    # panel row; per-trait scans drop the value.
+    # mask_phenotype_outliers). Under missing_phenotype='drop_subject' (and
+    # always for reduce='jagwas') the sample's whole panel row is masked;
+    # under 'impute' per-trait scans mask the value.
     phenotype_outlier_sd: float | None = None,
+    # How a missing (NaN or outlier-masked) phenotype value is handled.
+    # 'drop_subject': a sample missing any trait leaves the analysis for every
+    # trait, so each statistic is exact OLS on the kept samples (the run equals
+    # one on inputs with those samples removed). 'impute': the release
+    # convention -- the trait mean, t times sqrt(trait_df / df), pair df
+    # variant_df x trait_df / df.
+    missing_phenotype: str = "drop_subject",
 ) -> GWASResult:
     """Run associations, optionally saving bounded early productive measurements.
 
@@ -698,6 +746,8 @@ def run_linear_gwas(
                                   output_dir=output_dir, options=locals())
     if sumstats_format not in {"binary", "none"}:
         raise ValueError("sumstats_format must be 'binary' or 'none'; TSV output has been removed")
+    if missing_phenotype not in ("drop_subject", "impute"):
+        raise ValueError("missing_phenotype must be 'drop_subject' or 'impute'")
     calibrator = None
     if initial_calibration is not None:
         from .run_calibration import RunCalibration,validate_initial_calibration
@@ -802,7 +852,11 @@ def run_linear_gwas(
         from .preprocess import mask_phenotype_outliers
         phenotype, outlier_rows = mask_phenotype_outliers(
             phenotype, None if covariates is None else np.asarray(covariates), float(phenotype_outlier_sd),
-            whole_rows=reduce == "jagwas")
+            whole_rows=reduce == "jagwas" or missing_phenotype == "drop_subject")
+    dropped_subjects = 0
+    if missing_phenotype == "drop_subject":
+        phenotype, covariates, genotype, sample_ids, dropped_subjects = _drop_subjects_missing_phenotypes(
+            phenotype, covariates, genotype, sample_ids)
     if empirical is not None and not isinstance(genotype, ChunkedGenotype):
         # An in-memory genotype array runs one in-memory scan: nothing to tune.
         empirical.update(sizes=None, layout=dict(why=['in-memory genotype array: no streaming scan to tune']),
@@ -2202,6 +2256,9 @@ def run_linear_gwas(
         "numpy_hugepage_advice": numpy_hugepage_advice(),
         "phenotype_outlier_sd": phenotype_outlier_sd,
         "phenotype_outlier_rows": None if outlier_rows is None else int(outlier_rows.sum()),
+        "missing_phenotype": missing_phenotype,
+        # Samples left out of every trait for a missing or outlier-masked value.
+        "dropped_subjects": dropped_subjects,
         # Recorded because it changes how many passes the run made over the
         # genotypes, which is the first thing to check against a wall time.
         "trait_block": None if trait_block is None else int(trait_block),
