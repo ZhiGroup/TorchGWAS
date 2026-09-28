@@ -68,7 +68,8 @@ def test_transport_retains_statistics_df_and_ownership(device,borrow,missing,mon
     if not borrow:
         for actual,expected in zip(retained,reference):np.testing.assert_array_equal(actual[3],expected[3])
     if device.startswith('cuda'):
-        assert source._last_scan_profile['result_payload_bytes']==47*(4*7+5)
+        # t, plus each pair's complete-case df when a phenotype is missing (return_df).
+        assert source._last_scan_profile['result_payload_bytes']==47*((4+4*missing)*7+5)
         assert source._last_scan_profile['return_beta'] is False
 
 

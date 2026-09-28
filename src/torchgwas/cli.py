@@ -120,11 +120,12 @@ def _build_parser() -> argparse.ArgumentParser:
              "computes the quadratic form over the whole trait set",
     )
     linear.add_argument(
-        "--missing-phenotype", choices=("drop_subject", "impute"), default="drop_subject",
+        "--missing-phenotype", choices=("drop_subject", "impute", "exact"), default="drop_subject",
         help="a sample with a missing or outlier-masked phenotype value: "
              "'drop_subject' (default) leaves the analysis for every trait, so "
              "statistics are exact OLS on the kept samples; 'impute' uses the "
-             "trait mean with the trait's own df",
+             "trait mean with the trait's own df; 'exact' tests each trait on "
+             "its own observed samples (complete-case OLS, not for jagwas)",
     )
     linear.add_argument(
         "--phenotype-outlier-sd", type=float, default=None,

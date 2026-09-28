@@ -1902,6 +1902,83 @@ executor seconds (`results/autotune_vs_fixed_v2_20260927/`):
   of each other (10.5, 10.7, 10.9) and chose 2. The unmodelled per-shard host
   cost favours more shards.
 
+### Missing phenotypes: complete-case OLS per trait (2026-09-27, night)
+
+**Status (2026-09-28): opt-in, `missing_phenotype='exact'`.** The user kept
+the release convention as `'impute'` and made dropping the subject the
+default (see "Missing phenotypes: drop the subject" below). The method below is otherwise
+unchanged. The release convention is now a plan too
+(`complete_case.ImputedPlan`, rescaling t and returning the pair df), so
+both conventions share the per-pair plumbing.
+
+**The release convention was conservative.**
+- For a trait with missing values, full output took the t of the
+  mean-imputed panel times sqrt(trait_df / df), with pair df
+  variant_df x trait_df / df.
+- The mean-imputed t is already about the complete-case t. The rescale makes
+  it about sqrt(observed / n) of it: 2.60 against 3.22 with 250 of 400
+  observed.
+- Against FP64 least squares on each trait's observed rows, the error in
+  -log10 P (`benchmarks/missing_phenotype_conventions_20260927.py`):
+  - the full-scale panel (64 traits, up to 2% missing): -1.3% median,
+    -1.7% mean over pairs with -log10 P > 2;
+  - a synthetic panel with 30% missing by a covariate: -31% median.
+- Without the rescale the imputed t is -0.05% on the first panel, but still
+  -5.5% median on the second. Residualizing each trait on its own rows alone
+  brings both within 0.13%.
+
+**`'exact'`: each trait on its own observed samples, as plink2's --glm does
+per phenotype** (`complete_case.py`).
+- Each trait with missing values is residualized on [1, covariates] over its
+  own observed rows and zero-filled. The scan's product g^T y is then the
+  exact numerator.
+- The call's residual sum over the subset is a downdate of full-sample
+  quantities over the rows the trait lacks. With Z the scan's covariate
+  design [1/sqrt(n), Q]:
+  (sum g^2 - sum_M g^2) - u^T (Z^T Z - Z_M^T Z_M)^+ u, where
+  u = Z^T g - Z_M^T g_M.
+- The df is the pair's own count less rank(Z_S) less 1.
+- Traits sharing a missingness pattern share the work. Its cost is
+  (missing cells) x (rank + 1) per variant, gathered in blocks of at most
+  16,384 cells and 256 patterns.
+- It covers every backend: torch, native fused (dosage and packed 2-bit),
+  packed BED (unpacked, then the torch statistics) and generic. -log10 P,
+  p-values, min-p and significant pairs all use the pair's t and df.
+- JAGWAS keeps the imputed panel: its joint test needs one sample set.
+- Calls missing inside a subset keep the genotype convention: centred at the
+  variant's observed mean, df one lower each.
+
+**Two traps the tests caught.**
+- A float32 covariate basis is orthonormal only to ~1e-7. Downdating I
+  instead of Z^T Z lifted a subset's null direction above the rank cut. And
+  lstsq on the phenotype kept that direction where the call's
+  pseudo-inverse dropped it: 63% error in t for a trait whose samples made
+  a covariate constant. Both projections now use the plan's one
+  pseudo-inverse.
+- The tile and shard writers read -log10 P's presence from the chunk's
+  length. A chunk sent without its df made them recompute every tail on the
+  host: 19 s against 1.9 s for 200k variants.
+
+**Measured.**
+- The formula reproduces lstsq to machine precision.
+- Full-scale dense output on 300 variants x 64 missing traits
+  (`complete_case_full_scale_check_20260927.py`): t within 2.4e-6 absolute,
+  -log10 P within 1.8e-6 relative.
+- The correction costs 2.2 ms per 4,096-variant chunk for 28k missing cells
+  (`complete_case_gather_probe_20260927.py`), 0.9 ms of it the gather. It was
+  3.5 ms before its elementwise passes were cut.
+- Full scale on four H100s, K = 512, 64 traits up to 2% missing, fixed four
+  shards, host load 7-9 (`results/complete_case_cost*_20260927/`), executor
+  seconds against the complete panel:
+  - min-p: 8.8-8.9 against 6.9;
+  - dense: 14.2-16.4 against 10.5-11.4.
+- This regime is host-bound (see above). correct() issues ~80 small torch
+  ops per chunk, about 0.9 ms of GIL time, and that is likely most of the
+  gap.
+- Open: fewer host ops (one group per chunk, or a captured graph), and a
+  memory-model term for the gather transient (chunk x 16,384 floats, about
+  0.5 GB with its temporaries at chunk 4096).
+
 ### GIL and process start
 
 - **Correction (2026-09-26):** hold time understates the GIL's cost. With
@@ -2006,6 +2083,9 @@ whole rows.
   `drop_subject` when a value is missing; the error names `'impute'`.
 - Grouped JAGWAS drops the union of rows across groups, as outlier masking did
   before.
+- `'exact'` on a whole-row selection reads calls at the samples' file
+  positions (`CompleteCasePlan.at_positions`); on BED it keeps the gathered
+  layout, since the plan gathers calls by sample.
 
 ## 3. Tuning during the run
 

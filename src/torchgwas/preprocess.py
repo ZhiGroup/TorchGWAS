@@ -144,6 +144,37 @@ class PhenotypeColumnView:
         return np.asarray(self.values[:,self.columns],dtype=dtype)
 
 
+class PhenotypeRowView:
+    """Row selection without materializing the kept rows of a whole phenotype panel.
+
+    missing_phenotype='drop_subject' on a memory-mapped panel: each block a
+    consumer asks for (`view[rows, columns]`) reads only the kept rows of
+    those columns, so a voxel-scale panel is never copied whole.
+    """
+    def __init__(self,values,rows):
+        self.values=values
+        self.rows=np.asarray(rows,dtype=np.int64)
+        self.shape=(len(self.rows),values.shape[1])
+        self.ndim=2
+        self.dtype=values.dtype
+
+    def __getitem__(self,key):
+        if not isinstance(key,tuple):
+            # A row selection stays lazy (PhenotypeColumnView indexes rows first).
+            return PhenotypeRowView(self.values,self.rows[key])
+        rows,columns=key
+        if rows is Ellipsis:
+            rows=slice(None)
+        # Columns first: a slice of a memmap is a view, so only the kept rows
+        # of these columns are read.
+        return np.asarray(self.values[:,columns])[self.rows[rows]]
+
+    def __array__(self,dtype=None,copy=None):
+        if copy is False:
+            raise ValueError('Selected phenotype rows require a copy')
+        return np.asarray(self.values[self.rows],dtype=dtype)
+
+
 def prepare_inputs_for_prep(
     genotype,
     phenotype: np.ndarray,
@@ -445,8 +476,20 @@ def residualize_and_standardize(
     _prevalidated_covariate_basis=...,
     keep_on_device: bool = False,
     column_groups=None,
+    missing: str = "impute",
+    return_plan: bool = False,
 ):
     """Centre each trait, project out the covariates, and scale to unit variance.
+
+    Missing values: `missing='impute'` centres each trait on its observed
+    mean, fills the missing cells with it and projects the covariates out
+    over all samples (JAGWAS's panel). `missing='complete_case'` instead
+    residualizes each trait with missing values on [1, covariates] over its
+    own observed rows, zero-fills the rest and scales it to unit variance
+    there, for per-trait complete-case OLS (complete_case.CompleteCasePlan).
+    return_plan=True appends the scan's plan for the missing traits: that
+    CompleteCasePlan, or for 'impute' the release's rescaling
+    (complete_case.ImputedPlan); None for a complete panel.
 
     `column_groups` (disjoint index arrays) residualises each group by its own
     call, exactly as a run of that group alone would; columns in no group are
@@ -484,9 +527,13 @@ def residualize_and_standardize(
     caller's own array, dropping the peak to the phenotype itself; it mutates
     the argument, so it is opt-in and the default remains the safe copy.
     """
+    if missing not in ("impute", "complete_case"):
+        raise ValueError("missing must be 'impute' or 'complete_case'")
     if column_groups is not None:
         if inplace:
             raise ValueError("column_groups cannot be combined with inplace=True")
+        if missing != "impute" or return_plan:
+            raise ValueError("column_groups (JAGWAS groups) use the imputed panel")
         groups = [np.asarray(columns, dtype=np.int64).reshape(-1) for columns in column_groups]
         uncovered = np.setdiff1d(np.arange(phenotype.shape[1]),
                                  np.concatenate(groups) if groups else np.empty(0, np.int64))
@@ -544,7 +591,9 @@ def residualize_and_standardize(
             processed = (_residualize_on_device(phenotype, q_matrix, device, keep_on_device=True) if keep_on_device
                          else _residualize_on_device(phenotype, q_matrix, device))
             result = (processed, q_matrix)
-            return (*result, phenotype_observed_counts) if return_observed_counts else result
+            if return_observed_counts:
+                result = (*result, phenotype_observed_counts)
+            return (*result, None) if return_plan else result
         except (RuntimeError, ImportError):
             # Out of memory, a driver problem, or no torch: the host path below
             # produces the same answer, so this is a slowdown and not a failure.
@@ -573,6 +622,16 @@ def residualize_and_standardize(
             f"{phenotype.dtype} would become {resolved}; pass "
             f"out_dtype={phenotype.dtype} to keep it, or inplace=False")
 
+    plan = None
+    if missing == "complete_case" and has_missing:
+        from .complete_case import CompleteCasePlan
+        # Before the loop: with inplace=True it overwrites the raw values.
+        observed = np.ones(phenotype.shape, dtype=bool)
+        for start in range(0, phenotype.shape[1], max(1, int(trait_block))):
+            stop = min(start + max(1, int(trait_block)), phenotype.shape[1])
+            observed[:, start:stop] = ~np.isnan(np.asarray(phenotype[:, start:stop], dtype=np.float64))
+        plan = CompleteCasePlan(observed, q_matrix)
+        raw_missing = {int(trait): np.array(phenotype[:, trait], dtype=np.float64) for trait in plan.traits}
     out = phenotype if inplace else np.empty(phenotype.shape, dtype=resolved)
     step = max(1, int(trait_block))
     for start in range(0, phenotype.shape[1], step):
@@ -596,8 +655,17 @@ def residualize_and_standardize(
         std[std == 0] = 1.0
         work /= std
         out[:, start:stop] = work
+    if plan is not None:
+        for trait, values in raw_missing.items():
+            out[:, trait] = plan.residualize(values, trait).astype(out.dtype, copy=False)
+    if return_plan and plan is None and missing == "impute" and has_missing:
+        from .complete_case import ImputedPlan
+        plan = ImputedPlan(phenotype_observed_counts, 0 if q_matrix is None else q_matrix.shape[1],
+                           phenotype.shape[0])
     result = (out, q_matrix)
-    return (*result, phenotype_observed_counts) if return_observed_counts else result
+    if return_observed_counts:
+        result = (*result, phenotype_observed_counts)
+    return (*result, plan) if return_plan else result
 
 
 def standardize_genotype(genotype_chunk: np.ndarray) -> np.ndarray:

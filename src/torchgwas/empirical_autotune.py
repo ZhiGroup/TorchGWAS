@@ -574,7 +574,7 @@ def _device_chunk_seconds(device, mode, n_samples, width, chunk, repeats, path='
             reduction = MinPReduction()
 
             def step(beta, t, status, variant_df):
-                reduction.reduce(beta, t, status, variant_df, 1, log10_p=(None, None, torch.float32))
+                reduction.reduce(beta, t, status, variant_df, 1, log10_p=(None, torch.float32))
         elif mode == 'significant':
             from .reduce import SignificantPairs, device_significance_critical, device_significant_pairs
             critical = device_significance_critical(SignificantPairs(), n_samples, width, device)

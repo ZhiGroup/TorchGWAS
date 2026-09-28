@@ -103,10 +103,16 @@ def write_trait_tiled_sumstats(directory, *, n_variants, trait_names, n_samples,
                     if stop.is_set():
                         raise RuntimeError('trait tile cancelled after peer failure')
                     # (start, end, beta, t, p, -log10 P, df); without -log10
-                    # P (six long) the writer computes it.
+                    # P (six long) the writer computes it. With per-trait df
+                    # (missing phenotypes) no df is read: (start, end, beta,
+                    # t, p, -log10 P).
                     if len(chunk) not in (6,7):
                         raise ValueError('Full trait tiles require scan df metadata')
-                    start,end,beta,t_stat=chunk[:4];variant_df=chunk[-1];logp=chunk[5] if len(chunk)==7 else None
+                    start,end,beta,t_stat=chunk[:4]
+                    if trait_df is not None:
+                        variant_df,logp=None,chunk[5]
+                    else:
+                        variant_df=chunk[-1];logp=chunk[5] if len(chunk)==7 else None
                     writer.write_chunk(start,end,beta,t_stat,logp,variant_df=variant_df if trait_df is None else None)
                 summary=writer.close()
                 completed.append(dict(trait_range=[offset,offset+width],directory=relative,
@@ -143,7 +149,7 @@ def write_trait_tiled_sumstats(directory, *, n_variants, trait_names, n_samples,
         **(dict(df=dict(layout='per_tile'),
                 p_value='not stored; two-sided Student t using the matching tile df sidecar')
            if trait_df is None else
-           dict(df=trait_df,p_value='not stored; two-sided Student t on t_stat with per-trait df')),
+           dict(df=trait_df,p_value='neg_log10_p is exact at each pair\'s complete-case df; df lists each trait\'s observed samples less rank and genotype, which missing calls lower further')),
         excluded_convention='NaN marks an excluded variant in stored beta/t arrays',
         genotype_passes=len(tiles),reader_workers=reader_workers,
         scope='Each tile is a sequential variant-major store. No full-matrix assembly.',

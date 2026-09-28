@@ -68,7 +68,7 @@ class ExactLinearStatisticsTestCase(unittest.TestCase):
         self.assertEqual(beta.shape, t_stat.shape)
 
     def test_missing_phenotypes_match_mean_imputed_ols_with_trait_df(self):
-        """Phenotype NaNs use the same mean-impute/df rule as genotype NaNs."""
+        """missing_phenotype='impute' (the default here): the release's mean-impute/df rule."""
         rng = np.random.default_rng(20260917)
         n_samples, n_markers, n_traits = 101, 9, 3
         genotype = rng.integers(0, 3, size=(n_samples, n_markers)).astype(np.float64)
@@ -89,6 +89,39 @@ class ExactLinearStatisticsTestCase(unittest.TestCase):
             for marker in range(n_markers):
                 design = np.column_stack(
                     (np.ones(n_samples), covariates, genotype[:, marker]))
+                coefficients, *_ = np.linalg.lstsq(design, y, rcond=None)
+                residual = y - design @ coefficients
+                df = int(observed.sum()) - np.linalg.matrix_rank(design)
+                gram = np.linalg.inv(design.T @ design)
+                se = np.sqrt(float(residual @ residual) / df * gram[-1, -1])
+                expected[marker, trait] = coefficients[-1] / se
+        np.testing.assert_allclose(observed_t, expected, rtol=1e-11, atol=1e-11)
+
+    def test_missing_phenotypes_match_complete_case_ols(self):
+        """Each trait is tested on its own observed samples (complete_case.py).
+
+        Until 2026-09-27 phenotype NaNs followed genotype NaNs: mean-imputed y,
+        observed df. That t is about sqrt(observed / n) of the complete-case t.
+        """
+        rng = np.random.default_rng(20260917)
+        n_samples, n_markers, n_traits = 101, 9, 3
+        genotype = rng.integers(0, 3, size=(n_samples, n_markers)).astype(np.float64)
+        genotype[:3] = np.arange(3)[:, None]
+        covariates = rng.normal(size=(n_samples, 2))
+        phenotype = rng.normal(size=(n_samples, n_traits))
+        phenotype[rng.random(size=phenotype.shape) < 0.11] = np.nan
+
+        _beta, observed_t, _p, _q = linear_scan(
+            genotype, phenotype, covariates,
+            chunk_size=4, device="cpu", compute_dtype="float64", missing_phenotype="exact")
+
+        expected = np.empty_like(observed_t)
+        for trait in range(n_traits):
+            observed = np.isfinite(phenotype[:, trait])
+            y = phenotype[observed, trait]
+            for marker in range(n_markers):
+                design = np.column_stack(
+                    (np.ones(observed.sum()), covariates[observed], genotype[observed, marker]))
                 coefficients, *_ = np.linalg.lstsq(design, y, rcond=None)
                 residual = y - design @ coefficients
                 df = int(observed.sum()) - np.linalg.matrix_rank(design)

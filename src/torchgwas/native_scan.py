@@ -57,11 +57,14 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                          reduction=None, reader_worker_limit=None,
                          borrow_results=False, return_df=False, significance=None, significance_n_traits=None,
                          chunk_size_selector=None, chunk_observer=None, return_beta=True,
-                         shared_loader=None, log10_p=None):
+                         shared_loader=None, log10_p=None, complete_case=None):
     """shared_loader: a SharedDecodeHub subscriber used instead of this scan's
-    own PinnedDosageLoader, so several tile scans share one decode pass."""
-    from .linear import (_device_log10_p, _dosage_statistics, _log10_p_dtype, _log10_p_tensors,
-                         _two_sided_t_pvalue)
+    own PinnedDosageLoader, so several tile scans share one decode pass.
+
+    complete_case (complete_case.CompleteCasePlan, missing phenotypes): traits
+    with missing values get complete-case OLS on the device; unreduced chunks
+    stage the (chunk, K) pair df, which is their df."""
+    from .linear import _device_log10_p, _dosage_statistics, _log10_p_dtype, _two_sided_t_pvalue
     logp_dtype = _log10_p_dtype(log10_p)
 
     if type(return_beta) is not bool or (not return_beta and reduction is not None):
@@ -152,6 +155,8 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
             unselected = torch.as_tensor(source.native_unselected_samples, dtype=torch.long, device=device)
             unselected_value = source.native_missing_value
     rows = n if physical is None else int(physical)
+    if physical is not None and complete_case is not None and getattr(complete_case, 'needs_calls', True):
+        complete_case = complete_case.at_positions(source.native_sample_positions)
     timings['physical_samples'] = rows
     design = (torch.empty if positions is None else torch.zeros)(
         (rows, traits + covariates.shape[1]), dtype=torch.float32, device=device)
@@ -238,6 +243,8 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     # pinned memory per buffer per slot, which is where a high-trait scan dies
     # before it ever reaches the writer.
     reduction_width = None if reduction is None else reduction.resolved_width(traits)
+    # The complete-case pair df crosses to the host only when read there.
+    stage_pair_df = complete_case is not None and (return_df or (compute_p_values and log10_p is None))
     if significance is not None:
         make_result = None
     elif reduction is None:
@@ -248,7 +255,9 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                     # One residual df per variant, not per test.
                     torch.empty(rows, pin_memory=True),
                     # float32 -log10 P, computed on the device (log10_p).
-                    *((torch.empty((rows, traits), dtype=logp_dtype, pin_memory=True),) if log10_p is not None else ()))
+                    *((torch.empty((rows, traits), dtype=logp_dtype, pin_memory=True),) if log10_p is not None else ()),
+                    # Complete-case pair df (missing phenotypes).
+                    *((torch.empty((rows, traits), pin_memory=True),) if stage_pair_df else ()))
     else:
         def make_result(rows):
             if log10_p is None:
@@ -259,7 +268,6 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     # depth 32 pins 537 MB per GPU at chunk 4096.
     result_buffers = [] if make_result is None else [None] * depth
     result_rows = [0] * depth
-    logp_scale_t, logp_factor_t = _log10_p_tensors(log10_p, device)
 
     def result_slot(slot, rows):
         """This slot's pinned results. Its previous chunk was resolved before this iteration, so they are free."""
@@ -343,9 +351,11 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         else:
             staged = [None if value is None else value[:count].numpy().copy() for value in result_buffers[slot]]
         logp = None
+        pair_df = None
         if reduction is None:
-            beta, t, status, variant_df = staged[:4]
-            logp = staged[4] if log10_p is not None else None
+            beta, t, status, variant_df, *extra = staged
+            logp = extra.pop(0) if log10_p is not None else None
+            pair_df = extra.pop(0) if stage_pair_df else None
             trait_index = None
         else:
             beta, t, trait_index, status, variant_df, *kept_pairs = staged
@@ -359,9 +369,11 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         if beta is not None:beta[invalid] = np.nan
         t[invalid] = np.nan
         if logp is not None:logp[invalid] = np.nan
-        # df is per variant either way; a reduced chunk broadcasts it across the
-        # k traits it kept, so the p-values match the unreduced scan exactly.
-        df_for_p = variant_df[:, None] if reduction is not None else variant_df
+        # df is per variant, or per pair for complete-case traits; a reduced
+        # chunk broadcasts it across the k traits it kept, so the p-values
+        # match the unreduced scan exactly.
+        df_for_p = (variant_df[:, None] if reduction is not None
+                    else variant_df if pair_df is None else pair_df)
         if logp is not None:
             from .linear import _p_from_log10
             p = _p_from_log10(logp) if compute_p_values else None
@@ -373,7 +385,7 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         emitted = ((start, end, beta, t, p, *((logp,) if logp is not None else ())) if reduction is None
                    else (start, end, beta, t, p, trait_index, *((logp, pair_df) if logp is not None else ())))
         if return_df:
-            emitted = (*emitted, variant_df[:, None])
+            emitted = (*emitted, variant_df[:, None] if pair_df is None or reduction is not None else pair_df)
         return emitted, int((status == 1).sum()), int((status == 2).sum()), gpu_times
 
     def resolve(future):
@@ -508,11 +520,20 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                     present, df_offset,
                     getattr(source, 'validate_native_range', False))
                 variant_df = present.to(torch.float32) + df_offset
+                pair_df = None
+                if complete_case is not None:
+                    from .complete_case import call_mask
+                    pair_df = complete_case.correct(
+                        centered, centered_ss, products[:, traits:], products[:, :traits], phenotype_ss,
+                        variant_df, beta, t,
+                        calls_observed=call_mask(genotype_t, missing_value=missing,
+                                                 encoding='pgen_2bit' if native_encoding == 'pgen_2bit' else None))
             else:
-                beta, t, status, variant_df = _dosage_statistics(
+                beta, t, status, variant_df, *extra = _dosage_statistics(
                     genotype_t, design, phenotype_ss, traits, df,
                     getattr(source, "validate_native_range", False),
-                    covariate_rank=rank)
+                    covariate_rank=rank, complete_case=complete_case)
+                pair_df = extra[0] if extra else None
             if significance is not None:
                 # Release the input lease after its own H2D event, independently
                 # of how long selection and the downstream writer take.
@@ -532,12 +553,14 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                 # wide (chunk x K) tensors are freed here rather than travelling.
                 staged_values = reduction.reduce(
                     beta, t, status, variant_df, reduction_width,
-                    **({} if log10_p is None else dict(log10_p=(logp_scale_t, logp_factor_t, logp_dtype))))
-                del beta, t
+                    **({} if log10_p is None else dict(log10_p=(pair_df, logp_dtype))))
+                del beta, t, pair_df
             else:
                 staged_values = (beta if return_beta else None, t, status, variant_df)
                 if log10_p is not None:
-                    staged_values += (_device_log10_p(t, variant_df, logp_scale_t, logp_factor_t, logp_dtype),)
+                    staged_values += (_device_log10_p(t, variant_df if pair_df is None else pair_df, logp_dtype),)
+                if stage_pair_df:
+                    staged_values += (pair_df,)
             timings['result_payload_bytes'] += sum(value.numel()*value.element_size() for value in staged_values if value is not None)
             compute_done[slot].record(compute_stream)
             with torch.cuda.stream(result_stream):
