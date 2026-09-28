@@ -378,7 +378,9 @@ def _form_costs(device, blocks, whole, starts):
         host, gpu = [], None
         for shape in _FORM_PROBES:
             t = torch.full(shape, 3.0, dtype=torch.float64, device=device)
-            df = torch.full(shape, 22_238.0, dtype=torch.float64, device=device)
+            # Any df: the tail runs a fixed number of iterations, so its cost
+            # does not depend on it.
+            df = torch.full(shape, 1000.0, dtype=torch.float64, device=device)
             _evaluate(stages, t, df, starts)
             torch.cuda.synchronize(device)
             issued, elapsed = [], []

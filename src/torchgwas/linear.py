@@ -454,6 +454,14 @@ def _packed_bed_cuda_iterator(
             for _ in range(result_depth)
         ]
     )
+    # A per-variant reduction with -log10 P (min-p) also stages its kept
+    # pairs' df (MinPReduction.reduce).
+    kept_df_host = (
+        None if reduction is None or log10_p is None else [
+            torch.empty((chunk_size, staged_traits), dtype=torch.float32, pin_memory=True)
+            for _ in range(result_depth)
+        ]
+    )
     logp_scale_t, logp_factor_t = _log10_p_tensors(log10_p, torch_device)
     result_done = [torch.cuda.Event(enable_timing=profiling)
                    for _ in range(result_depth)]
@@ -585,6 +593,11 @@ def _packed_bed_cuda_iterator(
                           _two_sided_t_pvalue(t_chunk, df=df_chunk) if compute_p_values else None)
             return (*result, df_chunk[:, None]) if return_df else result
         index_chunk = index_host[result_slot][:count].numpy().copy()
+        if kept_df_host is not None:
+            # min-p: the kept pairs' -log10 P and df, from the device.
+            kept_df = kept_df_host[result_slot][:count].numpy().copy()
+            p_chunk = _p_from_log10(logp_chunk) if compute_p_values else None
+            return start, end, beta_chunk, t_chunk, p_chunk, index_chunk, logp_chunk, kept_df
         # df is per variant; broadcast it across the k traits kept so the
         # reduced p-values equal the unreduced ones exactly.
         p_chunk = (_two_sided_t_pvalue(t_chunk, df=df_chunk[:, None])
@@ -657,11 +670,16 @@ def _packed_bed_cuda_iterator(
                 # On the compute stream and before compute_done, so the copy
                 # stream waits on the narrow result and the wide tensors are
                 # released here instead of crossing the bus.
-                beta_t, t_t, index_t, status_t, df_t = reduction.reduce(
+                beta_t, t_t, index_t, status_t, df_t, *kept = reduction.reduce(
                     beta_t[:count], t_t[:count], status_t[:count], df_t[:count],
-                    reduction_width)
-            logp_t = (None if log10_p is None else
-                      _device_log10_p(t_t[:count], df_t[:count], logp_scale_t, logp_factor_t, logp_dtype))
+                    reduction_width,
+                    **({} if log10_p is None else
+                       dict(log10_p=(logp_scale_t, logp_factor_t, logp_dtype))))
+                # min-p's kept pairs: -log10 P and df (MinPReduction.reduce).
+                logp_t, kept_df_t = kept if kept else (None, None)
+            else:
+                logp_t = (None if log10_p is None else
+                          _device_log10_p(t_t[:count], df_t[:count], logp_scale_t, logp_factor_t, logp_dtype))
             if profiling:
                 compute_end[result_slot].record(compute_stream)
             compute_done[device_slot].record(compute_stream)
@@ -680,6 +698,8 @@ def _packed_bed_cuda_iterator(
                     staged = ((beta_host, beta_t), (t_host, t_t),
                               (index_host, index_t), (status_host, status_t),
                               (df_host, df_t))
+                    if kept_df_host is not None:
+                        staged += ((logp_host, logp_t), (kept_df_host, kept_df_t))
                 for ring, value in staged:
                     ring[result_slot][:count].copy_(
                         value if reduction is not None else value[:count],
