@@ -870,9 +870,11 @@ def run_linear_gwas(
             if mode == 'jagwas' and jagwas_groups is not None:
                 from .jagwas_projection import JagwasGroups
                 group_sizes = [len(columns) for columns in JagwasGroups(jagwas_groups).columns]
+            from .empirical_autotune import scan_statistics_path
             gpu_per_variant = gpu_seconds_per_variant(devices[0], mode=mode, n_samples=int(genotype.shape[0]),
                                                       n_traits=int(np.shape(phenotype)[1]),
-                                                      group_sizes=group_sizes)
+                                                      group_sizes=group_sizes,
+                                                      path=scan_statistics_path(genotype))
             if len(devices) > 1:
                 setup = (float(options['shard_setup_seconds']) if options.get('shard_setup_seconds') is not None
                          else shard_setup_seconds(devices[1]))  # a GPU the job uses (at least two are kept)
