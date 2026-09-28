@@ -64,7 +64,8 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     complete_case (complete_case.CompleteCasePlan, missing phenotypes): traits
     with missing values get complete-case OLS on the device; unreduced chunks
     stage the (chunk, K) pair df, which is their df."""
-    from .linear import _device_log10_p, _dosage_statistics, _log10_p_dtype, _two_sided_t_pvalue
+    from .linear import (_device_log10_p, _dosage_statistics, _log10_p_dtype, _two_sided_t_pvalue,
+                         _unpack_pgen_2bit_float)
     logp_dtype = _log10_p_dtype(log10_p)
 
     if type(return_beta) is not bool or (not return_beta and reduction is not None):
@@ -82,16 +83,25 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     profiling = os.environ.get('TORCHGWAS_SCAN_PROFILE', '0') != '0'
     timed_gpu = profiling or measure_cuda
     blocking_events = os.environ.get('TORCHGWAS_BLOCKING_EVENTS', '0') != '0'
-    from .scan_gpu import resolve_statistics_backend
-    statistics_backend = resolve_statistics_backend()
-    native_statistics = statistics_backend == 'native_fused'
+    from .scan_gpu import fused_module, resolve_statistics_backend
+    statistics_backend = resolve_statistics_backend(device)
+    # The CUDA kernels or their Triton port: the same prepare/finish contract.
+    fused = fused_module(statistics_backend)
+    native_statistics = fused is not None
     native_encoding = getattr(source, 'native_encoding', 'dosage')
     if native_encoding not in ('dosage', 'pgen_2bit'):
         raise ValueError(f"unsupported native transfer encoding: {native_encoding}")
-    if native_encoding == 'pgen_2bit' and not native_statistics:
-        raise ValueError("packed PGEN transfer requires TORCHGWAS_NATIVE_STATS=1")
+    # Packed rows on a device without fused statistics (Triton failed there):
+    # unpacked by Torch ops, then the Torch statistics.
+    unpack_packed = native_encoding == 'pgen_2bit' and not native_statistics
     if native_statistics:
-        from .scan_gpu import prepare as native_prepare, finish as native_finish
+        native_prepare, native_finish = fused.prepare, fused.finish
+    # min-p on a complete panel ranks by |t| inside the Triton finish, so the
+    # chunk's (variants x traits) beta and t are never written.
+    fused_min_p = (getattr(fused, 'finish_min_p', None) if log10_p is not None and complete_case is None
+                   and getattr(reduction, 'mode', None) == 'min-p' and hasattr(reduction, 'from_winners')
+                   and reduction.resolved_width(phenotype.shape[1]) == 1
+                   else None)
     setup_started = time.perf_counter() if profiling else 0
     timings = dict(enabled=profiling, blocking_completion_events=blocking_events, setup_seconds=0.0, fetch_seconds=0.0,
                    result_wait_seconds=0.0, copy_wait_seconds=0.0,
@@ -102,6 +112,7 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     timings['return_beta'] = return_beta
     timings['result_payload_bytes'] = 0
     timings['conversion_fused_into_statistics'] = native_statistics
+    timings['packed_unpacked_by_torch'] = unpack_packed
     source._last_scan_profile = timings
 
     device = torch.device(device)
@@ -493,7 +504,9 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                     genotype_t.bitwise_or_(packed_missing)
                 elif unselected is not None:
                     genotype_t.index_fill_(1, unselected, unselected_value)
-                if not native_statistics and transfer_dtype == torch.int8:
+                if unpack_packed:
+                    genotype_t = _unpack_pgen_2bit_float(genotype_t, rows)
+                elif not native_statistics and transfer_dtype == torch.int8:
                     genotype_t = torch.where(genotype_t == -9, torch.nan,
                                              genotype_t.to(torch.float32))
                 elif not native_statistics and transfer_dtype == torch.uint8:
@@ -515,11 +528,16 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                 else:
                     centered, centered_ss, minimum, maximum, present = native_prepare(genotype_t, scale, missing)
                 products = centered @ design
-                beta, t, status = native_finish(
-                    products, centered_ss, minimum, maximum, phenotype_ss,
-                    present, df_offset,
-                    getattr(source, 'validate_native_range', False))
                 variant_df = present.to(torch.float32) + df_offset
+                if fused_min_p is not None:
+                    winners = fused_min_p(products, centered_ss, minimum, maximum, phenotype_ss, present,
+                                          df_offset, getattr(source, 'validate_native_range', False))
+                    beta = t = status = None
+                else:
+                    beta, t, status = native_finish(
+                        products, centered_ss, minimum, maximum, phenotype_ss,
+                        present, df_offset,
+                        getattr(source, 'validate_native_range', False))
                 pair_df = None
                 if complete_case is not None:
                     from .complete_case import call_mask
@@ -551,9 +569,13 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                 # Reduce on the compute stream, before compute_done is recorded,
                 # so the narrow result is what the copy stream waits for and the
                 # wide (chunk x K) tensors are freed here rather than travelling.
-                staged_values = reduction.reduce(
-                    beta, t, status, variant_df, reduction_width,
-                    **({} if log10_p is None else dict(log10_p=(pair_df, logp_dtype))))
+                if fused_min_p is not None:
+                    staged_values = reduction.from_winners(*winners, variant_df, logp_dtype)
+                    del winners
+                else:
+                    staged_values = reduction.reduce(
+                        beta, t, status, variant_df, reduction_width,
+                        **({} if log10_p is None else dict(log10_p=(pair_df, logp_dtype))))
                 del beta, t, pair_df
             else:
                 staged_values = (beta if return_beta else None, t, status, variant_df)

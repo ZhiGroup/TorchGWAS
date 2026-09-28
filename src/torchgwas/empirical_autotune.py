@@ -468,9 +468,11 @@ def scan_statistics_path(genotype):
         return 'bed'
     if not getattr(genotype, 'supports_fused_qc', False):
         return 'generic'
-    if resolve_statistics_backend() != 'native_fused':
+    backend = resolve_statistics_backend()
+    if backend == 'torch':
         return 'torch'
-    return 'native-pgen2' if getattr(genotype, 'native_encoding', None) == 'pgen_2bit' else 'native-dosage'
+    prefix = 'native' if backend == 'native_fused' else 'triton'
+    return prefix + ('-pgen2' if getattr(genotype, 'native_encoding', None) == 'pgen_2bit' else '-dosage')
 
 
 def scan_device_seconds_per_variant(device, *, mode, n_samples, n_traits, repeats=3, path='torch'):
@@ -502,6 +504,10 @@ def scan_device_seconds_per_variant(device, *, mode, n_samples, n_traits, repeat
         from . import scan_gpu
         if not scan_gpu.available(device):
             return None
+    if path.startswith('triton'):
+        from . import triton_scan
+        if not triton_scan.available(device):
+            return None
     chunk = int(max(64, min(1024, (1 << 27) // max(1, int(n_samples)))))
     widths = sorted({min(int(n_traits), 256), min(int(n_traits), 2048)})
     timed = {width: _device_chunk_seconds(device, mode, int(n_samples), width, chunk, repeats, path)
@@ -521,7 +527,7 @@ def _statistics_for_path(path, device, n_samples, width, chunk, generator):
     phenotype_ss = torch.ones(width, device=device)
     df = n_samples - 3
     packed_width = (n_samples + 3) // 4
-    if path in ('bed', 'native-pgen2'):
+    if path in ('bed', 'native-pgen2', 'triton-pgen2'):
         # Two-bit calls; any byte is valid (a missing code is one of the four).
         packed = torch.randint(0, 256, (chunk, packed_width), generator=generator, device=device,
                                dtype=torch.int32).to(torch.uint8)
@@ -531,15 +537,18 @@ def _statistics_for_path(path, device, n_samples, width, chunk, generator):
         from .linear import _select_packed_bed_statistics
         kernel = _select_packed_bed_statistics(None, None)
         return lambda: kernel(packed, design, phenotype_ss, n_samples, width, df, None, None)
-    if path.startswith('native'):
-        from . import scan_gpu
+    if path.startswith('native') or path.startswith('triton'):
+        if path.startswith('native'):
+            from . import scan_gpu as module
+        else:
+            from . import triton_scan as module
 
         def native():
-            if path == 'native-pgen2':
-                centered, ss, low, high, present = scan_gpu.prepare(packed, encoding='pgen_2bit', n_samples=n_samples)
+            if path.endswith('-pgen2'):
+                centered, ss, low, high, present = module.prepare(packed, encoding='pgen_2bit', n_samples=n_samples)
             else:
-                centered, ss, low, high, present = scan_gpu.prepare(codes, 1.0, None)
-            beta, t, status = scan_gpu.finish(centered @ design, ss, low, high, phenotype_ss, present, -3.0)
+                centered, ss, low, high, present = module.prepare(codes, 1.0, None)
+            beta, t, status = module.finish(centered @ design, ss, low, high, phenotype_ss, present, -3.0)
             return beta, t, status, present.to(torch.float32) - 3.0
         return native
     if path == 'generic':

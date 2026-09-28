@@ -87,6 +87,18 @@ class MinPReduction(VariantReduction):
         return (beta.gather(1, index), t.gather(1, index), index.to(torch.int32), status, variant_df,
                 scores.gather(1, index).to(dtype), pair_df.gather(1, index).float())
 
+    def from_winners(self, beta, t, index, status, variant_df, dtype):
+        """reduce(..., log10_p=(None, dtype)) from a complete panel's winners, already ranked.
+
+        The Triton finish (triton_scan.finish_min_p) keeps each variant's
+        largest |t| with VariantReduction's rules; this adds the winners'
+        -log10 P at the variant df, so the result is reduce()'s tuple.
+        """
+        from .tails import neg_log10_p_device
+        pair_df = variant_df.reshape(-1, 1).expand(t.shape)
+        logp = neg_log10_p_device(t, pair_df, out=torch.empty(t.shape, dtype=dtype, device=t.device))
+        return (beta, t, index, status, variant_df, logp, pair_df.float().contiguous())
+
     def merge(self, running, incoming, trait_offset: int):
         """Combine two trait blocks' winners, ranking by their -log10 P.
 
