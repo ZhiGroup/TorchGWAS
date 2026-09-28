@@ -78,9 +78,15 @@ def write_variant_sharded_sumstats(directory, *, n_variants, trait_names, n_samp
             for chunk in iterator:
                 if stop.is_set():raise RuntimeError('variant shard cancelled after peer failure')
                 # (start, end, beta, t, p, -log10 P, df); without -log10 P
-                # (six long) the writer computes it.
+                # (six long) the writer computes it. With per-trait df
+                # (missing phenotypes) no df is read: (start, end, beta, t,
+                # p, -log10 P), the pairs' df staying on the device.
                 if len(chunk) not in (6,7):raise ValueError('Full variant shards require scan df metadata')
-                first,last,beta,t_stat=chunk[:4];variant_df=chunk[-1];logp=chunk[5] if len(chunk)==7 else None
+                first,last,beta,t_stat=chunk[:4]
+                if trait_df is not None:
+                    variant_df,logp=None,chunk[5]
+                else:
+                    variant_df=chunk[-1];logp=chunk[5] if len(chunk)==7 else None
                 writer.write_chunk(first,last,beta,t_stat,logp,variant_df=variant_df if trait_df is None else None)
             summary=writer.close()
             return dict(variant_range=[start,end],directory=relative,device=device,
@@ -112,7 +118,7 @@ def write_variant_sharded_sumstats(directory, *, n_variants, trait_names, n_samp
         **(dict(df=dict(layout='per_shard',axis='variant'),
                 p_value='not stored; two-sided Student t using the matching variant df sidecar')
            if trait_df is None else
-           dict(df=trait_df,p_value='not stored; two-sided Student t on t_stat with per-trait df')),
+           dict(df=trait_df,p_value='neg_log10_p is exact at each pair\'s complete-case df; df lists each trait\'s observed samples less rank and genotype, which missing calls lower further')),
         excluded_convention='NaN marks an excluded variant in stored beta/t arrays',
         genotype_passes=1,reader_workers=reader_workers,
         scope='Disjoint variant ranges, whole phenotype panel per device. No full-matrix gather or cross-device result queue.',

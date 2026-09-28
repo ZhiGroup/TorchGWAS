@@ -60,8 +60,8 @@ def read_pairs(directory):
 
 @pytest.mark.parametrize('device',['cpu','cuda:1'])
 @pytest.mark.parametrize('block',[None,4])
-@pytest.mark.parametrize('missing_pheno',[False,True])
-def test_api_selected_pairs_match_full_pgen_statistics_with_missing_calls(tmp_path,monkeypatch,device,block,missing_pheno):
+@pytest.mark.parametrize('missing_pheno,convention',[(False,'impute'),(True,'impute'),(True,'exact')])
+def test_api_selected_pairs_match_full_pgen_statistics_with_missing_calls(tmp_path,monkeypatch,device,block,missing_pheno,convention):
     if device!='cpu' and torch.cuda.device_count()<2:pytest.skip('second CUDA device required')
     rng=np.random.default_rng(813);n,m,k=97,19,11
     calls=rng.integers(0,3,size=(m,n),dtype=np.uint8)
@@ -74,14 +74,17 @@ def test_api_selected_pairs_match_full_pgen_statistics_with_missing_calls(tmp_pa
     y=rng.normal(size=(n,k)).astype(np.float32);cov=rng.normal(size=(n,2)).astype(np.float32)
     if missing_pheno:y[:5,0]=np.nan;y[:9,2]=np.nan
     for key,value in [('TORCHGWAS_PGEN_BACKEND','native'),('TORCHGWAS_PGEN_PACKED','0'),('TORCHGWAS_NATIVE_STATS','0')]:monkeypatch.setenv(key,value)
-    # The release's missing-phenotype convention (pair df), which the reference below recomputes.
-    options=dict(genotype_format='pgen',pgen_mode='hardcall',device=device,compute_dtype='float32',chunk_size=4,missing_phenotype='impute',
+    # A convention that keeps the samples (pair df), which the reference below recomputes.
+    options=dict(genotype_format='pgen',pgen_mode='hardcall',device=device,compute_dtype='float32',chunk_size=4,missing_phenotype=convention,
         reader_workers=2,prefetch_chunks=2,variant_range=(1,18),sumstats_queue_depth=1)
     run_linear_gwas(path,y,cov,output_dir=tmp_path/'full',**options)
     beta,t,_logp,_=open_binary_sumstats(tmp_path/'full/sumstats');df=np.broadcast_to(open_binary_df(tmp_path/'full/sumstats'),t.shape)
-    if missing_pheno:
-        # Dense legacy stores only trait df for this case. Verify the selected
-        # producer's combined df independently from observed counts instead.
+    if missing_pheno and convention=='exact':
+        # Dense stores keep only each trait's df here. The selected pairs carry
+        # their own complete-case df: call and phenotype observed, less 4.
+        df=((calls[1:18]!=3).astype(np.int64)@np.isfinite(y).astype(np.int64)-4).astype(np.float64)
+    elif missing_pheno:
+        # The release's pair df: the variant's df times trait_df / df.
         df=(np.count_nonzero(calls[1:18]!=3,axis=1)[:,None]-4)*(np.isfinite(y).sum(0)[None,:]-4)/float(n-4)
     keep=np.nonzero(np.isfinite(t)&(2*special.stdtr(df,-np.abs(t))<=.2))
     expected=[keep[0],keep[1],beta[keep],t[keep],df[keep]]
@@ -94,7 +97,8 @@ def test_api_selected_pairs_match_full_pgen_statistics_with_missing_calls(tmp_pa
         if backend=='host' or device=='cpu':assert selector.call_count==0
         actual=read_pairs(tmp_path/backend/'sumstats')
         for index,(got,want) in enumerate(zip(actual,expected)):
-            if index==4 and missing_pheno:np.testing.assert_allclose(got,want,rtol=1e-14,atol=0)
+            # The pair df is staged as float32: exact for 'exact' (integers), 6e-8 for 'impute'.
+            if index==4 and missing_pheno:np.testing.assert_allclose(got,want,rtol=1e-14 if convention=='exact' else 1e-7,atol=0)
             elif index in (0,1,4):np.testing.assert_array_equal(got,want)
             else:np.testing.assert_allclose(got,want,rtol=3e-5,atol=3e-6)
 

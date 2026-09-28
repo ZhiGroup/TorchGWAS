@@ -21,6 +21,25 @@ records the df the tail was taken at. That is a scalar, one value per trait
 for missing phenotypes, or a per-variant `df.f32` column for missing genotype
 calls.
 
+**Missing phenotypes** (`missing_phenotype`, run metadata):
+- `'drop_subject'` (the default since 2026-09-28): a sample with any missing
+  or outlier-masked value is left out of every trait, so the store is that of
+  a run without those samples; `dropped_subjects` counts them.
+- `'impute'` (the release): the trait's missing values take its mean; t is
+  the imputed panel's t times sqrt(trait_df / df) and `neg_log10_p` is at
+  pair df variant_df x trait_df / df. The manifest keeps each trait's df.
+- `'exact'` (opt-in): each trait is tested on its own observed samples, as
+  plink2's `--glm` does per phenotype. The intercept and covariates are
+  refitted on those samples, t, beta and `neg_log10_p` are that
+  complete-case OLS, and the df is the pair's own count less the covariate
+  rank there and the genotype. The manifest's per-trait df is the trait's
+  observed count less rank and genotype, and a missing call lowers a pair's
+  df by one more.
+- Calls missing inside a trait's samples keep the genotype convention:
+  centred at the variant's observed mean.
+- JAGWAS takes `'drop_subject'` or `'impute'`: its joint test needs one
+  sample set.
+
 ```python
 from torchgwas.sumstats import open_binary_df, open_binary_sumstats
 

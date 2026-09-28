@@ -11,12 +11,13 @@ trait of a variant shares it and the two-sided p-value is strictly
 decreasing in |t|. The winner is the largest |t| (VariantReduction's
 ranking) and the tail is computed for the winners only.
 
-**With missing phenotypes it is not.** Each trait has its own observed count,
-so a pair's df is the variant's df times trait_df / df and its t is rescaled
-by sqrt(trait_df / df), full output's convention (linear.py); p is no longer
-monotone in |t| across a variant's traits. min-p then ranks by the exact tail
-of every cell of the chunk: 3.3 ms per 8.4M cells on an H100, 0.4 ns a cell,
-against 0.9 ns of scan GEMM per cell at 22,250 samples (K = 512).
+**With missing phenotypes it is not.** Each trait is then tested on its own
+observed samples (complete-case OLS, complete_case.py), so a pair's df is its
+own sample count less rank and genotype, and p is no longer monotone in |t|
+across a variant's traits. min-p then ranks by the exact tail of every cell
+of the chunk at its pair df: 0.4-0.8 ns a cell on an H100 (the two tail forms,
+tails._choose_form), against 0.9 ns of scan GEMM per cell at 22,250 samples
+(K = 512).
 
 This is a separate module, not a change to reduce.py: that file is the device
 selector's source, and its bytes identify the recorded selector census
@@ -56,26 +57,24 @@ class MinPReduction(VariantReduction):
     def reduce(self, beta, t, status, variant_df, width: int, log10_p=None):
         """`(chunk, K)` device tensors in, `(chunk, 1)` out.
 
-        `log10_p=(trait_scale, df_factor, dtype)` appends the kept pairs'
-        exact -log10 P (at `dtype`) and float32 df: `(beta, t, index, status,
-        variant_df, logp, pair_df)`. trait_scale and df_factor are None for a
-        complete panel; for missing phenotypes they are full output's
-        per-trait adjustment, applied here to the kept t and df, and the
-        ranking is by the tail itself (module docstring).
+        `log10_p=(pair_df, dtype)` appends the kept pairs' exact -log10 P
+        (at `dtype`) and float32 df: `(beta, t, index, status, variant_df,
+        logp, pair_df)`. pair_df is None for a complete panel; for missing
+        phenotypes it is the scan's (chunk, K) complete-case df, t is already
+        each pair's complete-case t, and the ranking is by the tail itself
+        (module docstring).
         """
         if log10_p is None:
             return super().reduce(beta, t, status, variant_df, width)
         from .tails import neg_log10_p_device
-        scale, factor, dtype = log10_p
-        if scale is None:
+        pair_df, dtype = log10_p
+        if pair_df is None:
             kept = super().reduce(beta, t, status, variant_df, width)
             # The winners only: one df per variant, shared by its traits.
             pair_df = variant_df.reshape(-1, 1).expand(kept[1].shape)
             logp = neg_log10_p_device(kept[1], pair_df,
                                       out=torch.empty(kept[1].shape, dtype=dtype, device=t.device))
             return (*kept, logp, pair_df.float().contiguous())
-        t = t * scale[None, :]
-        pair_df = variant_df.double()[:, None] * factor[None, :]
         scores = neg_log10_p_device(t, pair_df, out=torch.empty(t.shape, dtype=torch.float64, device=t.device))
         # Same NaN discipline as VariantReduction.reduce: a NaN would sort
         # above every finite value, so it is replaced rather than compared.

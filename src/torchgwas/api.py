@@ -149,7 +149,12 @@ def _drop_subjects_missing_phenotypes(phenotype, covariates, genotype, sample_id
         genotype = np.asarray(genotype)[kept]
         if sample_ids is not None:
             sample_ids = np.asarray(sample_ids)[kept]
-    phenotype = np.ascontiguousarray(phenotype[kept])
+    if isinstance(phenotype, np.memmap):
+        # A mapped panel stays mapped: blocks read only the kept rows.
+        from .preprocess import PhenotypeRowView
+        phenotype = PhenotypeRowView(phenotype, kept)
+    else:
+        phenotype = np.ascontiguousarray(phenotype[kept])
     if covariates is not None:
         covariates = np.ascontiguousarray(np.asarray(covariates)[kept])
     return phenotype, covariates, genotype, sample_ids, dropped
@@ -665,7 +670,9 @@ def run_linear_gwas(
     # trait, so each statistic is exact OLS on the kept samples (the run equals
     # one on inputs with those samples removed). 'impute': the release
     # convention -- the trait mean, t times sqrt(trait_df / df), pair df
-    # variant_df x trait_df / df.
+    # variant_df x trait_df / df. 'exact' (opt-in): each trait is tested on its
+    # own observed samples, complete-case OLS at each pair's own df
+    # (complete_case.py); not for JAGWAS, which needs one sample set.
     missing_phenotype: str = "drop_subject",
 ) -> GWASResult:
     """Run associations, optionally saving bounded early productive measurements.
@@ -746,8 +753,11 @@ def run_linear_gwas(
                                   output_dir=output_dir, options=locals())
     if sumstats_format not in {"binary", "none"}:
         raise ValueError("sumstats_format must be 'binary' or 'none'; TSV output has been removed")
-    if missing_phenotype not in ("drop_subject", "impute"):
-        raise ValueError("missing_phenotype must be 'drop_subject' or 'impute'")
+    if missing_phenotype not in ("drop_subject", "impute", "exact"):
+        raise ValueError("missing_phenotype must be 'drop_subject', 'impute' or 'exact'")
+    if missing_phenotype == "exact" and reduce == "jagwas":
+        raise ValueError("JAGWAS needs one sample set: use missing_phenotype='drop_subject' "
+                         "(or 'impute'), not 'exact'")
     calibrator = None
     if initial_calibration is not None:
         from .run_calibration import RunCalibration,validate_initial_calibration
@@ -857,6 +867,8 @@ def run_linear_gwas(
     if missing_phenotype == "drop_subject":
         phenotype, covariates, genotype, sample_ids, dropped_subjects = _drop_subjects_missing_phenotypes(
             phenotype, covariates, genotype, sample_ids)
+    # What the scans do with a missing value: none remains after a drop.
+    scan_missing = "exact" if missing_phenotype == "exact" else "impute"
     if empirical is not None and not isinstance(genotype, ChunkedGenotype):
         # An in-memory genotype array runs one in-memory scan: nothing to tune.
         empirical.update(sizes=None, layout=dict(why=['in-memory genotype array: no streaming scan to tune']),
@@ -1662,8 +1674,9 @@ def run_linear_gwas(
                         None if covariates is None or covariates.shape[1]==0 else _covariate_basis(covariates))
             rank = 0 if q_matrix is None else q_matrix.shape[1]
             # A panel with missing phenotypes keeps the single-device contract:
-            # t from the mean-imputed panel with per-trait df, no variant df
-            # sidecar. Tiling or sharding must not change the p-value convention.
+            # complete-case t and -log10 P per pair (complete_case.py), each
+            # trait's df in the manifest, no variant df sidecar. Tiling or
+            # sharding must not change the p-value convention.
             partition_trait_df = (None if not qc['phenotype_missing_cells'] else
                 (np.asarray(qc['phenotype_observed_counts'], dtype=np.int64) - rank - 2).tolist())
             offset = 0 if variant_range is None else _resolve_variant_range(variant_range,genotype.shape[1])[0]
@@ -1688,10 +1701,15 @@ def run_linear_gwas(
                 tile_phenotype=np.asarray(phenotype[:,first:first+width],
                                          dtype=np.float32 if resolved_compute_dtype=='float32' else np.float64)
                 iterator,_=linear_scan_streaming_chunks(source,tile_phenotype,covariates,
+                    missing_phenotype=scan_missing,
                     chunk_size=chunk_size,device=str(tile_device),compute_dtype=resolved_compute_dtype,
                     reader_workers=workers,prefetch_chunks=prefetch_chunks,compute_p_values=False,
                     compute_log10_p=True,log10_p_dtype='float32',
-                    variant_range=variant_range if _variant_span is None else _variant_span,borrow_results=True,return_df=True,_reader_worker_limit=workers,
+                    variant_range=variant_range if _variant_span is None else _variant_span,borrow_results=True,
+                    # Missing phenotypes: the writers keep each trait's df and
+                    # read -log10 P at 5, so the pairs' df is not staged (16.6
+                    # GB of device-to-host at full scale, K = 512).
+                    return_df=partition_trait_df is None,_reader_worker_limit=workers,
                     _prevalidated_observed_counts=tile_observed_counts[first:first+width],
                     _prevalidated_covariate_basis=q_matrix,
                     _chunk_size_selector=(empirical_tuner.control if empirical_tuner is not None else
@@ -1795,6 +1813,7 @@ def run_linear_gwas(
                     genotype if source is None else source,
                     panel,
                     covariates,
+                    missing_phenotype=scan_missing,
                     chunk_size=chunk_size,
                     device=str(device or resolved_device),
                     compute_dtype=resolved_compute_dtype,
@@ -1818,7 +1837,9 @@ def run_linear_gwas(
                     variant_range=variant_range,
                     reduction=reduction,
                     borrow_results=borrow_results,
-                    return_df=full_binary_df or significance is not None,
+                    # Missing phenotypes: the store keeps each trait's df, not
+                    # the pairs' (the -log10 P it stores is at those).
+                    return_df=(full_binary_df and not qc['phenotype_missing_cells']) or significance is not None,
                     significance=significance,
                     significance_n_traits=int(phenotype.shape[1]),
                     _reader_worker_limit=workers,
@@ -1871,6 +1892,7 @@ def run_linear_gwas(
                                         transform_borrows=True)
                 chunk_iterator, q_matrix = linear_scan_multigpu(
                     genotype, phenotype, covariates, devices=variant_devices,
+                    missing_phenotype=scan_missing,
                     chunk_size=int(effective_chunk_size), compute_dtype=resolved_compute_dtype,
                     reader_workers=int(reader_workers), prefetch_chunks=prefetch_chunks,
                     compute_p_values=False, ordered=False, variant_range=variant_range,
@@ -2121,6 +2143,7 @@ def run_linear_gwas(
                 genotype,
                 phenotype,
                 covariates,
+                missing_phenotype=scan_missing,
                 chunk_size=chunk_size,
                 device=str(resolved_device),
                 compute_dtype=resolved_compute_dtype,
@@ -2162,6 +2185,7 @@ def run_linear_gwas(
             genotype,
             phenotype,
             covariates,
+            missing_phenotype=scan_missing,
             chunk_size=chunk_size,
             device=str(resolved_device),
             compute_dtype=resolved_compute_dtype,

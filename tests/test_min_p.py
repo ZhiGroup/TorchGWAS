@@ -43,11 +43,11 @@ def _inputs(tmp_path, *, missing_calls, missing_pheno, n=97, m=80, k=11, seed=51
     return path, y, covariates, calls
 
 
-def _options(device):
-    # The release's missing-phenotype convention, which _expected recomputes.
+def _options(device, missing_phenotype='impute'):
+    # A missing-phenotype convention that keeps the samples, which _expected recomputes.
     return dict(genotype_format='pgen', pgen_mode='hardcall', device=device, compute_dtype='float32',
                 chunk_size=4, reader_workers=2, prefetch_chunks=2, sumstats_queue_depth=1,
-                missing_phenotype='impute')
+                missing_phenotype=missing_phenotype)
 
 
 def _expected(tmp_path, path, y, covariates, calls, options, missing_pheno):
@@ -57,9 +57,15 @@ def _expected(tmp_path, path, y, covariates, calls, options, missing_pheno):
     beta, t = np.asarray(beta), np.asarray(t)
     n = y.shape[0]
     # Two covariates, the intercept and the genotype.
-    variant_df = np.count_nonzero(calls != 3, axis=1)[:, None].astype(np.float64) - 4
-    df = (variant_df * (np.isfinite(y).sum(0)[None, :] - 4) / float(n - 4) if missing_pheno
-          else np.broadcast_to(variant_df, t.shape))
+    if options.get('missing_phenotype') == 'exact':
+        # Each pair's own samples (call and phenotype observed) less the two
+        # covariates, the intercept and the genotype: complete-case OLS.
+        df = ((calls != 3).astype(np.int64) @ np.isfinite(y).astype(np.int64) - 4).astype(np.float64)
+    else:
+        # The release: variant df times trait_df / df.
+        variant_df = np.count_nonzero(calls != 3, axis=1)[:, None].astype(np.float64) - 4
+        df = (variant_df * (np.isfinite(y).sum(0)[None, :] - 4) / float(n - 4) if missing_pheno
+              else np.broadcast_to(variant_df, t.shape))
     exact = upper_tail_log10_from_t(t.astype(np.float64), df)
     exact = np.where(np.isfinite(exact), exact, -np.inf)
     winner = exact.argmax(axis=1)
@@ -87,15 +93,16 @@ def _assert_min_p(got, want):
 
 @pytest.mark.parametrize('device', ['cpu', 'cuda:1'])
 @pytest.mark.parametrize('block', [None, 4])
-@pytest.mark.parametrize('missing_pheno', [False, True])
-def test_min_p_is_the_full_scans_smallest_p_per_variant(tmp_path, monkeypatch, device, block, missing_pheno):
+@pytest.mark.parametrize('missing_pheno,convention', [(False, 'impute'), (True, 'impute'), (True, 'exact')])
+def test_min_p_is_the_full_scans_smallest_p_per_variant(tmp_path, monkeypatch, device, block, missing_pheno,
+                                                         convention):
     if device != 'cpu' and torch.cuda.device_count() < 2:
         pytest.skip('second CUDA device required')
     path, y, covariates, calls = _inputs(tmp_path, missing_calls=device != 'cpu', missing_pheno=missing_pheno)
     for key, value in [('TORCHGWAS_PGEN_BACKEND', 'native'), ('TORCHGWAS_PGEN_PACKED', '0'),
                        ('TORCHGWAS_NATIVE_STATS', '0')]:
         monkeypatch.setenv(key, value)
-    options = _options(device)
+    options = _options(device, convention)
     want, exact = _expected(tmp_path, path, y, covariates, calls, options, missing_pheno)
     if missing_pheno:
         # Some winners are partly missing traits, so their df is per pair.
@@ -146,16 +153,16 @@ def test_reduce_ranks_by_the_exact_tail_when_pair_df_differ():
     beta = torch.tensor([[1.0, 2.0]])
     status = torch.zeros(1, dtype=torch.uint8)
     variant_df = torch.tensor([40.0])
-    scale = torch.tensor([1.0, 1.0])
-    factor = torch.tensor([0.25, 1.0], dtype=torch.float64)
+    # Complete-case pair df: trait 0 observed on a quarter of trait 1's samples.
+    pair_df = torch.tensor([[10.0, 40.0]])
     reduction = MinPReduction()
-    kept = reduction.reduce(beta, t, status, variant_df, 1, log10_p=(scale, factor, torch.float64))
+    kept = reduction.reduce(beta, t, status, variant_df, 1, log10_p=(pair_df, torch.float64))
     assert int(kept[2][0, 0]) == 1
     np.testing.assert_allclose(kept[6].numpy(), [[40.0]])
     np.testing.assert_allclose(kept[5].numpy(), upper_tail_log10_from_t(np.array([[3.9]], np.float32).astype(np.float64), 40.0),
                                rtol=1e-10)
     # A complete panel ranks by |t| and prices the winner alone.
-    kept = reduction.reduce(beta, t, status, variant_df, 1, log10_p=(None, None, torch.float32))
+    kept = reduction.reduce(beta, t, status, variant_df, 1, log10_p=(None, torch.float32))
     assert int(kept[2][0, 0]) == 0 and kept[5].dtype == torch.float32
     np.testing.assert_allclose(kept[6].numpy(), [[40.0]])
     # Without log10_p it is VariantReduction('min-p'), the internal |t| ranking.

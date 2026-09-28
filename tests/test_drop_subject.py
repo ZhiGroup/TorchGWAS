@@ -248,3 +248,68 @@ def test_a_minority_selection_matches_its_own_file(tmp_path, monkeypatch, backen
     run_linear_gwas(subset, phenotype[chosen], covariates[chosen], output_dir=tmp_path / 'reference',
                     **load, **options, **COMMON)
     _assert_same_output(tmp_path / 'selected', tmp_path / 'reference', 3e-5, 3e-6)
+
+
+@pytest.mark.parametrize('backend', ['cuda-torch', 'cuda-native-int8', 'cuda-native-packed'])
+def test_exact_on_whole_rows_matches_its_own_file(tmp_path, monkeypatch, backend):
+    # missing_phenotype='exact' gathers calls by sample; on whole rows the plan
+    # reads them at the samples' file positions (CompleteCasePlan.at_positions).
+    options = _backend(monkeypatch, backend)
+    calls, covariates, phenotype = _panel()
+    order = np.random.default_rng(3).permutation(N)[:70]
+    full, load = _genotype(tmp_path, 'full', 'pgen', calls, None)
+    subset, _ = _genotype(tmp_path, 'subset', 'pgen', calls[order], order)
+    common = dict(missing_phenotype='exact', **load, **options, **COMMON)
+    run_linear_gwas(full, phenotype[order], covariates[order], sample_ids=[str(i) for i in order],
+                    output_dir=tmp_path / 'whole', **common)
+    run_linear_gwas(subset, phenotype[order], covariates[order], output_dir=tmp_path / 'reference', **common)
+    _assert_same_output(tmp_path / 'whole', tmp_path / 'reference', 3e-5, 3e-6)
+
+
+def _indexed(directory):
+    from torchgwas.sumstats_indexed import open_indexed_sumstats
+    _manifest, parts = open_indexed_sumstats(directory / 'sumstats')
+    parts = list(parts)
+    if not parts:
+        return {}
+    values = {key: np.concatenate([part[key] for part in parts]) for key in parts[0]}
+    order = np.lexsort([values[key] for key in ('trait_index', 'variant_index') if key in values][::-1])
+    return {key: value[order] for key, value in values.items()}
+
+
+@pytest.mark.parametrize('mode', ['significant', 'min-p', 'tiles', 'jagwas'])
+def test_a_mapped_panel_is_read_by_rows(tmp_path, monkeypatch, mode):
+    from unittest.mock import patch
+    from torchgwas import preprocess
+    from torchgwas.preprocess import PhenotypeRowView, PhenotypeColumnView
+    options = _backend(monkeypatch, 'cpu')
+    calls, covariates, phenotype = _panel(missing_calls=False)
+    kept = np.setdiff1d(np.arange(N), MISSING[0])
+    full, load = _genotype(tmp_path, 'full', 'pgen', calls, None)
+    subset, _ = _genotype(tmp_path, 'subset', 'pgen', calls[kept], kept)
+    np.save(tmp_path / 'y.npy', phenotype)
+    np.save(tmp_path / 'y_kept.npy', phenotype[kept])
+    extra = dict(significant=dict(reduce='significant', significance_threshold=0.5),
+                 **{'min-p': dict(reduce='min-p')},
+                 tiles=dict(trait_block=2, trait_devices=['cpu']), jagwas=dict(reduce='jagwas'))[mode]
+    seen = []
+    original = preprocess.prepare_inputs_for_prep
+
+    def prepare(genotype, phenotype, *args, **kwargs):
+        seen.append(phenotype)
+        return original(genotype, phenotype, *args, **kwargs)
+    with patch('torchgwas.api.prepare_inputs_for_prep', side_effect=prepare):
+        result = run_linear_gwas(full, tmp_path / 'y.npy', covariates, output_dir=tmp_path / 'dropped',
+                                 **load, **options, **COMMON, **extra)
+    assert result.run_metadata['dropped_subjects'] == len(MISSING[0])
+    if mode != 'min-p':  # min-p reads the panel into memory, so it is copied
+        assert seen and isinstance(seen[0], (PhenotypeRowView, PhenotypeColumnView)), type(seen[0])
+    run_linear_gwas(subset, tmp_path / 'y_kept.npy', covariates[kept], output_dir=tmp_path / 'reference',
+                    **load, **options, **COMMON, **extra)
+    if mode == 'tiles':
+        _assert_same_output(tmp_path / 'dropped', tmp_path / 'reference', 1e-10, 1e-10)
+        return
+    got, want = _indexed(tmp_path / 'dropped'), _indexed(tmp_path / 'reference')
+    assert got.keys() == want.keys() and got
+    for key in got:
+        np.testing.assert_allclose(got[key], want[key], rtol=1e-9, atol=1e-9, equal_nan=True, err_msg=key)

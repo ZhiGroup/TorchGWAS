@@ -688,7 +688,8 @@ class BinarySumstatsWriter:
             ),
             "significance": ("neg_log10_p is -log10 of the exact two-sided Student-t tail at "
                              + ("the per-variant df in df.f32" if self.store_variant_df else
-                                "the per-trait df" if np.ndim(self.df) else "df")),
+                                "each pair's complete-case df (the per-trait df here, less missing calls)"
+                                if np.ndim(self.df) else "df")),
             **(
                 {}
                 if self.store_beta
