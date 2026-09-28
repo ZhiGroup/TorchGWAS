@@ -28,12 +28,71 @@ def load_library():
     library.tg_scan_finish.restype=ct.c_int
     return library
 
-def resolve_statistics_backend():
-    """Resolve explicit opt-in; unavailable native kernels raise without fallback."""
-    if os.environ.get('TORCHGWAS_NATIVE_STATS', '0') == '1':
+def resolve_statistics_backend(device=None):
+    """The scan's statistics backend: 'native_fused', 'triton' or 'torch'.
+
+    - TORCHGWAS_STATS_BACKEND=torch|triton|native forces one ('triton' and
+      'native' raise when unavailable);
+    - TORCHGWAS_NATIVE_STATS=1 is the explicit opt-in to the CUDA kernels
+      (unavailable raises, as before);
+    - TORCHGWAS_NATIVE_STATS=0, set explicitly, keeps the Torch statistics,
+      which is what every plan pinning it was calibrated on;
+    - otherwise (the default) the Triton kernels (triton_scan) when they
+      compile and run on `device`, else Torch.
+
+    The Triton kernels are the CUDA kernels' contract in a language that
+    compiles for whatever GPU is present: at K = 512 they took 2.76 ms of
+    GPU and 0.11 ms of host issue per 4,096-variant chunk on an H100, against
+    7.00 and 0.45 for Torch (benchmarks/triton_scan_20260928.py).
+    """
+    forced = os.environ.get('TORCHGWAS_STATS_BACKEND', 'auto')
+    if forced not in ('auto', 'torch', 'triton', 'native'):
+        raise ValueError("TORCHGWAS_STATS_BACKEND must be auto, torch, triton or native")
+    if forced == 'native' or (forced == 'auto' and os.environ.get('TORCHGWAS_NATIVE_STATS') == '1'):
         load_library()
         return 'native_fused'
+    if forced == 'torch' or (forced == 'auto' and os.environ.get('TORCHGWAS_NATIVE_STATS') == '0'):
+        return 'torch'
+    from . import triton_scan
+    if triton_scan.available(device):
+        return 'triton'
+    if forced == 'triton':
+        raise ImportError('Triton statistics unavailable on this device')
     return 'torch'
+
+
+def fused_statistics_expected():
+    """Whether a CUDA scan will run fused statistics, decided without touching a device.
+
+    A genotype source picks its transport (packed two-bit rows or one byte
+    per call) before the scan's devices are known, so this must not create
+    a CUDA context: probing the current device put one on another user's GPU
+    and cost 24 s on a loaded host. Triton being importable with CUDA
+    present is the expectation; a device where the kernels then fail still
+    reads packed rows (native_scan unpacks them with Torch ops).
+    """
+    forced = os.environ.get('TORCHGWAS_STATS_BACKEND', 'auto')
+    if forced == 'torch' or (forced == 'auto' and os.environ.get('TORCHGWAS_NATIVE_STATS') == '0'):
+        return False
+    if forced == 'native' or (forced == 'auto' and os.environ.get('TORCHGWAS_NATIVE_STATS') == '1'):
+        return True
+    try:
+        import torch
+        from . import triton_scan
+    except ImportError:
+        return False
+    return triton_scan.triton is not None and torch.cuda.is_available()
+
+
+def fused_module(backend):
+    """The module serving prepare/finish for a fused backend, or None for Torch."""
+    if backend == 'native_fused':
+        import sys
+        return sys.modules[__name__]
+    if backend == 'triton':
+        from . import triton_scan
+        return triton_scan
+    return None
 
 
 _LAUNCHABLE={}

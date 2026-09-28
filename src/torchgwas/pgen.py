@@ -897,8 +897,10 @@ class PgenGenotype(PgenDosageSource):
             # without them. Enabling packed unconditionally would turn a
             # working torch-backend scan into a hard error at scan time, which
             # is exactly what the first attempt at this did.
-            enable_packed = (refusal is None
-                             and os.environ.get("TORCHGWAS_NATIVE_STATS", "0") == "1")
+            # The fused statistics (Triton by default, or the CUDA kernels)
+            # read packed rows; Torch's do not.
+            from .scan_gpu import fused_statistics_expected
+            enable_packed = refusal is None and fused_statistics_expected()
         # WHOLE ROWS for a sample selection (a subset, a reorder, or subjects
         # dropped for a missing phenotype): rows travel in file order with
         # every sample, the scan marks the unselected samples missing on the

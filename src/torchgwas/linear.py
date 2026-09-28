@@ -101,6 +101,13 @@ def _unpack_plink_a2_float(
     return torch.where(calls == 1, torch.nan, dosage)
 
 
+def _unpack_pgen_2bit_float(packed: torch.Tensor, n_samples: int) -> torch.Tensor:
+    """PGEN two-bit rows (0/1/2 ALT dosage, 3 missing) as float dosages with NaN, by Torch ops."""
+    calls = torch.stack((packed & 3, (packed >> 2) & 3, (packed >> 4) & 3, (packed >> 6) & 3),
+                        dim=2).reshape(packed.shape[0], -1)[:, :n_samples]
+    return torch.where(calls == 3, torch.nan, calls.to(torch.float32))
+
+
 def _packed_bed_statistics(
     packed: torch.Tensor,
     design: torch.Tensor,
@@ -229,6 +236,7 @@ def _packed_bed_statistics_native(
     sample_byte_indices: torch.Tensor | None,
     sample_bit_shifts: torch.Tensor | None,
     physical_samples: int | None = None,
+    module=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The contract of _packed_bed_statistics, served by the CUDA kernel.
 
@@ -239,7 +247,9 @@ def _packed_bed_statistics_native(
     """
     if sample_byte_indices is not None or sample_bit_shifts is not None:
         raise ValueError("native packed BED does not support sample subsetting")
-    from . import scan_gpu
+    if module is None:
+        from . import scan_gpu as module
+    scan_gpu = module
 
     centered, centered_ss, minimum, maximum, present = scan_gpu.prepare(
         packed, encoding="plink_2bit", n_samples=int(physical_samples or n_samples))
@@ -250,16 +260,36 @@ def _packed_bed_statistics_native(
     return beta, t_stat, status, present.to(torch.float32) + float(df) - float(n_samples)
 
 
-def _native_packed_bed_available():
-    """True when the native BED kernel may run (`TORCHGWAS_BED_NATIVE=0` forbids it)."""
-    if os.environ.get("TORCHGWAS_BED_NATIVE", "1") != "1":
-        return False
-    try:
-        from . import scan_gpu
+def _packed_bed_module():
+    """The fused module for packed BED rows: the CUDA kernels, else Triton; None for Torch.
 
-        return bool(scan_gpu.available())
+    `TORCHGWAS_BED_NATIVE=0` forbids both, the escape hatch if the fused
+    kernels are ever suspected of disagreeing with the Torch path.
+    TORCHGWAS_STATS_BACKEND=torch or =triton chooses as it does for PGEN;
+    otherwise the CUDA kernel, which BED has used by default, comes first.
+    """
+    if os.environ.get("TORCHGWAS_BED_NATIVE", "1") != "1":
+        return None
+    forced = os.environ.get("TORCHGWAS_STATS_BACKEND", "auto")
+    try:
+        from . import scan_gpu, triton_scan
+
+        if forced == "torch":
+            return None
+        if forced == "triton":
+            return triton_scan if triton_scan.available() else None
+        if scan_gpu.available():
+            return scan_gpu
+        if triton_scan.available():
+            return triton_scan
     except Exception:  # noqa: BLE001 - availability must never fail a scan
-        return False
+        pass
+    return None
+
+
+def _native_packed_bed_available():
+    """True when a fused BED kernel may run (_packed_bed_module)."""
+    return _packed_bed_module() is not None
 
 
 def _select_packed_bed_statistics(sample_byte_indices, sample_bit_shifts):
@@ -268,15 +298,10 @@ def _select_packed_bed_statistics(sample_byte_indices, sample_bit_shifts):
     `TORCHGWAS_BED_NATIVE=0` forces the Torch path, which is the escape hatch
     if the kernel is ever suspected of disagreeing with it.
     """
-    if (sample_byte_indices is None and sample_bit_shifts is None
-            and os.environ.get("TORCHGWAS_BED_NATIVE", "1") == "1"):
-        try:
-            from . import scan_gpu
-
-            if scan_gpu.available():
-                return _packed_bed_statistics_native
-        except Exception:  # noqa: BLE001 - availability must never fail a scan
-            pass
+    if sample_byte_indices is None and sample_bit_shifts is None:
+        module = _packed_bed_module()
+        if module is not None:
+            return functools.partial(_packed_bed_statistics_native, module=module)
     return _get_packed_bed_statistics()
 
 
@@ -568,7 +593,8 @@ def _packed_bed_cuda_iterator(
             return _dosage_statistics(genotype_float, design, phenotype_ss, n_traits, df,
                                       covariate_rank=n_samples - df - 2, complete_case=complete_case)
     elif whole_rows:
-        statistics = functools.partial(_packed_bed_statistics_native, physical_samples=stored_samples)
+        statistics = functools.partial(_packed_bed_statistics_native, physical_samples=stored_samples,
+                                       module=_packed_bed_module())
     else:
         statistics = _select_packed_bed_statistics(
             sample_byte_indices_t, sample_bit_shifts_t)

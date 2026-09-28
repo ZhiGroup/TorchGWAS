@@ -1326,11 +1326,11 @@ def _validate(w, p, h, plan):
             raise ValueError('packed PGEN requires 64-byte-padded uint8 physical rows')
         if p.transfer_bytes_per_variant != p.native_row_width or p.decode_on_gpu:
             raise ValueError('packed PGEN transfer width or decode placement mismatch')
-        if w.statistics_kernel != 'native_fused':
+        if w.statistics_kernel not in ('native_fused', 'triton'):
             raise ValueError('packed PGEN requires native fused statistics')
-    if w.statistics_kernel not in {'torch', 'native_fused'}:
+    if w.statistics_kernel not in {'torch', 'native_fused', 'triton'}:
         raise ValueError('unknown statistics_kernel')
-    if w.statistics_kernel == 'native_fused':
+    if w.statistics_kernel in ('native_fused', 'triton'):
         if p.native_input_bytes_per_value <= 0:
             raise ValueError('native fused statistics require positive native input width')
         if p.gpu_input_conversion_seconds_per_variant:
@@ -1412,7 +1412,7 @@ def estimate(w: Workload, p: InputProfile, h: Hardware, plan: PipelinePlan,
     # This is linear GWAS only: no JAGWAS, exact p-values or clumping.
     flops = m * (2 * n * (k + c) + 4 * n + 2 * c + 12 * k)
     genotype_bytes = (2 * p.native_input_bytes_per_value + 8
-                      if w.statistics_kernel == 'native_fused' else 32)
+                      if w.statistics_kernel in ('native_fused', 'triton') else 32)
     genotype_row_bytes = n * genotype_bytes
     if p.native_encoding == 'pgen_2bit':
         genotype_row_bytes = 2 * p.native_row_width + 8 * n
@@ -1547,9 +1547,9 @@ def estimate(w: Workload, p: InputProfile, h: Hardware, plan: PipelinePlan,
         'native_encoding': p.native_encoding, 'native_row_width': p.native_row_width,
         'input_transfer_bytes': transfer,
         'statistics_kernel': w.statistics_kernel,
-        'conversion_fused_into_statistics': w.statistics_kernel == 'native_fused',
+        'conversion_fused_into_statistics': w.statistics_kernel in ('native_fused', 'triton'),
         'gpu_input_conversion_seconds': gpu_conversion,
-        'gpu_input_conversion_status': ('fused_into_statistics' if w.statistics_kernel == 'native_fused' else
+        'gpu_input_conversion_status': ('fused_into_statistics' if w.statistics_kernel in ('native_fused', 'triton') else
                                         'supplied' if gpu_conversion else 'zero_assumed_absent_or_unmeasured'),
         'gpu_flops': flops, 'gpu_memory_bytes': gpu_bytes,
         'assumptions': [
@@ -1782,7 +1782,7 @@ def apply_pipeline_profile(source, phenotype, covariates, profile: dict) -> dict
                   all_source_controls_applied=not bool(advisory))
     result['estimate']['application_status'] = ('conditional_on_advisory_controls' if advisory else 'controls_applied')
     result['estimate']['gpu_input_conversion_status'] = (
-        'fused_into_statistics' if w.statistics_kernel == 'native_fused' else
+        'fused_into_statistics' if w.statistics_kernel in ('native_fused', 'triton') else
         'supplied' if 'gpu_input_conversion_seconds_per_variant' in profile['input']
         else 'unmeasured_default_zero')
     result['estimate']['advisory_conditions'] = list(advisory)
