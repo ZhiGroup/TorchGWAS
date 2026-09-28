@@ -588,6 +588,43 @@ def test_grouped_jagwas_is_priced_by_its_groups(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('path', ['torch', 'native-dosage', 'native-pgen2', 'bed', 'generic'])
+def test_every_statistics_path_is_timed(path):
+    import torchgwas.empirical_autotune as autotune
+    from torchgwas import scan_gpu
+    device = f'cuda:{torch.cuda.device_count() - 1}'
+    if path.startswith('native') and not scan_gpu.available(torch.device(device)):
+        pytest.skip('native statistics unavailable')
+    narrow = autotune.scan_device_seconds_per_variant(device, mode='full', n_samples=4000, n_traits=64, path=path)
+    wide = autotune.scan_device_seconds_per_variant(device, mode='full', n_samples=4000, n_traits=4096, path=path)
+    assert 0 < narrow < wide
+    gemm = 2.0 * 4000 * 4096 / autotune.measured_gemm_rate(device, torch.float32)
+    assert autotune.gpu_seconds_per_variant(device, mode='full', n_samples=4000, n_traits=4096, path=path) >= gemm
+
+
+def test_the_statistics_path_follows_the_scan_dispatch(monkeypatch):
+    from torchgwas.empirical_autotune import scan_statistics_path
+
+    class Packed:
+        def iter_packed_chunks(self):
+            pass
+
+    class Native:
+        supports_fused_qc = True
+        native_encoding = 'pgen_2bit'
+
+    assert scan_statistics_path(Packed()) == 'bed'
+    assert scan_statistics_path(object()) == 'generic'
+    monkeypatch.setenv('TORCHGWAS_NATIVE_STATS', '0')
+    assert scan_statistics_path(Native()) == 'torch'
+    import torchgwas.scan_gpu as scan_gpu
+    monkeypatch.setattr(scan_gpu, 'resolve_statistics_backend', lambda: 'native_fused')
+    assert scan_statistics_path(Native()) == 'native-pgen2'
+    Native.native_encoding = 'dosage'
+    assert scan_statistics_path(Native()) == 'native-dosage'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize('mode', ['full', 'min-p', 'significant', 'jagwas'])
 def test_scan_device_time_prices_more_than_the_gemm(mode, monkeypatch):
     import torchgwas.empirical_autotune as autotune
@@ -599,8 +636,7 @@ def test_scan_device_time_prices_more_than_the_gemm(mode, monkeypatch):
     assert 0 < narrow < wide < 64 * narrow
     gemm = 2.0 * 4000 * 4096 / autotune.measured_gemm_rate(device, torch.float32)
     assert autotune.gpu_seconds_per_variant(device, mode=mode, n_samples=4000, n_traits=4096) >= gemm
-    monkeypatch.setenv('TORCHGWAS_NATIVE_STATS', '1')
-    assert autotune.scan_device_seconds_per_variant(device, mode=mode, n_samples=4000, n_traits=64) is None
+    assert autotune.scan_device_seconds_per_variant('cpu', mode=mode, n_samples=4000, n_traits=64) is None
 
 
 def test_output_write_rates_uses_the_real_writer_and_cleans_up(tmp_path):

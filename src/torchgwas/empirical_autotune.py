@@ -433,7 +433,7 @@ def jagwas_factor_bytes(n_traits, group_sizes=None):
     return 3 * largest * largest * 8 + 8 * (sum(size * size for size in sizes) - largest * largest)
 
 
-def gpu_seconds_per_variant(device, *, mode, n_samples, n_traits, group_sizes=None):
+def gpu_seconds_per_variant(device, *, mode, n_samples, n_traits, group_sizes=None, path='torch'):
     """GPU time one variant costs: the scan's device work, plus the FP64 projection for JAGWAS.
 
     The larger of the FP32 GEMM alone and the scan's own per-chunk device
@@ -446,7 +446,8 @@ def gpu_seconds_per_variant(device, *, mode, n_samples, n_traits, group_sizes=No
     """
     import torch
     seconds = 2.0 * n_samples * n_traits / measured_gemm_rate(device, torch.float32)
-    measured = scan_device_seconds_per_variant(device, mode=mode, n_samples=n_samples, n_traits=n_traits)
+    measured = scan_device_seconds_per_variant(device, mode=mode, n_samples=n_samples, n_traits=n_traits,
+                                               path=path)
     if measured is not None:
         seconds = max(seconds, measured)
     if mode == 'jagwas':
@@ -454,14 +455,32 @@ def gpu_seconds_per_variant(device, *, mode, n_samples, n_traits, group_sizes=No
     return seconds
 
 
-def scan_device_seconds_per_variant(device, *, mode, n_samples, n_traits, repeats=3):
+def scan_statistics_path(genotype):
+    """The statistics backend a CUDA scan of `genotype` runs, as linear_scan_streaming_chunks dispatches it.
+
+    'bed' (packed PLINK rows, iter_packed_chunks), 'native-pgen2' / 'native-dosage'
+    (the fused kernels, TORCHGWAS_NATIVE_STATS=1, packed or byte transport),
+    'torch' (native dosage transport, torch statistics) or 'generic' (host-decoded
+    float chunks, kernels.linear_chunk_kernel).
+    """
+    from .scan_gpu import resolve_statistics_backend
+    if hasattr(genotype, 'iter_packed_chunks'):
+        return 'bed'
+    if not getattr(genotype, 'supports_fused_qc', False):
+        return 'generic'
+    if resolve_statistics_backend() != 'native_fused':
+        return 'torch'
+    return 'native-pgen2' if getattr(genotype, 'native_encoding', None) == 'pgen_2bit' else 'native-dosage'
+
+
+def scan_device_seconds_per_variant(device, *, mode, n_samples, n_traits, repeats=3, path='torch'):
     """GPU seconds per variant of the scan's own per-chunk device work, timed; None if not measurable.
 
-    Times, with CUDA events on a synthetic chunk, what the torch statistics
-    backend does to every chunk: the uint8-to-float conversion, the
-    statistics (linear._dosage_statistics: missing mask, range, centring, the
-    GEMM against an n x (K + 1) design, residual sums), and the mode's own
-    step -- the -log10 P tail over every cell (full output), the min-p
+    Times, with CUDA events on a synthetic chunk, what the scan's statistics
+    backend (`path`, scan_statistics_path) does to every chunk -- decoding or
+    converting the calls, the statistics (masking, centring, range, the GEMM
+    against an n x (K + 1) design, residual sums) -- and the mode's own
+    step: the -log10 P tail over every cell (full output), the min-p
     reduction and its winners' tail, or the significance selection. JAGWAS's
     reduction is priced by its projection FLOPs instead (gpu_seconds_per_variant).
 
@@ -473,16 +492,19 @@ def scan_device_seconds_per_variant(device, *, mode, n_samples, n_traits, repeat
     H100, 22,250 samples, K = 512, timed in the scan itself (TORCHGWAS_SCAN_PROFILE,
     benchmarks/gpu_pipeline_profile_20260927.py): 1.58-1.65 us per variant of
     GPU compute for min-p, 1.85 us for dense output; the GEMM alone 0.47.
-    The native fused backend (TORCHGWAS_NATIVE_STATS=1) is not timed here: None.
+    None off CUDA, or when the path's kernels are unavailable.
     """
     import torch
-    from .scan_gpu import resolve_statistics_backend
     device = torch.device(device)
-    if device.type != 'cuda' or resolve_statistics_backend() != 'torch':
+    if device.type != 'cuda':
         return None
+    if path.startswith('native'):
+        from . import scan_gpu
+        if not scan_gpu.available(device):
+            return None
     chunk = int(max(64, min(1024, (1 << 27) // max(1, int(n_samples)))))
     widths = sorted({min(int(n_traits), 256), min(int(n_traits), 2048)})
-    timed = {width: _device_chunk_seconds(device, mode, int(n_samples), width, chunk, repeats)
+    timed = {width: _device_chunk_seconds(device, mode, int(n_samples), width, chunk, repeats, path)
              for width in widths}
     if len(widths) == 1 or int(n_traits) <= widths[-1]:
         seconds = timed[widths[-1]]
@@ -492,15 +514,55 @@ def scan_device_seconds_per_variant(device, *, mode, n_samples, n_traits, repeat
     return seconds / chunk
 
 
-def _device_chunk_seconds(device, mode, n_samples, width, chunk, repeats):
+def _statistics_for_path(path, device, n_samples, width, chunk, generator):
+    """statistics() -> (beta, t, status, variant_df) for one synthetic chunk on `path`'s kernels."""
+    import torch
+    design = torch.randn(n_samples, width + 1, generator=generator, device=device) / n_samples ** 0.5
+    phenotype_ss = torch.ones(width, device=device)
+    df = n_samples - 3
+    packed_width = (n_samples + 3) // 4
+    if path in ('bed', 'native-pgen2'):
+        # Two-bit calls; any byte is valid (a missing code is one of the four).
+        packed = torch.randint(0, 256, (chunk, packed_width), generator=generator, device=device,
+                               dtype=torch.int32).to(torch.uint8)
+    else:
+        codes = torch.randint(0, 3, (chunk, n_samples), generator=generator, device=device, dtype=torch.uint8)
+    if path == 'bed':
+        from .linear import _select_packed_bed_statistics
+        kernel = _select_packed_bed_statistics(None, None)
+        return lambda: kernel(packed, design, phenotype_ss, n_samples, width, df, None, None)
+    if path.startswith('native'):
+        from . import scan_gpu
+
+        def native():
+            if path == 'native-pgen2':
+                centered, ss, low, high, present = scan_gpu.prepare(packed, encoding='pgen_2bit', n_samples=n_samples)
+            else:
+                centered, ss, low, high, present = scan_gpu.prepare(codes, 1.0, None)
+            beta, t, status = scan_gpu.finish(centered @ design, ss, low, high, phenotype_ss, present, -3.0)
+            return beta, t, status, present.to(torch.float32) - 3.0
+        return native
+    if path == 'generic':
+        from .kernels import linear_chunk_kernel
+        # Host-decoded float chunks, samples x variants, as the generic scan uploads them.
+        values = codes.t().float()
+        phenotype = design[:, :width].contiguous()
+        basis = None
+
+        def generic():
+            beta, t, variant_df = linear_chunk_kernel(values, phenotype, basis, df, covariate_rank=0)
+            return beta, t, torch.zeros(t.shape[0], dtype=torch.uint8, device=device), variant_df
+        return generic
+    from .linear import _dosage_statistics
+    return lambda: _dosage_statistics(codes.float(), design, phenotype_ss, width, df, False, covariate_rank=1)
+
+
+def _device_chunk_seconds(device, mode, n_samples, width, chunk, repeats, path='torch'):
     """CUDA-event seconds of one synthetic chunk's device work (scan_device_seconds_per_variant)."""
     import torch
-    from .linear import _dosage_statistics
     with torch.cuda.device(device):
         generator = torch.Generator(device=device).manual_seed(20260927)
-        codes = torch.randint(0, 3, (chunk, n_samples), generator=generator, device=device, dtype=torch.uint8)
-        design = torch.randn(n_samples, width + 1, generator=generator, device=device) / n_samples ** 0.5
-        phenotype_ss = torch.ones(width, device=device)
+        statistics = _statistics_for_path(path, device, n_samples, width, chunk, generator)
         step = None
         if mode == 'full':
             from .tails import neg_log10_p_device
@@ -522,8 +584,7 @@ def _device_chunk_seconds(device, mode, n_samples, width, chunk, repeats):
                     pass
 
         def once():
-            beta, t, status, variant_df = _dosage_statistics(codes.float(), design, phenotype_ss, width,
-                                                             n_samples - 3, False, covariate_rank=1)
+            beta, t, status, variant_df = statistics()
             if step is not None:
                 step(beta, t, status, variant_df)
 
