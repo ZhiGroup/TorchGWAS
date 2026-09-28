@@ -223,3 +223,29 @@ def test_planner_shards_min_p_like_jagwas():
     huge = plan_layout(mode='min-p', n_traits=2_000_000, devices=seven[:2], cpus=40, reduction_width=1,
                        **dict(base, device_free_bytes=20 * 2**30))
     assert huge['trait_block'] and huge['trait_devices'] == seven[:2]
+
+
+@pytest.mark.parametrize('missing_pheno', [False, True])
+def test_min_p_on_packed_bed_input_matches_pgen(tmp_path, monkeypatch, missing_pheno):
+    # The packed BED path once reduced without staging the winners' -log10 P
+    # and df, so its store fell back to the writer's scalar-df branch.
+    if torch.cuda.device_count() < 2:
+        pytest.skip('second CUDA device required')
+    from test_statistics import _write_bed
+    path, y, covariates, calls = _inputs(tmp_path, missing_calls=True, missing_pheno=missing_pheno, m=41)
+    dosage = np.where(calls.T == 3, np.nan, calls.T).astype(float)
+    bed = _write_bed(tmp_path/'input', dosage)
+    for key, value in [('TORCHGWAS_PGEN_BACKEND', 'native'), ('TORCHGWAS_PGEN_PACKED', '0'),
+                       ('TORCHGWAS_NATIVE_STATS', '0')]:
+        monkeypatch.setenv(key, value)
+    options = _options('cuda:1')
+    run_linear_gwas(path, y, covariates, output_dir=tmp_path/'pgen', reduce='min-p', **options)
+    options['genotype_format'] = 'plink'
+    run_linear_gwas(bed, y, covariates, output_dir=tmp_path/'bed', reduce='min-p', **options)
+    manifest, got = _read(tmp_path/'bed/sumstats')
+    assert manifest['df'] == dict(layout='per_part', axis='pair', field='df')
+    _, want = _read(tmp_path/'pgen/sumstats')
+    np.testing.assert_array_equal(got['variant_index'], want['variant_index'])
+    np.testing.assert_array_equal(got['trait_index'], want['trait_index'])
+    np.testing.assert_allclose(got['df'], want['df'], rtol=1e-6)
+    np.testing.assert_allclose(got['neg_log10_p'], want['neg_log10_p'], rtol=3e-5, atol=1e-6)
