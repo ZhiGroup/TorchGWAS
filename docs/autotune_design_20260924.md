@@ -2087,6 +2087,89 @@ whole rows.
   positions (`CompleteCasePlan.at_positions`); on BED it keeps the gathered
   layout, since the plan gathers calls by sample.
 
+### Triton statistics: the default CUDA backend (2026-09-28)
+
+**Why.** At K = 512 the default (Torch) statistics made about 40 kernel
+launches per chunk, roughly ten elementwise passes over chunk x n, and their
+GPU time was 3.4x the GEMM. The same fusion already existed as CUDA
+(`native/scan_statistics.cu`, `TORCHGWAS_NATIVE_STATS=1`). But it is opt-in
+and built only for sm80/sm90, so it failed on the 2080 Ti and could never be
+the default. The user lifted the no-custom-kernels rule for Triton, which
+compiles for whatever GPU is present.
+
+**What.** `triton_scan` ports the CUDA contract kernel for kernel:
+- `prepare`: one program per variant decodes int8, uint8, float32, packed
+  PGEN or packed BED rows. It writes centred calls plus Σg², range and
+  observed count, accumulating in FP32 lanes and FP64 across lanes.
+- `finish`: beta, t and status.
+- `finish_min_p`: min-p's |t| ranking inside the finish, so a complete
+  panel's chunk x K beta and t are never written.
+
+Divisions and square roots are correctly rounded. Triton's `/` is
+approximate, and 127 / 127 must be exactly 1 or an invariant row's centred
+calls are not zero. Checked against an FP64 reference, the CUDA kernels and
+Torch (`tests/test_triton_scan.py`): t within 5e-7, identical status, 100%
+of min-p winners.
+
+**Selection** (`scan_gpu.resolve_statistics_backend`):
+- `TORCHGWAS_STATS_BACKEND=torch|triton|native` forces one.
+- `TORCHGWAS_NATIVE_STATS=1` keeps the CUDA kernels.
+- An explicit `TORCHGWAS_NATIVE_STATS=0` keeps Torch; the calibrated plans
+  pin it, and their calibrations stay valid.
+- Otherwise: Triton when it runs on the device, else Torch.
+  `triton_scan.UNAVAILABLE` records why it did not run.
+
+**Transport.**
+- PGEN takes packed two-bit rows whenever fused statistics are expected. The
+  decision is made without touching a device. A first version probed the
+  current device, which put a CUDA context on another user's GPU and cost
+  24 s on a loaded host.
+- A device where Triton then fails unpacks the rows with Torch ops.
+- BED takes the CUDA kernel, else Triton.
+
+**Per chunk** (H100, 22,250 samples, 4,096 variants,
+`benchmarks/triton_scan_20260928.py`), GPU / host issue ms:
+
+| K | torch int8 | native int8 | triton int8 | triton packed |
+|---|---|---|---|---|
+| 512 | 7.00 / 0.45 | 2.96 / 0.09 | 2.76 / 0.11 | 2.58 / 0.11 |
+| 8,192 | 37.6 / 0.43 | 32.4 / 0.09 | 32.1 / 0.11 | 32.0 / 0.11 |
+
+With three threads at once the host issue stays about 0.12-0.13 ms.
+
+**Full scale.**
+- Setup: 22,250 x 8.09M, K = 512, four H100s, fixed shards, chunk 4096,
+  16 readers, depth 4; host load 130-150, fresh interleaved processes.
+- Executor seconds (`benchmarks/triton_full_scale_20260928.py`):
+
+| | torch | triton int8 | triton packed (default) |
+|---|---|---|---|
+| min-p | 15.8, 10.8, 22.2 | 36.7*, 18.8, 20.8 | **8.4, 7.7, 5.0** |
+| dense | 31.1, 25.8, 34.5 | 81.6*, 34.5, 33.0 | **15.9, 15.9, 12.9** |
+
+\* The first Triton run in a fresh cache includes compilation.
+
+**Open.**
+- *Triton on int8 rows is slower than Torch with four shards*, though
+  faster per chunk and on one GPU (0.54 against 0.64 s for 200k variants).
+  It is not the default path (packed is). It needs a quiet host.
+- *Four GPUs are still not four times one at K = 512.* One GPU on packed
+  rows needs ~1.1 us per variant (8.8 s for the file), and four took
+  5.0-8.4 s.
+  - py-spy over every thread (`benchmarks/thread_attribution_20260928.py`)
+    found no thread saturated during the scan except the main thread. Its
+    samples in the indexed writer's min-p branch have no deeper Python frame,
+    which is how a thread waiting to reacquire the GIL looks. That points at
+    GIL contention, not writer work, but py-spy's own overhead on this host
+    tripled the run.
+  - Consuming the shards' chunks without writing
+    (`benchmarks/multigpu_consume_20260928.py`) ran 142-274 s on this host
+    right after the API runs took 5-8 s. That fits the 45 GB file leaving
+    the page cache under other users' memory pressure: the numbers measure
+    the disk, not the scan.
+  - This needs the quiet host too: consume-only against the API at 1/2/4
+    GPUs, then py-spy --gil.
+
 ## 3. Tuning during the run
 
 ### What the current tuner hides, and what it does not
