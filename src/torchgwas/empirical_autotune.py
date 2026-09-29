@@ -516,7 +516,11 @@ def scan_device_seconds_per_variant(device, *, mode, n_samples, n_traits, repeat
         seconds = timed[widths[-1]]
     else:
         low, high = widths
-        seconds = timed[high] + (timed[high] - timed[low]) / (high - low) * (int(n_traits) - high)
+        # Every per-cell pass costs something, so the slope in K is at least
+        # zero: timing noise on a shared GPU once put the wider chunk below the
+        # narrower one and extrapolated a negative price.
+        slope = max(0.0, (timed[high] - timed[low]) / (high - low))
+        seconds = timed[high] + slope * (int(n_traits) - high)
     return seconds / chunk
 
 
@@ -543,11 +547,16 @@ def _statistics_for_path(path, device, n_samples, width, chunk, generator):
         else:
             from . import triton_scan as module
 
-        def native():
+        def native(min_p=False):
             if path.endswith('-pgen2'):
                 centered, ss, low, high, present = module.prepare(packed, encoding='pgen_2bit', n_samples=n_samples)
             else:
                 centered, ss, low, high, present = module.prepare(codes, 1.0, None)
+            if min_p and hasattr(module, 'finish_min_p'):
+                # The scan's own min-p on a complete panel: ranked inside the
+                # finish (native_scan), so the chunk x K beta and t never exist.
+                winners = module.finish_min_p(centered @ design, ss, low, high, phenotype_ss, present, -3.0)
+                return (*winners, present.to(torch.float32) - 3.0)
             beta, t, status = module.finish(centered @ design, ss, low, high, phenotype_ss, present, -3.0)
             return beta, t, status, present.to(torch.float32) - 3.0
         return native
@@ -581,9 +590,17 @@ def _device_chunk_seconds(device, mode, n_samples, width, chunk, repeats, path='
         elif mode == 'min-p':
             from .min_p import MinPReduction
             reduction = MinPReduction()
+            if path.startswith('triton'):
+                ranked = statistics
 
-            def step(beta, t, status, variant_df):
-                reduction.reduce(beta, t, status, variant_df, 1, log10_p=(None, torch.float32))
+                def statistics():
+                    return ranked(min_p=True)
+
+                def step(beta, t, index, status, variant_df):
+                    reduction.from_winners(beta, t, index, status, variant_df, torch.float32)
+            else:
+                def step(beta, t, status, variant_df):
+                    reduction.reduce(beta, t, status, variant_df, 1, log10_p=(None, torch.float32))
         elif mode == 'significant':
             from .reduce import SignificantPairs, device_significance_critical, device_significant_pairs
             critical = device_significance_critical(SignificantPairs(), n_samples, width, device)
@@ -593,15 +610,31 @@ def _device_chunk_seconds(device, mode, n_samples, width, chunk, repeats, path='
                     pass
 
         def once():
-            beta, t, status, variant_df = statistics()
+            outputs = statistics()
             if step is not None:
-                step(beta, t, status, variant_df)
+                step(*outputs)
 
         once()
         torch.cuda.synchronize(device)
+        # Device time only: a stall queued ahead of the chunk lets the host
+        # finish issuing it before the GPU reaches it, so a loaded host's
+        # launch gaps are not timed as GPU work (at small n the chunk is tens
+        # of microseconds and the gaps were most of it). The stall is sized from
+        # this host's own issue time and this GPU's own clock.
+        issued = time.perf_counter()
+        once()
+        issue = time.perf_counter() - issued
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        begin.record()
+        torch.cuda._sleep(1_000_000)
+        end.record()
+        end.synchronize()
+        cycles_per_second = 1_000_000 / max(begin.elapsed_time(end) / 1e3, 1e-9)
+        stall = int(cycles_per_second * max(2.0 * issue, 1e-3))
         seconds = []
         for _ in range(repeats):
             start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            torch.cuda._sleep(stall)
             start.record()
             once()
             stop.record()
