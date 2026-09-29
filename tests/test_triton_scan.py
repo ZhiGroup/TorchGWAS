@@ -208,3 +208,24 @@ def test_packed_rows_on_a_device_without_triton_are_unpacked_by_torch(tmp_path, 
     for index in range(3):
         np.testing.assert_allclose(np.asarray(got[index]), np.asarray(want[index]), rtol=1e-6, atol=1e-7,
                                    equal_nan=True)
+
+
+def test_the_tail_is_scipys_and_serves_the_device_tail():
+    from torchgwas import tails
+    rng = np.random.default_rng(3)
+    t = np.concatenate([np.linspace(0, 1, 50), np.linspace(1, 60, 400), rng.uniform(0, 300, 600)])
+    df = rng.choice([1.0, 2.0, 5.5, 30.0, 500.0, 22238.0, 499998.0], size=t.size)
+    want = tails.upper_tail_log10_from_t(t, df)
+    got = triton_scan.neg_log10_p(torch.as_tensor(t, device=DEVICE).reshape(-1, 1),
+                                  torch.as_tensor(df, device=DEVICE).reshape(-1, 1),
+                                  out=torch.empty((t.size, 1), dtype=torch.float64, device=DEVICE))
+    np.testing.assert_allclose(got.cpu().numpy()[:, 0], want, rtol=2e-9, atol=2e-9)
+    # neg_log10_p_device takes it: per-variant, per-pair and per-trait df, float32 out.
+    t2 = torch.randn((37, 5), device=DEVICE) * 6
+    for df2 in (torch.full((37, 1), 40.0, device=DEVICE), torch.rand((37, 5), device=DEVICE) * 100 + 3,
+                torch.tensor([3.0, 10.0, 30.0, 100.0, 1000.0], device=DEVICE)):
+        got2 = tails.neg_log10_p_device(t2, df2)
+        want2 = tails.upper_tail_log10_from_t(t2.double().cpu().numpy(),
+                                              np.broadcast_to(df2.double().cpu().numpy(), t2.shape))
+        np.testing.assert_allclose(got2.cpu().numpy(), want2, rtol=2e-6, atol=2e-6)
+    assert tails._KINDS.get(torch.device('cuda', torch.cuda.current_device())) == 'triton'

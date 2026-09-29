@@ -286,3 +286,112 @@ def finish_min_p(products, centered_ss, minimum, maximum, phenotype_ss, present,
                                       VALIDATE=bool(validate_range), COV_BLOCK=cov_block, BLOCK=block,
                                       num_warps=4)
     return beta, t, index, status
+
+
+# -- the -log10 P tail ---------------------------------------------------------
+#
+# tails.py's device tail -- P(|T| > t) = I_x(df/2, 1/2) in logs, one Lentz
+# continued fraction per cell (the direct one, or the reflected one near t =
+# 0), 40 fixed iterations -- as one kernel with everything in registers. The
+# AOTInductor build of the same stages exists only for the architectures it
+# was built for; elsewhere the stages ran as ~12 torch.compile calls per tail,
+# each holding the GIL through Dynamo's guards: on four 2080 Ti shards that was
+# 40% of all GIL time (benchmarks/synthetic_multigpu_20260928.py). One launch
+# here, on any GPU Triton supports. FP64 throughout, as the stages.
+TAIL_BLOCK = 256
+TAIL_ITERATIONS = 40
+
+
+def _tail_constants():
+    import math
+    from scipy import special
+    return float(special.gammaln(0.5)), 1.0 / math.log(10.0)
+
+
+_LGAMMA_HALF, _INV_LN10 = _tail_constants()
+
+
+if triton is not None:
+    try:
+        from triton.language.extra import libdevice as _libdevice
+    except ImportError:  # older layouts
+        from triton.language.extra.cuda import libdevice as _libdevice
+
+    @triton.jit
+    def _tail_kernel(t_ptr, df_ptr, out_ptr, cells, cols, t_row, t_col, df_row, df_col,
+                     TINY: tl.constexpr, LGAMMA_HALF: tl.constexpr, INV_LN10: tl.constexpr,
+                     ITERATIONS: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        valid = offsets < cells
+        row = offsets // cols
+        col = offsets % cols
+        # FP64 constants built as FP64: a Python float literal would be FP32,
+        # and 1e-300 would flush to zero.
+        tiny = tl.full([BLOCK], TINY, tl.float64)
+        t = tl.abs(tl.load(t_ptr + row * t_row + col * t_col, mask=valid, other=0.0).to(tl.float64))
+        df = tl.load(df_ptr + row * df_row + col * df_col, mask=valid, other=1.0).to(tl.float64)
+        a = df * 0.5
+        squared = t * t
+        total = df + squared
+        x = df / total
+        y = squared / total
+        reflect = x >= (a + 1.0) / (a + 2.5)
+        first = tl.where(reflect, 0.5, a)
+        second = tl.where(reflect, a, 0.5)
+        argument = tl.where(reflect, y, x)
+        d = 1.0 - (first + second) * argument / (first + 1.0)
+        d = 1.0 / tl.where(tl.abs(d) < tiny, tiny, d)
+        c = tl.full([BLOCK], 1.0, tl.float64)
+        h = d
+        qab = first + second
+        qap = first + 1.0
+        qam = first - 1.0
+        for index in range(ITERATIONS):
+            m = (index + 1).to(tl.float64)
+            m2 = 2.0 * m
+            step = m * (second - m) * argument / ((qam + m2) * (first + m2))
+            d = 1.0 + step * d
+            d = 1.0 / tl.where(tl.abs(d) < tiny, tiny, d)
+            c = 1.0 + step / c
+            c = tl.where(tl.abs(c) < tiny, tiny, c)
+            h = h * d * c
+            step = -(first + m) * (qab + m) * argument / ((first + m2) * (qap + m2))
+            d = 1.0 + step * d
+            d = 1.0 / tl.where(tl.abs(d) < tiny, tiny, d)
+            c = 1.0 + step / c
+            c = tl.where(tl.abs(c) < tiny, tiny, c)
+            h = h * d * c
+        log_beta = (_libdevice.lgamma(a) + tl.full([BLOCK], LGAMMA_HALF, tl.float64)
+                    - _libdevice.lgamma(a + 0.5))
+        log_y = _libdevice.log(tl.maximum(y, tiny))
+        log_direct = (a * _libdevice.log(tl.maximum(x, tiny)) + 0.5 * log_y
+                      - _libdevice.log(a) - log_beta + _libdevice.log(h))
+        upper = 2.0 * _libdevice.exp(-log_beta + 0.5 * log_y + a * _libdevice.log1p(-y)) * h
+        log_reflect = _libdevice.log(tl.minimum(tl.maximum(1.0 - upper, tiny), 1.0))
+        result = -tl.where(reflect, log_reflect, log_direct) * tl.full([BLOCK], INV_LN10, tl.float64)
+        tl.store(out_ptr + offsets, result.to(out_ptr.dtype.element_ty), mask=valid)
+
+
+def neg_log10_p(t, df, out=None):
+    """tails.neg_log10_p_device's result for (rows, cols) t at df broadcasting to it, one launch."""
+    if t.ndim != 2:
+        raise ValueError('t must be (rows, cols)')
+    if not isinstance(df, torch.Tensor) or df.device != t.device:
+        df = torch.as_tensor(df, device=t.device)
+    if df.ndim == 1:
+        df = df.reshape(-1, 1)
+    df = df.expand(t.shape)
+    if out is None:
+        out = torch.empty(t.shape, dtype=torch.float32, device=t.device)
+    if not out.is_contiguous() or out.shape != t.shape:
+        raise ValueError('out must be contiguous and shaped like t')
+    rows, cols = t.shape
+    cells = rows * cols
+    if cells == 0:
+        return out
+    with torch.cuda.device(t.device):
+        _tail_kernel[(triton.cdiv(cells, TAIL_BLOCK),)](
+            t, df, out, cells, cols, t.stride(0), t.stride(1), df.stride(0), df.stride(1),
+            TINY=1e-300, LGAMMA_HALF=_LGAMMA_HALF, INV_LN10=_INV_LN10,
+            ITERATIONS=TAIL_ITERATIONS, BLOCK=TAIL_BLOCK, num_warps=4)
+    return out
