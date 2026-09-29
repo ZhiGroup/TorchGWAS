@@ -11,6 +11,16 @@ for unrelated or appropriately relatedness-filtered individuals. When related
 individuals are retained, a mixed-model association method should be used
 instead.
 
+Missing phenotype values (NaN, or values masked by `--phenotype-outlier-sd`)
+are handled by `--missing-phenotype`:
+- `drop_subject` (default): a sample missing any trait is left out of every
+  trait, so each statistic is ordinary least squares on the kept samples.
+- For grouped JAGWAS each group drops only the subjects its own traits miss.
+- `impute`: the earlier convention, with the trait mean and the trait's own
+  degrees of freedom.
+- `exact`: each trait is tested on its own observed samples, as plink2's
+  `--glm` does per phenotype. Not available for JAGWAS.
+
 ## Features
 
 - Linear association testing for one or more quantitative phenotypes.
@@ -21,6 +31,11 @@ instead.
 - Binary, tiled summary-statistic output for large scans.
 - Optional device-side reductions across traits: significant pairs, the
   minimum-p trait per variant, and the JAGWAS joint test.
+- Fused per-chunk statistics and the -log10 P tail as Triton kernels.
+  - They compile for the GPU present and fall back to PyTorch operations when
+    Triton cannot run.
+  - Hard-call PGEN travels to the GPU as packed two-bit rows.
+  - `TORCHGWAS_STATS_BACKEND=torch|triton` forces a backend.
 
 ## Benchmark
 

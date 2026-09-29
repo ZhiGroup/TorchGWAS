@@ -2081,11 +2081,42 @@ whole rows.
   panel.
 - Stores without `select_samples` (zstd, the hardcall store) refuse
   `drop_subject` when a value is missing; the error names `'impute'`.
-- Grouped JAGWAS drops the union of rows across groups, as outlier masking did
-  before.
+- ~~Grouped JAGWAS drops the union of rows across groups.~~ Done: each group
+  drops its own subjects (below).
 - `'exact'` on a whole-row selection reads calls at the samples' file
   positions (`CompleteCasePlan.at_positions`); on BED it keeps the gathered
   layout, since the plan gathers calls by sample.
+
+### JAGWAS groups drop their own subjects (2026-09-28)
+
+Under `drop_subject` a subject missing, or outlier-masked in, one of a
+group's traits leaves that group only. Groups that share a trait share their
+drops, since a column has one set of rows. Ungrouped JAGWAS keeps the global
+drop, which is the same thing with a single group.
+
+**How:**
+- `api._drop_subjects_by_group` marks each group's missing rows across all
+  its traits. Outlier masking works per value here, then per group.
+- The scan runs with the complete-case plan (`complete_case.py`). Every trait
+  of a group shares one pattern, so each gets its t and pair df on the
+  group's rows. The plan is built over the panel.
+- `jagwas_group_drop.GroupDropJagwas` prepares each group's factor on its
+  kept rows alone, so R, the count and the rounding precision are those of a
+  run of the group alone.
+- Its reduce scores each group at the group's pair df.
+- It is a separate module because `jagwas_projection.py`'s bytes key the
+  recorded factor calibrations (`reduction_tensor_work` `source_sha256`). A
+  first version edited that file and failed the calibration tests.
+- Run metadata records `dropped_subjects_by_group`.
+
+**Checked** (`tests/test_jagwas_group_drop.py`): with complete calls, each
+group's chi2 equals a run of that group alone on files without its dropped
+subjects, to 1e-8 on CPU in FP64 and to float32 on CUDA.
+
+With missing calls a call inside a group's subjects is imputed at the
+variant's mean over every scanned subject rather than the group's own. That
+gave 0.3% here: 3% of calls missing, 2 of 150 subjects dropped. Making it
+exact needs the call-side sums the plan does not gather.
 
 ### Triton statistics: the default CUDA backend (2026-09-28)
 
@@ -2149,10 +2180,60 @@ With three threads at once the host issue stays about 0.12-0.13 ms.
 
 \* The first Triton run in a fresh cache includes compilation.
 
+**The -log10 P tail in Triton (2026-09-28).**
+- `triton_scan.neg_log10_p` is one launch for the same identity and
+  continued fraction, FP64 in registers.
+- It is within 4.6e-10 of scipy, and 3.3e-11 of the Torch stages.
+- A100:
+  - (4096, 1): 0.054 ms GPU and 0.32 ms host;
+  - (4096, 512): 1.92 ms GPU and 0.80 ms host;
+  - against the AOT build's 0.076 / 0.84 and 2.74 / 1.66.
+- `tails.neg_log10_p_device` takes it on any device where it runs and
+  agrees with the eager stages, and `prepare_device_tail` then builds
+  nothing.
+- Without it, a GPU with no AOT build (the 2080 Ti: sm75) ran the tail as
+  ~12 `torch.compile` calls, each holding the GIL through Dynamo's guards.
+  That was 40% of all GIL samples and stopped multi-GPU scaling.
+
+**Scaling without disk or decode** (`benchmarks/synthetic_multigpu_20260928.py`:
+packed rows memcpy'd from a random pool, min-p K = 512, the API's variant
+shards, no writer), us per variant:
+
+| host | tail | 1 GPU | 2 | 3 | 4 | 8 |
+|---|---|---|---|---|---|---|
+| lab-2080ti (load 38) | torch.compile fallback | 3.13 | 3.49 | 2.81 | 3.62 | |
+| lab-2080ti | Triton | 2.87 | 2.19-2.31 | 1.49 | 1.14-2.29 | 2.59-2.81 |
+| lab-h100 (load 22) | Triton | 0.70 | 0.36-0.37 | 0.33-0.34 | 0.32-0.34 | |
+
+- H100: two GPUs give 1.9x. At four, each shard spends 0.72 s of 1.59 on GPU
+  compute (3.7 ms per chunk, up from ~2.7 alone), 0.29 s on results and
+  0.2-0.28 s waiting for input: close to GPU-bound.
+- The pipeline's floor is ~0.33 us per variant, 2.7 s for the full file.
+  The real runs' 5-8 s is therefore decode, disk and writer, to be measured
+  on a quiet host.
+- 2080 Ti: the GIL was idle during the scan without the tail, and the
+  allocator was clean (no retries or frees). Its remaining non-scaling
+  follows CPU scheduling on a loaded host.
+- The GPU price probe now queues a stall ahead of the timed chunk, so a
+  loaded host's launch gaps are not priced as GPU work. Its slope in K is
+  clamped at zero: noise had extrapolated a negative price.
+
+**int8 rows against packed rows, without disk or decode** (same
+benchmark, lab-h100, min-p K = 512), us per variant at 1 / 2 / 4 GPUs:
+- torch on int8: 1.78 / 0.98 / 1.37;
+- Triton on int8: 0.75 / 0.44 / 0.75;
+- Triton on packed (the default): 0.71 / 0.37 / 0.40.
+
+Triton beats Torch on int8 rows at every count, so the full-scale result
+below (Triton int8 slower with four shards) did not come from the
+statistics; it came from that run's reading. With either backend int8 rows
+get slower from two GPUs to four: at 91 MB per chunk, four GPUs pull ~30
+GB/s from host memory. Packed rows, a quarter of the bytes, do not. That is
+why packed is the default.
+
 **Open.**
-- *Triton on int8 rows is slower than Torch with four shards*, though
-  faster per chunk and on one GPU (0.54 against 0.64 s for 200k variants).
-  It is not the default path (packed is). It needs a quiet host.
+- ~~Triton on int8 rows is slower than Torch with four shards.~~ Not the
+  statistics (above). The full-scale gap is in reading; it needs a quiet host.
 - *Four GPUs are still not four times one at K = 512.* One GPU on packed
   rows needs ~1.1 us per variant (8.8 s for the file), and four took
   5.0-8.4 s.
