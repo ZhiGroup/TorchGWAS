@@ -49,18 +49,32 @@ def _missing_options(missing_phenotype, jagwas_panel):
     'impute' (the release convention: the trait mean, t times
     sqrt(trait_df / df), pair df variant_df x trait_df / df) and 'exact'
     (complete-case OLS per trait) both return a plan with the same interface
-    (complete_case.ImputedPlan, CompleteCasePlan). JAGWAS takes the imputed
-    panel as it is: its joint test needs one sample set, which 'exact' would
-    break trait by trait.
+    (complete_case.ImputedPlan, CompleteCasePlan). JAGWAS under 'impute' takes
+    the imputed panel as it is. Under 'exact' each joint test must still have
+    one sample set: the API uses it for JAGWAS groups whose subjects were
+    dropped group by group, so every trait of a group shares its rows
+    (jagwas_group_drop.GroupDropJagwas checks that).
     """
     if missing_phenotype not in MISSING_PHENOTYPE:
         raise ValueError(f"missing_phenotype must be one of {MISSING_PHENOTYPE}")
-    if jagwas_panel:
-        if missing_phenotype == "exact":
-            raise ValueError("JAGWAS needs one sample set; missing_phenotype='exact' tests each trait "
-                             "on its own samples (drop the subjects instead)")
+    if jagwas_panel and missing_phenotype != "exact":
         return {}
     return dict(missing="complete_case" if missing_phenotype == "exact" else "impute", return_plan=True)
+
+
+def _prepare_reduction(reduction, pheno_proc, device, observed_counts, complete_case):
+    """reduction.prepare; a joint test whose groups dropped subjects prepares each on its own rows."""
+    dropped = complete_case is not None and getattr(complete_case, "needs_calls", True)
+    if getattr(reduction, "takes_pair_df", False):  # jagwas_group_drop.GroupDropJagwas
+        return reduction.prepare(pheno_proc, device=device, plan=complete_case if dropped else None)
+    if dropped and getattr(reduction, "mode", None) == "jagwas":
+        raise ValueError("a joint test on subjects dropped by group needs jagwas_group_drop.GroupDropJagwas")
+    return reduction.prepare(pheno_proc, device=device)
+
+
+def _joint_pair_df(reduction, pair_df):
+    """reduce()'s pair_df keyword for a joint test on dropped subjects, else nothing."""
+    return dict(pair_df=pair_df) if pair_df is not None and getattr(reduction, "takes_pair_df", False) else {}
 
 
 def _log10_p_dtype(log10_p):
@@ -802,7 +816,8 @@ def _packed_bed_cuda_iterator(
                     beta_t[:count], t_t[:count], status_t[:count], df_t[:count],
                     reduction_width,
                     **({} if log10_p is None else dict(
-                        log10_p=(None if pair_t is None else pair_t[:count], logp_dtype))))
+                        log10_p=(None if pair_t is None else pair_t[:count], logp_dtype))),
+                    **_joint_pair_df(reduction, None if pair_t is None else pair_t[:count]))
                 if kept:
                     logp_t, pair_t = kept
             elif log10_p is not None:
@@ -1105,7 +1120,9 @@ def linear_scan_multigpu(
         keep = False  # grouped residualisation returns NumPy
     # JAGWAS keeps the imputed panel; everything else tests each trait with
     # missing values on its own samples (complete_case.py).
-    jagwas_panel = reduction_factory is not None or getattr(kwargs.get("reduction"), "mode", None) == "jagwas"
+    # The shards' own reductions say whether this is a joint test (min-p
+    # shards have a factory too).
+    jagwas_panel = getattr(reductions[0], "mode", None) == "jagwas"
     shared_pheno, shared_q, observed, *plan = residualize_and_standardize(
         phenotype, covariates, device=choose_device(devices[0]),
         return_observed_counts=True, keep_on_device=keep, column_groups=column_groups,
@@ -1463,7 +1480,7 @@ def linear_scan_streaming_chunks(
         raise ValueError("jagwas trait count exceeds the residual phenotype rank")
     # Validate rank and missingness before allocating a joint factor.
     if reduction is not None and hasattr(reduction, "prepare"):
-        reduction.prepare(pheno_proc, device=torch_device)
+        _prepare_reduction(reduction, pheno_proc, torch_device, phenotype_observed_counts, complete_case)
     log10_p = None if not compute_log10_p else dict(dtype=log10_p_dtype)
 
     def apply_phenotype_missingness(iterator):
@@ -1578,7 +1595,8 @@ def linear_scan_streaming_chunks(
                                     device=beta_t.device)
                 beta_t, t_chunk_t, index_t, _, _, *kept_pairs = reduction.reduce(
                     beta_t, t_chunk_t, clear, df_chunk_t, width,
-                    **({} if log10_p is None else dict(log10_p=(pair_t, _log10_p_dtype(log10_p)))))
+                    **({} if log10_p is None else dict(log10_p=(pair_t, _log10_p_dtype(log10_p)))),
+                    **_joint_pair_df(reduction, pair_t))
                 index_chunk = index_t.cpu().numpy()
             beta_chunk = beta_t.cpu().numpy() if return_beta else None
             t_chunk = t_chunk_t.cpu().numpy()

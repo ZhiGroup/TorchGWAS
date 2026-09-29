@@ -573,9 +573,11 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                     staged_values = reduction.from_winners(*winners, variant_df, logp_dtype)
                     del winners
                 else:
+                    from .linear import _joint_pair_df
                     staged_values = reduction.reduce(
                         beta, t, status, variant_df, reduction_width,
-                        **({} if log10_p is None else dict(log10_p=(pair_df, logp_dtype))))
+                        **({} if log10_p is None else dict(log10_p=(pair_df, logp_dtype))),
+                        **_joint_pair_df(reduction, pair_df))
                 del beta, t, pair_df
             else:
                 staged_values = (beta if return_beta else None, t, status, variant_df)
