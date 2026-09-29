@@ -407,12 +407,16 @@ def _packed_bed_cuda_iterator(
     # the unselected calls are marked missing (code 01) on the device, so they
     # leave every genotype sum and the observed count, and each design row
     # sits at its sample's stored position. The Torch path gathers instead.
+    # Whole rows cost the unselected samples' prepare, GEMM and design rows,
+    # which the kept work bounds only while at least half the samples are
+    # kept (pgen.py's rule); a sub-cohort gathers.
     selected_samples = getattr(genotype, "_sample_indices", None)
     stored_samples = int(getattr(genotype, "_stored_n_samples", n_samples))
     # Complete-case statistics gather calls by sample, so they need the
     # selected samples' own layout; the imputed rescaling needs no calls.
     gathers_calls = complete_case is not None and getattr(complete_case, "needs_calls", True)
     whole_rows = (selected_samples is not None and not gathers_calls
+                  and 2 * n_samples >= stored_samples
                   and _native_packed_bed_available())
     design_rows = stored_samples if whole_rows else n_samples
     positions_t = bed_keep_t = bed_missing_t = None
