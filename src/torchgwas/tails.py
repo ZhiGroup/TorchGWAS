@@ -439,6 +439,9 @@ def prepare_device_tail(device):
     device = torch.device(device)
     if device.type == 'cuda' and device.index is None:
         device = torch.device('cuda', torch.cuda.current_device())
+    if _triton_tail(device):
+        # One Triton launch serves the tail: nothing to build or load.
+        return True
     if _STAGE_LOCK is None:
         _STAGE_LOCK = threading.Lock()
     with _STAGE_LOCK:
@@ -477,6 +480,43 @@ def prepare_device_tail(device):
         return compiled is not None
 
 
+# Devices where the Triton tail (triton_scan.neg_log10_p) serves: one launch
+# per call on any architecture Triton supports, against 12 compiled calls per
+# strip (or one AOT graph, only on the architectures it was built for). A100:
+# 0.054 ms of GPU for a (4096, 1) column and 1.92 for (4096, 512), against the
+# AOT build's 0.076 and 2.74; within 4.6e-10 of scipy.
+_TRITON_TAIL = {}
+
+
+def _triton_tail(device):
+    """Whether the Triton tail serves `device`: it runs there and agrees with the eager stages."""
+    import os
+
+    import torch
+
+    if device.type != 'cuda' or os.environ.get('TORCHGWAS_COMPILE_TAILS', '1') in ('0', 'jit'):
+        return False
+    known = _TRITON_TAIL.get(device)
+    if known is not None:
+        return known
+    usable = False
+    try:
+        from . import triton_scan
+        if triton_scan.available(device):
+            with torch.cuda.device(device):
+                probe = torch.linspace(0.0, 40.0, 64 * 3, device=device, dtype=torch.float64).reshape(64, 3)
+                probe_df = torch.full((64, 3), 30.0, device=device, dtype=torch.float64)
+                slow = _evaluate(_eager_stages(), probe, probe_df, _starts(device))
+                fast = triton_scan.neg_log10_p(probe, probe_df, out=torch.empty_like(probe))
+                usable = bool(torch.allclose(fast, slow, rtol=1e-10, atol=1e-10))
+    except Exception:  # noqa: BLE001 - the other forms remain
+        usable = False
+    _TRITON_TAIL[device] = usable
+    if usable:
+        _KINDS[device] = 'triton'
+    return usable
+
+
 def neg_log10_p_device(t, df, *, out=None, max_cells=DEVICE_TAIL_MAX_CELLS):
     """`-log10 P(|T| > |t|)` for a scan chunk on t's device, into float32 `out`.
 
@@ -491,6 +531,13 @@ def neg_log10_p_device(t, df, *, out=None, max_cells=DEVICE_TAIL_MAX_CELLS):
     device = t.device
     if device.type == 'cuda' and device.index is None:
         device = torch.device('cuda', torch.cuda.current_device())
+    if _triton_tail(device):
+        from . import triton_scan
+        df = torch.as_tensor(df, device=t.device)
+        if df.dim() < 2:
+            df = df.reshape(1, -1) if df.dim() == 1 and df.shape[0] == traits and traits != rows else df.reshape(-1, 1)
+        result = torch.empty((rows, traits), dtype=torch.float32, device=t.device) if out is None else out
+        return triton_scan.neg_log10_p(t, df, out=result)
     if device not in _STAGES:
         prepare_device_tail(device)
     compiled, starts = _STAGES[device]

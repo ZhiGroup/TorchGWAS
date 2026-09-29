@@ -194,6 +194,11 @@ class ScanDeviceTailTestCase(unittest.TestCase):
         from torchgwas import tails
 
         device = torch.device("cuda", torch.cuda.current_device())
+        # The fallback forms, as a device the Triton tail cannot serve gets them.
+        triton_served = tails._TRITON_TAIL.get(device)
+        tails._TRITON_TAIL[device] = False
+        self.addCleanup(lambda: tails._TRITON_TAIL.__setitem__(device, triton_served)
+                        if triton_served is not None else tails._TRITON_TAIL.pop(device, None))
         tails.prepare_device_tail(device)
         compiled, starts = tails._STAGES[device]
         if compiled is None:
