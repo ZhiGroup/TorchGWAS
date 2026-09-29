@@ -37,9 +37,22 @@ def main():
         done = [0] * count
         stop = threading.Event()
         with source.native_reader_session() as read_into:
+            errors = []
+
             def worker(index):
-                out = np.empty((args.chunk, source.native_row_width), dtype=source.native_transfer_dtype)
+                # 64-byte aligned, as the scan's pinned rows are.
+                shape = (args.chunk, source.native_row_width)
+                size = int(np.prod(shape)) * np.dtype(source.native_transfer_dtype).itemsize
+                raw = np.empty(size + 64, dtype=np.uint8)
+                offset = (-raw.ctypes.data) % 64
+                out = raw[offset:offset + size].view(source.native_transfer_dtype).reshape(shape)
                 position = index
+                try:
+                    run(index, out, position)
+                except Exception as error:  # noqa: BLE001 - reported below
+                    errors.append(repr(error))
+
+            def run(index, out, position):
                 while not stop.is_set():
                     start = (position % chunks) * args.chunk
                     read_into(start, start + args.chunk, out)
@@ -54,6 +67,8 @@ def main():
             for thread in threads:
                 thread.join()
             seconds = time.perf_counter() - began
+        if errors:
+            raise SystemExit(errors[0])
         rate = sum(done) * args.chunk / seconds
         print(json.dumps(dict(threads=count, variants_per_second=round(rate), us_per_variant=round(1e6 / rate, 3),
                               per_thread_us=round(1e6 * count / rate, 3), encoding=source.native_encoding)),
