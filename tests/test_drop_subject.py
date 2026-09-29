@@ -250,6 +250,58 @@ def test_a_minority_selection_matches_its_own_file(tmp_path, monkeypatch, backen
     _assert_same_output(tmp_path / 'selected', tmp_path / 'reference', 3e-5, 3e-6)
 
 
+@pytest.mark.parametrize('count', [60, 30])
+def test_bed_takes_whole_rows_only_for_a_majority(tmp_path, monkeypatch, count):
+    # Whole stored rows cost the unselected samples' prepare, GEMM and design
+    # rows, so a sub-cohort (under half kept) is gathered, as PGEN decides.
+    from torchgwas import linear
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    monkeypatch.delenv('TORCHGWAS_STATS_BACKEND', raising=False)
+    monkeypatch.setenv('TORCHGWAS_BED_NATIVE', '1')
+    if linear._packed_bed_module() is None:
+        pytest.skip('no fused BED kernel on this device')
+    calls, covariates, phenotype = _panel()
+    phenotype = np.nan_to_num(phenotype)
+    chosen = np.sort(np.random.default_rng(5).choice(N, count, replace=False))
+    full, load = _genotype(tmp_path, 'full', 'bed', calls, np.arange(N))
+    subset, _ = _genotype(tmp_path, 'subset', 'bed', calls[chosen], chosen)
+    widths = []
+    original = linear._packed_bed_statistics_native
+
+    def spy(*args, physical_samples=None, **kwargs):
+        widths.append(physical_samples)
+        return original(*args, physical_samples=physical_samples, **kwargs)
+    monkeypatch.setattr(linear, '_packed_bed_statistics_native', spy)
+    options = dict(device='cuda:0', compute_dtype='float32', **load, **COMMON)
+    run_linear_gwas(full, phenotype[chosen], covariates[chosen], sample_ids=[f'I{i}' for i in chosen],
+                    output_dir=tmp_path / 'selected', **options)
+    assert (N in widths) == (2 * count >= N), widths
+    run_linear_gwas(subset, phenotype[chosen], covariates[chosen], output_dir=tmp_path / 'reference', **options)
+    _assert_same_output(tmp_path / 'selected', tmp_path / 'reference', 3e-5, 3e-6)
+
+
+def test_uint8_dosage_rows_mask_the_dropped_subjects_on_torch(tmp_path, monkeypatch):
+    # The uint8 dosage transport's missing code (255) marks every unselected
+    # sample of a whole row; the Torch statistics must read it as missing.
+    pytest.importorskip('pgenlib')
+    options = _backend(monkeypatch, 'cuda-torch')
+    monkeypatch.setenv('TORCHGWAS_PGEN_BACKEND', 'pgenlib')
+    monkeypatch.setenv('TORCHGWAS_STATS_BACKEND', 'torch')
+    monkeypatch.setenv('TORCHGWAS_PGEN_DOSAGE_UINT8', '1')
+    calls, covariates, phenotype = _panel()
+    kept = np.setdiff1d(np.arange(N), MISSING[0])
+    full = _write_pgen(tmp_path / 'full.pgen', calls, None)
+    subset = _write_pgen(tmp_path / 'subset.pgen', calls[kept], kept)
+    load = dict(genotype_format='pgen', pgen_mode='dosage')
+    result = run_linear_gwas(full, phenotype, covariates, output_dir=tmp_path / 'dropped',
+                             **load, **options, **COMMON)
+    assert result.run_metadata['dropped_subjects'] == len(MISSING[0])
+    run_linear_gwas(subset, phenotype[kept], covariates[kept], output_dir=tmp_path / 'reference',
+                    **load, **options, **COMMON)
+    _assert_same_output(tmp_path / 'dropped', tmp_path / 'reference', 3e-5, 3e-6)
+
+
 @pytest.mark.parametrize('backend', ['cuda-torch', 'cuda-native-int8', 'cuda-native-packed'])
 def test_exact_on_whole_rows_matches_its_own_file(tmp_path, monkeypatch, backend):
     # missing_phenotype='exact' gathers calls by sample; on whole rows the plan

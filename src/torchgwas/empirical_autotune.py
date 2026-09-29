@@ -455,20 +455,22 @@ def gpu_seconds_per_variant(device, *, mode, n_samples, n_traits, group_sizes=No
     return seconds
 
 
-def scan_statistics_path(genotype):
-    """The statistics backend a CUDA scan of `genotype` runs, as linear_scan_streaming_chunks dispatches it.
+def scan_statistics_path(genotype, device=None):
+    """The statistics backend a CUDA scan of `genotype` on `device` runs, as linear_scan_streaming_chunks dispatches it.
 
     'bed' (packed PLINK rows, iter_packed_chunks), 'native-pgen2' / 'native-dosage'
     (the fused kernels, TORCHGWAS_NATIVE_STATS=1, packed or byte transport),
+    'triton-pgen2' / 'triton-dosage' (their Triton port, the default),
     'torch' (native dosage transport, torch statistics) or 'generic' (host-decoded
-    float chunks, kernels.linear_chunk_kernel).
+    float chunks, kernels.linear_chunk_kernel). `device` is the scan's: the
+    Triton probe launches there, not on whatever device is current.
     """
     from .scan_gpu import resolve_statistics_backend
     if hasattr(genotype, 'iter_packed_chunks'):
         return 'bed'
     if not getattr(genotype, 'supports_fused_qc', False):
         return 'generic'
-    backend = resolve_statistics_backend()
+    backend = resolve_statistics_backend(device)
     if backend == 'torch':
         return 'torch'
     prefix = 'native' if backend == 'native_fused' else 'triton'

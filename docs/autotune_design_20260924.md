@@ -2180,6 +2180,23 @@ With three threads at once the host issue stays about 0.12-0.13 ms.
 
 \* The first Triton run in a fresh cache includes compilation.
 
+**Full-scale agreement (2026-09-29).**
+- Setup: the default path (Triton statistics, Triton tail, packed rows)
+  against `TORCHGWAS_STATS_BACKEND=torch` (int8 rows, Torch statistics,
+  device tail). First 200,000 variants of the 22,250-sample cohort, one H100.
+- Script: `benchmarks/triton_full_scale_check_20260929.py`.
+- Dense, K = 512 (102.4M cells):
+  - finite cells identical;
+  - largest |Δbeta| 6.0e-8;
+  - |Δt| 1.4e-6 (4.2e-7 relative);
+  - |Δ(-log10 P)| 2.9e-6 (7.1e-7 relative), at -log10 P up to 8.05.
+- min-p, K = 512 and K = 8,192:
+  - the same variants;
+  - 100% winner agreement;
+  - -log10 P within 6.5e-7 and 6.6e-7 relative;
+  - |Δt| of the winners 1.4e-6.
+- So the default matches Torch to float32 rounding at full scale.
+
 **The -log10 P tail in Triton (2026-09-28).**
 - `triton_scan.neg_log10_p` is one launch for the same identity and
   continued fraction, FP64 in registers.

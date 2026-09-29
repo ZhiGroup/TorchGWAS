@@ -618,10 +618,16 @@ def test_the_statistics_path_follows_the_scan_dispatch(monkeypatch):
     monkeypatch.setenv('TORCHGWAS_NATIVE_STATS', '0')
     assert scan_statistics_path(Native()) == 'torch'
     import torchgwas.scan_gpu as scan_gpu
-    monkeypatch.setattr(scan_gpu, 'resolve_statistics_backend', lambda: 'native_fused')
-    assert scan_statistics_path(Native()) == 'native-pgen2'
+    probed = []
+    # The backend is resolved on the scan's device, not the current one.
+    monkeypatch.setattr(scan_gpu, 'resolve_statistics_backend',
+                        lambda device=None: probed.append(device) or 'native_fused')
+    assert scan_statistics_path(Native(), 'cuda:3') == 'native-pgen2'
+    assert probed == ['cuda:3']
     Native.native_encoding = 'dosage'
     assert scan_statistics_path(Native()) == 'native-dosage'
+    monkeypatch.setattr(scan_gpu, 'resolve_statistics_backend', lambda device=None: 'triton')
+    assert scan_statistics_path(Native()) == 'triton-dosage'
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')

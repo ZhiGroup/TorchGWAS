@@ -37,6 +37,10 @@ class GroupDropJagwas(JagwasGroups):
             if columns.min() < 0 or columns.max() >= traits:
                 raise ValueError(f"jagwas group {name} refers outside the {traits} scanned traits")
         self._indices = []
+        # Each group's first column as a host int: reading it from the device
+        # index inside reduce() would sync the compute stream once per group
+        # per chunk.
+        self._first_columns = []
         for name, columns, reduction in zip(self.names, self.columns, self.reductions):
             missing = _group_missing_rows(plan, name, columns)
             kept = np.setdiff1d(np.arange(samples), missing)
@@ -44,13 +48,14 @@ class GroupDropJagwas(JagwasGroups):
             index = torch.as_tensor(columns, dtype=torch.int64, device=matrix.device)
             reduction.prepare(matrix.index_select(0, rows).index_select(1, index))
             self._indices.append(index)
+            self._first_columns.append(int(columns[0]))
         return self
 
     def reduce(self, beta, t, status, variant_df, width, pair_df=None):
         """(chunk, K) t of the whole panel in, (chunk, groups) T out; each group at its own df."""
         statistic = []
-        for reduction, index in zip(self.reductions, self._indices):
-            group_df = variant_df if pair_df is None else pair_df[:, int(index[0])].to(variant_df.dtype)
+        for reduction, index, first in zip(self.reductions, self._indices, self._first_columns):
+            group_df = variant_df if pair_df is None else pair_df[:, first].to(variant_df.dtype)
             statistic.append(reduction.reduce(beta, t.index_select(1, index), status, group_df, 1)[1])
         statistic = torch.cat(statistic, dim=1)
         return (torch.full_like(statistic, float("nan"), dtype=beta.dtype),

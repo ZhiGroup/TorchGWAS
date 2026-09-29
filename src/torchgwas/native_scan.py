@@ -510,7 +510,13 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                     genotype_t = torch.where(genotype_t == -9, torch.nan,
                                              genotype_t.to(torch.float32))
                 elif not native_statistics and transfer_dtype == torch.uint8:
-                    genotype_t = genotype_t.to(torch.float32) / float(source.native_scale)
+                    raw = genotype_t
+                    genotype_t = raw.to(torch.float32) / float(source.native_scale)
+                    # PGEN's uint8 dosage keeps 255 free as its missing code
+                    # (pgen.py); whole rows put it at every unselected sample.
+                    sentinel = getattr(source, 'native_missing_value', None)
+                    if sentinel is not None:
+                        genotype_t = torch.where(raw == sentinel, torch.nan, genotype_t)
                 elif (not native_statistics and getattr(source, 'allows_direct_native_fill', False) and
                       getattr(source, 'native_missing_value', None) is not None):
                     genotype_t = torch.where(genotype_t == source.native_missing_value,
