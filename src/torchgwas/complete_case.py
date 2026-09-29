@@ -21,7 +21,12 @@ almost for free:
 - df = (samples in S with the call observed) - rank(Z_S) - 1.
 
 Calls missing inside S keep the scan's convention: centred at the variant's
-observed mean (zero), df reduced by one each.
+observed mean (zero), df reduced by one each. That mean is over every scanned
+sample, not over S alone, so with missing calls the statistic differs a
+little from a run on S's samples only (0.3% of a JAGWAS chi2 at 3% of calls
+missing and 2 of 150 subjects dropped; tests/test_jagwas_group_drop.py).
+Making it S's mean needs the call-side sums over each variant's missing
+calls, which the plan does not gather.
 
 Measured (benchmarks/missing_phenotype_conventions_20260927.py, relative
 error of -log10 P against FP64 lstsq on the observed rows): this formula 0

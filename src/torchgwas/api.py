@@ -115,6 +115,54 @@ def _select_chunked_samples(genotype, genotype_sample_ids, requested_sample_ids)
     return genotype, genotype_sample_ids, stored
 
 
+def _drop_subjects_by_group(phenotype, jagwas_groups):
+    """drop_subject for JAGWAS groups: a subject missing a group's trait leaves that group only.
+
+    Each group's missing rows become missing across all its traits, so the
+    group's joint test runs on one sample set: the subjects its own traits
+    observe. Groups that share a trait share their drops (a column has one
+    set of rows). Returns the panel and each group's dropped count; the
+    panel is copied only when something is marked.
+    """
+    groups = [tuple(group) for group in (jagwas_groups.items() if isinstance(jagwas_groups, dict)
+                                          else jagwas_groups)]
+    names = [str(group[0]) for group in groups]
+    columns = [np.asarray(group[1], dtype=np.int64).reshape(-1) for group in groups]
+    missing = [np.isnan(np.asarray(phenotype[:, cols], dtype=np.float64)).any(axis=1) for cols in columns]
+    # Overlapping groups: one component, one set of drops.
+    parent = list(range(len(groups)))
+
+    def root(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            if np.intersect1d(columns[i], columns[j]).size:
+                parent[root(i)] = root(j)
+    components = {}
+    for index in range(len(groups)):
+        components.setdefault(root(index), []).append(index)
+    marked = None
+    dropped = {}
+    for members in components.values():
+        rows = np.logical_or.reduce([missing[index] for index in members])
+        cols = np.unique(np.concatenate([columns[index] for index in members]))
+        for index in members:
+            dropped[names[index]] = int(rows.sum())
+        if not rows.any():
+            continue
+        block = np.asarray(phenotype[np.ix_(np.flatnonzero(rows), cols)], dtype=np.float64)
+        if np.isnan(block).all():
+            continue
+        if marked is None:
+            marked = np.array(phenotype, dtype=np.result_type(np.asarray(phenotype[:0]).dtype, np.float32),
+                              copy=True)
+        marked[np.ix_(np.flatnonzero(rows), cols)] = np.nan
+    return (phenotype if marked is None else marked), dropped
+
+
 def _drop_subjects_missing_phenotypes(phenotype, covariates, genotype, sample_ids):
     """Remove every sample with a missing phenotype value from all inputs.
 
@@ -857,18 +905,28 @@ def run_linear_gwas(
         )
     else:
         covariates = _coerce_array_or_path(covariates)
+    # JAGWAS groups under drop_subject drop subjects group by group: each
+    # joint test keeps every subject its own traits observe.
+    grouped_drop = missing_phenotype == "drop_subject" and reduce == "jagwas" and jagwas_groups is not None
     outlier_rows = None
     if phenotype_outlier_sd is not None:
         from .preprocess import mask_phenotype_outliers
         phenotype, outlier_rows = mask_phenotype_outliers(
             phenotype, None if covariates is None else np.asarray(covariates), float(phenotype_outlier_sd),
-            whole_rows=reduce == "jagwas" or missing_phenotype == "drop_subject")
+            whole_rows=not grouped_drop and (reduce == "jagwas" or missing_phenotype == "drop_subject"))
     dropped_subjects = 0
-    if missing_phenotype == "drop_subject":
-        phenotype, covariates, genotype, sample_ids, dropped_subjects = _drop_subjects_missing_phenotypes(
-            phenotype, covariates, genotype, sample_ids)
+    dropped_by_group = None
     # What the scans do with a missing value: none remains after a drop.
     scan_missing = "exact" if missing_phenotype == "exact" else "impute"
+    if grouped_drop:
+        phenotype, dropped_by_group = _drop_subjects_by_group(phenotype, jagwas_groups)
+        dropped_subjects = int(max(dropped_by_group.values(), default=0))
+        if dropped_subjects:
+            # Complete-case statistics on each group's own rows (complete_case.py).
+            scan_missing = "exact"
+    elif missing_phenotype == "drop_subject":
+        phenotype, covariates, genotype, sample_ids, dropped_subjects = _drop_subjects_missing_phenotypes(
+            phenotype, covariates, genotype, sample_ids)
     if empirical is not None and not isinstance(genotype, ChunkedGenotype):
         # An in-memory genotype array runs one in-memory scan: nothing to tune.
         empirical.update(sizes=None, layout=dict(why=['in-memory genotype array: no streaming scan to tune']),
@@ -1069,6 +1127,9 @@ def run_linear_gwas(
         if reduce_top_k is not None:
             raise ValueError("reduce_top_k does not apply to 'jagwas'")
         from .jagwas_projection import JagwasGroups, JagwasReduction
+        # Groups that dropped subjects each run on their own rows.
+        if grouped_drop and dropped_subjects:
+            from .jagwas_group_drop import GroupDropJagwas as JagwasGroups
         jagwas = (JagwasReduction(rcond=jagwas_rcond, min_residual=jagwas_min_residual)
                   if jagwas_groups is None else
                   JagwasGroups(jagwas_groups, rcond=jagwas_rcond, min_residual=jagwas_min_residual))
@@ -1479,7 +1540,7 @@ def run_linear_gwas(
                 if not kept:
                     raise ValueError(f"jagwas group {name} has no trait left after phenotype QC")
                 remapped.append((name, kept, cutoff))
-            jagwas = reduction = JagwasGroups(remapped)
+            jagwas = reduction = type(jagwas)(remapped)
         genotype_shape = list(genotype.shape)
         # A ranged scan reports on its range, not on the file. The variant count
         # and the marker names both have to be narrowed here, or the sumstats
@@ -2281,8 +2342,10 @@ def run_linear_gwas(
         "phenotype_outlier_sd": phenotype_outlier_sd,
         "phenotype_outlier_rows": None if outlier_rows is None else int(outlier_rows.sum()),
         "missing_phenotype": missing_phenotype,
-        # Samples left out of every trait for a missing or outlier-masked value.
+        # Samples left out of every trait for a missing or outlier-masked value
+        # (for JAGWAS groups, the most any one group lost).
         "dropped_subjects": dropped_subjects,
+        "dropped_subjects_by_group": dropped_by_group,
         # Recorded because it changes how many passes the run made over the
         # genotypes, which is the first thing to check against a wall time.
         "trait_block": None if trait_block is None else int(trait_block),

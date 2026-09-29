@@ -532,8 +532,6 @@ def residualize_and_standardize(
     if column_groups is not None:
         if inplace:
             raise ValueError("column_groups cannot be combined with inplace=True")
-        if missing != "impute" or return_plan:
-            raise ValueError("column_groups (JAGWAS groups) use the imputed panel")
         groups = [np.asarray(columns, dtype=np.int64).reshape(-1) for columns in column_groups]
         uncovered = np.setdiff1d(np.arange(phenotype.shape[1]),
                                  np.concatenate(groups) if groups else np.empty(0, np.int64))
@@ -552,8 +550,28 @@ def residualize_and_standardize(
                 out = np.empty(phenotype.shape, dtype=block.dtype)
             out[:, columns] = block
             counts[columns] = block_counts
+        plan = None
+        if missing == "complete_case" and np.any(counts != phenotype.shape[0]):
+            # Per-group subject drops (JAGWAS groups under drop_subject): one
+            # plan over the panel, each trait with missing values residualized
+            # on its own rows -- per trait, so it is what a run of its group
+            # alone would give.
+            from .complete_case import CompleteCasePlan
+            observed = np.ones(phenotype.shape, dtype=bool)
+            for start in range(0, phenotype.shape[1], max(1, int(trait_block))):
+                stop = min(start + max(1, int(trait_block)), phenotype.shape[1])
+                observed[:, start:stop] = ~np.isnan(np.asarray(phenotype[:, start:stop], dtype=np.float64))
+            plan = CompleteCasePlan(observed, group_q)
+            for trait in plan.traits:
+                values = np.array(phenotype[:, int(trait)], dtype=np.float64)
+                out[:, int(trait)] = plan.residualize(values, int(trait)).astype(out.dtype, copy=False)
+        elif return_plan and missing == "impute" and np.any(counts != phenotype.shape[0]):
+            from .complete_case import ImputedPlan
+            plan = ImputedPlan(counts, 0 if group_q is None else group_q.shape[1], phenotype.shape[0])
         result = (out, group_q)
-        return (*result, counts) if return_observed_counts else result
+        if return_observed_counts:
+            result = (*result, counts)
+        return (*result, plan) if return_plan else result
 
     q_matrix = None
     if _prevalidated_covariate_basis is not ...:
