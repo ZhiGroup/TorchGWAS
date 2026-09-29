@@ -2231,6 +2231,24 @@ get slower from two GPUs to four: at 91 MB per chunk, four GPUs pull ~30
 GB/s from host memory. Packed rows, a quarter of the bytes, do not. That is
 why packed is the default.
 
+**Real data, with the pipeline no longer the limit** (lab-h100, load 25-30,
+page cache warm, K = 512 min-p, GPUs 0, 1, 5 and 6, executor seconds):
+
+| | 1 GPU | 2 | 4 |
+|---|---|---|---|
+| shards' chunks consumed, no writer (`multigpu_consume_20260928.py`) | 8.24 | 4.44 | 4.91 |
+| the API (writer included), 4 readers per GPU, depth 4 | | 6.64, 4.65 | 5.61, 5.61, 5.11, 5.20 |
+| the API, 8 readers per GPU, depth 8 / 16 | | | 7.48 / 7.16 |
+| synthetic source: no decode, no disk | 5.7 | 3.0 | 2.7 |
+
+- The writer adds 0.2-0.7 s.
+- Decode adds ~0.3 us per variant and stops scaling past two GPUs: 16
+  decoder threads do no better than 8, and 32 are slower. So the K = 512
+  limit is now host decode, ~4 us per variant per decoder thread, bounded by
+  the CPU this shared host leaves free, not by the ring depth.
+- Next: decode-only thread scaling on a quiet host; if it is CPU-bound, make
+  plain two-bit records skip the decoder (read straight into the pinned row).
+
 **Open.**
 - ~~Triton on int8 rows is slower than Torch with four shards.~~ Not the
   statistics (above). The full-scale gap is in reading; it needs a quiet host.
