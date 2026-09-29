@@ -2246,8 +2246,20 @@ page cache warm, K = 512 min-p, GPUs 0, 1, 5 and 6, executor seconds):
   decoder threads do no better than 8, and 32 are slower. So the K = 512
   limit is now host decode, ~4 us per variant per decoder thread, bounded by
   the CPU this shared host leaves free, not by the ring depth.
-- Next: decode-only thread scaling on a quiet host; if it is CPU-bound, make
-  plain two-bit records skip the decoder (read straight into the pinned row).
+- Decode alone scales (`decode_thread_scaling_20260928.py`, warm cache): 1.93
+  us per variant on one thread, 1.02 / 0.53 / 0.27 / 0.166 on 2 / 4 / 8 / 16,
+  i.e. 1.35 s for the file at 16 threads. The pipeline alone reaches 0.33 us
+  per variant (synthetic). Together at four GPUs they run 0.61: the loss is
+  in their interaction, not in either one.
+- Per-shard profiles (consume-only):
+  - two GPUs: each shard waits 1.8 s for its loader, GPU compute 2.8 ms per
+    chunk (as alone), result copies 0.06 s;
+  - four GPUs: loader waits 0.5-0.8 s, GPU compute stretches to 3.8-4.4 ms
+    per chunk, and result copies (min-p: ~50 KB) jump to 1.2-1.5 ms per
+    chunk; ~1.5 s per shard is outside every profiled stage.
+- That points at the host side under contention: two other GPUs on this
+  host ran another user's jobs at 98%, at load ~30. It needs the quiet host,
+  with an nsys timeline of one shard.
 
 **Open.**
 - ~~Triton on int8 rows is slower than Torch with four shards.~~ Not the
