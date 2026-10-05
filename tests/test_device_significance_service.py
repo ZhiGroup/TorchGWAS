@@ -9,7 +9,7 @@ from torchgwas.device_significance_work import device_significant_tensor_work
 
 @pytest.mark.parametrize('shape,counts', [((13,7,17),[0]*7),((13,7,17),[1]*7),((1,37,11),[0,1,2,4])])
 def test_all_source_calls_resolve_to_available_fixed_primitives(shape, counts):
-    from direct_device_significance_primitives import build_bank
+    build_bank = pytest.importorskip('direct_device_significance_primitives').build_bank
     b,k,limit = shape
     work = device_significant_tensor_work(40,b,k,counts,max_cells=limit)
     resolved = device_selection_host_primitives(work)
@@ -35,7 +35,7 @@ def test_unknown_source_call_is_not_assigned_a_generic_price():
 def test_fixed_cpu_bank_matches_source_aten_dispatch_for_noncopy_calls():
     import torch
     from torch.utils._python_dispatch import TorchDispatchMode
-    from direct_device_significance_primitives import build_bank
+    build_bank = pytest.importorskip('direct_device_significance_primitives').build_bank
 
     class Record(TorchDispatchMode):
         def __init__(self): self.ops = []

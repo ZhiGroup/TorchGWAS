@@ -7,6 +7,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torchgwas.reduction_tensor_work import jagwas_tensor_work,jagwas_host_primitive_name
 
 path=Path(__file__).parents[1]/'benchmarks'/'direct_jagwas_host_primitives.py'
+if not path.exists():
+    pytest.skip(f'benchmarks/{path.name} is not in this repository',allow_module_level=True)
 spec=importlib.util.spec_from_file_location('joint_primitive_bank',path)
 bank_module=importlib.util.module_from_spec(spec);spec.loader.exec_module(bank_module)
 

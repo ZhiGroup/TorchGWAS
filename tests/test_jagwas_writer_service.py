@@ -7,8 +7,16 @@ from torchgwas.reduced_output_work import jagwas_writer_work,jagwas_host_selecti
 from test_jagwas_schedule import shard,run
 
 path=Path(__file__).parents[1]/'benchmarks'/'direct_jagwas_writer_primitives_20260921.py'
-spec=importlib.util.spec_from_file_location('joint_writer_primitives',path)
-module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+
+
+def writer_primitives():
+    # A benchmark script outside the repository: only the test that needs it
+    # skips, so the modules importing bank() and archive() still run.
+    if not path.exists():
+        pytest.skip(f'benchmarks/{path.name} is not in this repository')
+    spec=importlib.util.spec_from_file_location('joint_writer_primitives',path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    return module
 
 
 def bank():
@@ -28,7 +36,7 @@ def archive():
 @pytest.mark.parametrize('count',[1,37,65536])
 def test_seekable_npz_header_rewrites_match_actual_numpy_submission(count):
     work=jagwas_writer_work(count,count);part=work['part']
-    sink=module.CountingFile()
+    sink=writer_primitives().CountingFile()
     np.savez(sink,variant_index=np.arange(count,dtype=np.int64),chi2=np.ones(count,np.float64))
     assert sink.size==part['file_bytes']
     assert sink.written==part['file_bytes']+sum(row['local_header_bytes'] for row in part['arrays'])
