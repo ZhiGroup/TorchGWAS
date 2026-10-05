@@ -131,6 +131,52 @@ def test_in_memory_arrays_drop_subjects(tmp_path):
     _assert_same_output(tmp_path / 'dropped', tmp_path / 'reference', 1e-10, 1e-10)
 
 
+@pytest.mark.parametrize('outlier_sd', [None, 4.0])
+def test_a_one_dimensional_trait_drops_like_one_column(tmp_path, outlier_sd):
+    # np.loadtxt returns a one-column phenotype file 1-D; the default policy
+    # must treat it as the single column it is.
+    calls, covariates, phenotype = _panel(missing_calls=False)
+    trait = np.nan_to_num(phenotype[:, 1])
+    trait[[2, 40]] = np.nan
+    trait[30] = 40.0
+    options = dict(device='cpu', compute_dtype='float64', chunk_size=4, phenotype_outlier_sd=outlier_sd)
+    flat = run_linear_gwas(_dosage(calls), trait, covariates, output_dir=tmp_path / 'flat', **options)
+    column = run_linear_gwas(_dosage(calls), trait[:, None], covariates, output_dir=tmp_path / 'column', **options)
+    assert flat.run_metadata['dropped_subjects'] == column.run_metadata['dropped_subjects'] == 2 + (outlier_sd is not None)
+    _assert_same_output(tmp_path / 'flat', tmp_path / 'column', 0, 0)
+
+
+@pytest.mark.parametrize('streamed', [False, True])
+def test_filtered_output_uses_each_pairs_own_df(tmp_path, monkeypatch, streamed):
+    # 'exact' tests a trait on its own observed subjects, so a pair's df is
+    # below the complete-panel df. The filtered store must select and report
+    # -log10 P at the pair's df, as the dense store does.
+    from torchgwas.sumstats_indexed import open_indexed_sumstats
+    calls, covariates, phenotype = _panel(missing_calls=False)
+    phenotype[:30, 0] = np.nan
+    if streamed:
+        options = _backend(monkeypatch, 'cpu')
+        genotype, load = _genotype(tmp_path, 'g', 'pgen', calls, None)
+    else:
+        options, genotype, load = dict(device='cpu', compute_dtype='float64'), _dosage(calls), {}
+    common = dict(missing_phenotype='exact', chunk_size=4, **load, **options)
+    run_linear_gwas(genotype, phenotype, covariates, output_dir=tmp_path / 'dense', **common)
+    run_linear_gwas(genotype, phenotype, covariates, output_dir=tmp_path / 'filtered',
+                    p_value_threshold=0.5, **common)
+    _, t, logp, _ = open_binary_sumstats(tmp_path / 'dense' / 'sumstats')
+    t, logp = np.asarray(t), np.asarray(logp)
+    expected = np.isfinite(t) & (logp >= -np.log10(0.5))
+    assert 0 < expected.sum() < expected.size and expected[:, 0].any()
+    _, parts = open_indexed_sumstats(tmp_path / 'filtered' / 'sumstats')
+    parts = list(parts)
+    vi = np.concatenate([part['variant_index'] for part in parts])
+    ti = np.concatenate([part['trait_index'] for part in parts])
+    kept = np.zeros_like(expected)
+    kept[vi, ti] = True
+    np.testing.assert_array_equal(kept, expected)
+    np.testing.assert_allclose(np.concatenate([part['neg_log10_p'] for part in parts]), logp[vi, ti], rtol=1e-6)
+
+
 def test_outlier_rows_leave_every_trait(tmp_path, monkeypatch):
     options = _backend(monkeypatch, 'cpu')
     calls, covariates, phenotype = _panel(missing_calls=False)

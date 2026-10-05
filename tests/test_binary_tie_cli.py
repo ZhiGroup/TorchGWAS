@@ -2,7 +2,7 @@ import copy,sys
 from pathlib import Path
 import pytest
 sys.path.insert(0,str(Path(__file__).parents[1]/'benchmarks'))
-from direct_binary_ties import validate_profile
+validate_profile=pytest.importorskip('direct_binary_ties').validate_profile
 
 
 def test_profile_rejects_unsupported_geometry_and_incomplete_record_counts():

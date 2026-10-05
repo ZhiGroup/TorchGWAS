@@ -2,7 +2,10 @@
 import importlib.util
 from pathlib import Path
 import pytest
-spec=importlib.util.spec_from_file_location('cpu_pressure',Path(__file__).resolve().parents[1]/'benchmarks/direct_calculator_cpu_pressure.py')
+source=Path(__file__).resolve().parents[1]/'benchmarks/direct_calculator_cpu_pressure.py'
+if not source.exists():
+    pytest.skip(f'benchmarks/{source.name} is not in this repository',allow_module_level=True)
+spec=importlib.util.spec_from_file_location('cpu_pressure',source)
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 def test_guest_ticks_are_not_double_counted():

@@ -346,8 +346,9 @@ class PgenDosageSource:
 
     The output dosage is the count of ALT1 (PVAR ``ALT``), while PVAR ``REF``
     is the other allele. In ``hardcall`` mode calls 0/1/2 map exactly to
-    uint8 codes 0/128/255. A variant is excluded when any selected sample is
-    missing; invalid calls are also excluded and reported.
+    uint8 codes 0/128/255. A missing call is kept and given its variant's
+    observed mean (`_fill_masked_codes`); a variant with an invalid call, or
+    with no observed call, is excluded and reported.
 
     The default ``auto`` mode uses contiguous dosage reads for both dosage and
     hardcall PGENs. ``auto`` and ``dosage`` require an installed pgenlib with
@@ -696,7 +697,7 @@ class PgenDosageSource:
         code_parts: deque[np.ndarray] = deque()
         index_parts: deque[np.ndarray] = deque()
         buffered = 0
-        emitted = first
+        emitted = 0
         kept: list[np.ndarray] = []
 
         def take(count: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1104,7 +1105,10 @@ class PgenGenotype(PgenDosageSource):
                     # 127.0 and not zstd's 127.5: codes span 0..254 and the
                     # top code stays free, so a masked call keeps its identity
                     # and the per-variant residual df stays exact.
-                    missing = np.isnan(values)
+                    # pgenlib writes -9 for a missing dosage, not NaN (the
+                    # float32 transport keeps that -9); clipping it would
+                    # store a missing call as dosage 0.
+                    missing = (values == -9.0) | np.isnan(values)
                     np.clip(values, 0.0, 2.0, out=values)
                     np.multiply(values, 127.0, out=values)
                     np.rint(values, out=values)

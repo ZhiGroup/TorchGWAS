@@ -227,29 +227,21 @@ def _read_bim_fast(path: Path):
 def _make_a2_dosage_lut() -> np.ndarray:
     """Decode PLINK 1 two-bit calls as BIM-column-6 (A2) dosage.
 
-    **This counts A1, and it used to count A2.** A correctness fix, not a
-    preference: the PGEN reader emits "the count of ALT1 (PVAR ALT)", and in a
-    `.bim` written from a `.pvar` the A1 column *is* ALT, so the two readers
-    were counting opposite alleles. Measured on the benchmark cohort before
-    the fix, per-variant mean dosage summed to **exactly 2.0000** between the
-    two paths on every variant -- `dosage_bed = 2 - dosage_pgen`. The same tool
-    therefore reported betas of opposite sign for the same data depending on
-    whether it was handed a `.bed` or a `.pgen`, with nothing in the output
-    naming the allele.
+    This counts A2 and the reader declares A2 as `effect_allele`, which is
+    the contract tests/test_effect_allele_contract.py pins: a beta is per copy
+    of the declared allele. PGEN counts and declares ALT, and in a `.bim`
+    written from a `.pvar` A1 is ALT, so the same cohort read as `.bed` and as
+    `.pgen` gives betas of opposite sign, each labelled by its effect_allele.
+    Flipping this table alone would count A1 while announcing A2.
 
-    A1 is the target because it is what everything else already does: PGEN
-    counts ALT, and plink2's `--glm` reports per copy of A1/ALT by default.
-    Counting A2 made this reader the only dissenter.
-
-    The GPU kernels carry the same table and are changed with it --
-    `decode_two_bit` in `scan_statistics.cu` and `fused_scan.cu`. Changing one
-    without the other would be worse than leaving both wrong, because the
-    disagreement would then depend on which device the scan happened to pick.
+    The GPU kernels carry the same table -- `decode_two_bit` in
+    `scan_statistics.cu` and `fused_scan.cu` -- and must change with it, or
+    the counted allele would depend on which device ran the scan.
     """
 
     # PLINK codes, least-significant pair first:
     # PLINK specification: 00=A1/A1, 01=missing, 10=A1/A2, 11=A2/A2.
-    # A1 dosage is therefore 2, missing, 1, 0 -- the reverse of the A2 reading.
+    # A2 dosage is therefore 0, missing, 1, 2.
     code_to_a2 = np.asarray([0.0, np.nan, 1.0, 2.0], dtype=np.float32)
     lut = np.empty((256, 4), dtype=np.float32)
     for byte in range(256):

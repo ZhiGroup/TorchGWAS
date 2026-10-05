@@ -1,7 +1,11 @@
 import copy,json,sys,unittest
 from pathlib import Path
+import pytest
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'benchmarks'),str(ROOT/'src')]
+# The models and their paper/ inputs are not in this repository.
+for _name in ('direct_nm_model','direct_missing_marker_ties','direct_marker_ties'):
+    pytest.importorskip(_name)
 from direct_nm_model import evaluator,subject_profile
 from direct_missing_marker_ties import apply_missingness
 from direct_marker_ties import predict,crossings

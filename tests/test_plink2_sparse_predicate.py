@@ -32,7 +32,9 @@ from torchgwas.pgen_reader import pack_genovec  # noqa: E402
 
 def _load():
     path = pathlib.Path(__file__).resolve().parents[1] / "benchmarks" / "direct_plink2_sparse_predicate.py"
-    spec = importlib.util.spec_from_file_location("plink2_sparse_predicate", path)
+    if not path.exists():
+        raise unittest.SkipTest(f"benchmarks/{path.name} is not in this repository")
+    spec =importlib.util.spec_from_file_location("plink2_sparse_predicate", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)

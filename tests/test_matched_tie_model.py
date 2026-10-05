@@ -2,7 +2,8 @@ import sys
 from pathlib import Path
 import pytest
 sys.path.insert(0,str(Path(__file__).parents[1]/'benchmarks'))
-from direct_matched_tie_model import integer_crossings,validation_traits
+_model=pytest.importorskip('direct_matched_tie_model')
+integer_crossings,validation_traits=_model.integer_crossings,_model.validation_traits
 
 def test_discrete_crossing_and_validation_neighbors():
  rows=[{'traits':k,'torchGWAS':10.,'fast':float(3*k)} for k in range(1,9)]

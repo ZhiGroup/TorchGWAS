@@ -218,6 +218,15 @@ def write_indexed_sumstats(directory,marker_names,trait_names,n_samples,chunks,
     add(values,start,end)
     continue
    beta=np.asarray(chunk[2]);t=np.asarray(chunk[3]);keep=np.isfinite(t)
+   if kind=='filtered' and len(chunk)>=6 and chunk[5] is not None:
+    # (start, end, beta, t, p, -log10 P[, df]): the scan's -log10 P is at
+    # each pair's own df; `df` here is only the complete-panel residual df.
+    logp=np.asarray(chunk[5])
+    if p_value_threshold is not None:keep &= logp>=-np.log10(p_value_threshold)
+    vi,ti=np.nonzero(keep)
+    add({'variant_index':(start+vi).astype(np.int64),'trait_index':ti.astype(np.int64),'beta':beta[vi,ti],'t_stat':t[vi,ti],
+         'neg_log10_p':logp[vi,ti].astype(np.float32)},start,end)
+    continue
    if critical is not None:keep &= np.abs(t)>=critical
    vi,ti=np.nonzero(keep)
    trait_index=np.asarray(chunk[5])[vi,ti] if kind=='reduced' else ti

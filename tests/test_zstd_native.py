@@ -238,6 +238,8 @@ class ZstdNativeTests(unittest.TestCase):
 
     def test_lowrank_prefix_subframes_ring_and_close(self):
         file = Path(__file__).resolve().parents[1] / 'lowrank' / 'zstore.py'
+        if not file.exists():
+            self.skipTest('lowrank/zstore.py is not in this repository')
         spec = importlib.util.spec_from_file_location('lowrank_zstore_test', file)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 import pytest
 sys.path.insert(0,str(Path(__file__).parents[1]/'benchmarks'))
-from direct_marker_ties import crossings
+crossings=pytest.importorskip('direct_marker_ties').crossings
 
 def test_bisection_returns_marker_and_product_brackets():
     result=crossings(lambda m:{'samples':2000,'torchGWAS':10+m*.00001,'PLINK2':m*.00002},'PLINK2',minimum=1000,maximum=2000000,tolerance=10)

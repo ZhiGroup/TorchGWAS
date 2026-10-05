@@ -17,6 +17,7 @@ class NativeStatisticsTests(unittest.TestCase):
         raw[4, 0] = 3
         raw[5, :2] = [np.nan, 3]
         raw[6, 0] = -np.inf
+        raw[7, 4:] = np.nan  # four called samples: df = 4 - 3 - 2 < 0
         device_raw = torch.as_tensor(raw, device='cuda')
         design = torch.as_tensor(rng.normal(size=(129, 6)).astype(np.float32) / np.float32(np.sqrt(129)), device='cuda')
         phenotype_ss = torch.ones(3, device='cuda')
@@ -33,7 +34,7 @@ class NativeStatisticsTests(unittest.TestCase):
         # rejected on the merits of its remaining value (3, out of range)
         # rather than pre-empted by the missing call. Rows 2 and 6 hold an
         # infinity, which is not missing and is not masked.
-        np.testing.assert_array_equal(status.cpu().numpy()[1:7], [0, 3, 2, 3, 3, 3])
+        np.testing.assert_array_equal(status.cpu().numpy()[1:8], [0, 3, 2, 3, 3, 3, 2])
         valid = status.cpu().numpy() == 0
         for actual, reference in zip((beta, statistic), expected[:2]):
             np.testing.assert_allclose(actual.cpu().numpy()[valid], reference.cpu().numpy()[valid], rtol=2e-4, atol=2e-5)
@@ -73,6 +74,20 @@ class NativeStatisticsTests(unittest.TestCase):
             with np.errstate(invalid='ignore'):
                 np.testing.assert_allclose(lo.cpu(), np.nanmin(expected, axis=1), rtol=1e-6, equal_nan=True)
                 np.testing.assert_allclose(hi.cpu(), np.nanmax(expected, axis=1), rtol=1e-6, equal_nan=True)
+
+
+class TorchStatisticsTests(unittest.TestCase):
+    def test_too_few_called_samples_is_invalid_as_in_the_kernels(self):
+        # finish_kernel and triton_scan count df > 0 in validity, so such a
+        # variant gets status 2 (NaN downstream), not a valid t of zero.
+        rng = np.random.default_rng(887)
+        raw = rng.uniform(0, 2, (2, 12))
+        raw[1, 4:] = np.nan
+        design = torch.as_tensor(rng.normal(size=(12, 4)) / np.sqrt(12))
+        _, _, status, df = _dosage_statistics(torch.as_tensor(raw), design, torch.ones(1), 1, 7,
+                                              covariate_rank=3)
+        np.testing.assert_array_equal(df.numpy(), [7, -1])
+        np.testing.assert_array_equal(status.numpy(), [0, 2])
 
 
 if __name__ == '__main__':

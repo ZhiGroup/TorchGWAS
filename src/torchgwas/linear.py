@@ -204,6 +204,13 @@ def _dosage_statistics(genotype, design, phenotype_ss, n_traits, df,
     sum_squares = torch.sum(genotype * genotype, dim=1)
     residual_ss = sum_squares - torch.sum(gc * gc, dim=1)
     valid = (residual_ss > 1e-12) & (maximum > minimum)
+    if covariate_rank is None:
+        variant_df = torch.full_like(residual_ss, float(df))
+    else:
+        variant_df = present.squeeze(1).to(residual_ss.dtype) - float(covariate_rank) - 2.0
+        # Before the status word, as in finish_kernel and triton_scan: a
+        # variant with too few called samples is invalid (NaN), not t = 0.
+        valid = valid & (variant_df > 0)
     status = torch.where(
         torch.isfinite(residual_ss),
         torch.where(
@@ -216,11 +223,6 @@ def _dosage_statistics(genotype, design, phenotype_ss, n_traits, df,
     if validate_range:
         status = torch.where((minimum < 0) | (maximum > 2),
                              torch.full_like(status, 3), status)
-    if covariate_rank is None:
-        variant_df = torch.full_like(residual_ss, float(df))
-    else:
-        variant_df = present.squeeze(1).to(residual_ss.dtype) - float(covariate_rank) - 2.0
-        valid = valid & (variant_df > 0)
     safe_df = torch.clamp(variant_df, min=1.0)
     safe_ss = torch.clamp(residual_ss, min=1e-12)
     beta = gy / safe_ss[:, None]

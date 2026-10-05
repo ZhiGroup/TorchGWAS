@@ -77,11 +77,13 @@ def test_only_written_common_prefixes_and_exact_data(tmp_path, block, borrow, be
 def test_staging_and_one_completed_array_are_not_full_progress(tmp_path):
     from torchgwas import sumstats
     events = []; beta_written = threading.Event(); release_t = threading.Event(); progress = threading.Event()
+    t_blocked = threading.Event()
     writer = BinarySumstatsWriter(tmp_path, 4, ['a', 'b'], 129, 123, block_bytes=32,
         writeback_bytes=0, on_write_progress=lambda event: (events.append(event), progress.set()))
     original = sumstats.os.write; syncs = []
     def write(fd, data):
         if fd == writer._tstat._fd:
+            t_blocked.set()
             assert release_t.wait(5), 'test failed to release t writer'
         result = original(fd, data)
         if fd == writer._beta._fd: beta_written.set()
@@ -94,6 +96,9 @@ def test_staging_and_one_completed_array_are_not_full_progress(tmp_path):
             assert events == [] and writer._beta._offset == writer._tstat._offset == 0
             writer.write_chunk(1, 4, values[1:], values[1:])
             assert beta_written.wait(5) and events == []
+            # The t writer's block is active only once its thread is inside
+            # the write; on a loaded host it can still be queued here.
+            assert t_blocked.wait(5)
             queue = writer.queue_snapshot()
             assert queue['valid'] and queue['streams']['t_stat']['active_bytes'] == 32
             release_t.set()

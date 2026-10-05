@@ -28,15 +28,26 @@ def _open_bgen(*args, **kwargs):
     return open_bgen(*args, **kwargs)
 
 
+def _without_sample_type_row(table: pd.DataFrame) -> pd.DataFrame:
+    """Drop an Oxford .sample file's second line, the column types.
+
+    It reads 0 for the ID and missingness columns, then D, C, P or B for each
+    covariate or phenotype column: UK Biobank files carry "0 0 0 D".
+    """
+    if len(table):
+        first = table.iloc[0].astype(str)
+        if (first.iloc[:2] == "0").all() and first.str.fullmatch(r"[0DCPB]").all():
+            return table.iloc[1:].reset_index(drop=True)
+    return table
+
+
 def _sample_columns(sample_file: Path | None, reader_samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     reader_samples = np.asarray(reader_samples, dtype=str)
     if sample_file is None:
         ids = reader_samples.astype(object)
         return ids.copy(), ids
 
-    table = pd.read_csv(sample_file, sep=r"\s+", dtype=str)
-    if len(table) and table.iloc[0].astype(str).str.fullmatch(r"0").all():
-        table = table.iloc[1:].reset_index(drop=True)
+    table = _without_sample_type_row(pd.read_csv(sample_file, sep=r"\s+", dtype=str))
     if not {"ID_1", "ID_2"}.issubset(table.columns):
         raise ValueError(f"BGEN sample file must contain ID_1 and ID_2 columns: {sample_file}")
     family_ids = table["ID_1"].to_numpy(dtype=object)
@@ -544,9 +555,7 @@ class BgenGenotype:
                 if f.tell() > offset + 4:
                     raise ValueError('BGEN sample block overlaps genotype data')
         if sample_file is not None:
-            table = pd.read_csv(sample_file, sep=r'\s+', dtype=str)
-            if len(table) and table.iloc[0].astype(str).str.fullmatch(r'0').all():
-                table = table.iloc[1:].reset_index(drop=True)
+            table = _without_sample_type_row(pd.read_csv(sample_file, sep=r'\s+', dtype=str))
             if not {'ID_1','ID_2'}.issubset(table):
                 raise ValueError('sample file must contain ID_1 and ID_2')
             supplied = table.ID_2.to_numpy(dtype=object)

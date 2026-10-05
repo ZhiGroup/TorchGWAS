@@ -80,8 +80,9 @@ Install the optional reference BGEN dependency when that fallback is needed:
 python -m pip install -e '.[bgen]'
 ```
 
-The default CUDA scan uses PyTorch. Optional native decoders and scan kernels
-can be built in place:
+The default CUDA scan uses the Triton kernels, falling back to PyTorch when
+Triton cannot run. Optional native decoders and scan kernels can be built in
+place:
 
 ```bash
 bash build_bgen_cpu.sh

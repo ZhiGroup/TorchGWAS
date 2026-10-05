@@ -2,7 +2,8 @@ import math,sys
 from pathlib import Path
 import pytest
 sys.path.insert(0,str(Path(__file__).parents[1]/'benchmarks'))
-from direct_missing_marker_ties import branch_probabilities,apply_missingness
+_ties=pytest.importorskip('direct_missing_marker_ties')
+branch_probabilities,apply_missingness=_ties.branch_probabilities,_ties.apply_missingness
 
 def test_iid_branches_partition_variants():
     b=branch_probabilities(8192,.001)

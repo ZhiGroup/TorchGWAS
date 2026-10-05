@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'benchmarks'))
-from direct_real_pgen_longrun_20260921 import copy_record_prefix
+copy_record_prefix=pytest.importorskip('direct_real_pgen_longrun_20260921').copy_record_prefix
 from torchgwas.pgen_reader import read_header
 from torchgwas.pgen_native_reader import NativePgenReader
 from torchgwas import pgen_native

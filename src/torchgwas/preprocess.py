@@ -708,6 +708,10 @@ def mask_phenotype_outliers(phenotype, covariates, threshold, *, whole_rows):
     if not (threshold > 0 and np.isfinite(threshold)):
         raise ValueError("phenotype_outlier_sd must be a positive number")
     values = np.array(phenotype, dtype=np.float64)
+    # A single trait may arrive 1-D; mask it as one column and return it 1-D.
+    one_trait = values.ndim == 1
+    if one_trait:
+        values = values[:, None]
     standardized, _ = residualize_and_standardize(values, covariates)
     extreme = np.abs(standardized) > threshold
     rows = extreme.any(axis=1)
@@ -715,5 +719,5 @@ def mask_phenotype_outliers(phenotype, covariates, threshold, *, whole_rows):
         values[rows] = np.nan
     else:
         values[extreme] = np.nan
-    return values, rows
+    return (values[:, 0] if one_trait else values), rows
 

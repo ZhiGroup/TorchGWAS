@@ -11,7 +11,6 @@ from unittest import mock
 
 import numpy as np
 
-from benchmarks.benchmark_pgen_converter import _parse_configs
 from torchgwas.cli import _build_parser, _run_convert_pgen
 from torchgwas.io import infer_genotype_format, load_genotype, load_pgen_genotype
 from torchgwas.pgen import (
@@ -560,6 +559,12 @@ class PgenSourceTestCase(unittest.TestCase):
             )
 
     def test_benchmark_parses_single_or_multiple_worker_chunk_configs(self):
+        # Imported here: a missing benchmark script must not take the rest of
+        # this file's PGEN tests with it at collection.
+        try:
+            from benchmarks.benchmark_pgen_converter import _parse_configs
+        except ImportError:
+            self.skipTest("benchmarks/benchmark_pgen_converter.py is not in this repository")
         self.assertEqual(
             _parse_configs("1:1024:1:1000,2:4096:4:2500"),
             [(1, 1024, 1, 1000), (2, 4096, 4, 2500)],
@@ -746,7 +751,8 @@ class DirectPgenTestCase(unittest.TestCase):
                     calls[calls == 3] = -9
                     np.testing.assert_array_equal(calls, values)
                     self.assertFalse(packed[:, 1:].any())
-                source = PgenGenotype(pgen, mode=mode, selected_sample_ids=["I3", "I0", "I1"])
+                with mock.patch.dict(os.environ, {"TORCHGWAS_PGEN_WHOLE_ROWS": "0"}):
+                    source = PgenGenotype(pgen, mode=mode, selected_sample_ids=["I3", "I0", "I1"])
                 observed = np.concatenate([x for _, _, x in source.iter_chunks(2)], axis=1)
                 expected = values[:, [3, 0, 1]].T.astype(np.float32)
                 expected[expected == -9] = np.nan
@@ -755,11 +761,41 @@ class DirectPgenTestCase(unittest.TestCase):
                 with source.native_reader_session() as fill:
                     fill(0, 5, native_out)
                 np.testing.assert_allclose(native_out, values[:, [3, 0, 1]], rtol=0, atol=1 / 32768)
+                # Whole rows (the default for a majority selection): every
+                # stored sample in file order, and the kept samples' positions.
+                with mock.patch.dict(os.environ, {"TORCHGWAS_PGEN_PACKED": "0"}):
+                    whole = PgenGenotype(pgen, mode=mode, selected_sample_ids=["I3", "I0", "I1"])
+                self.assertEqual(whole.native_row_width, 4)
+                np.testing.assert_array_equal(whole.native_sample_positions, [3, 0, 1])
+                whole_out = np.empty((5, 4), dtype=whole.native_transfer_dtype)
+                with whole.native_reader_session() as fill:
+                    fill(0, 5, whole_out)
+                np.testing.assert_allclose(whole_out, values, rtol=0, atol=1 / 32768)
                 if mode == "dosage":
                     self.assertGreater(abs(float(observed[1, 4]) - round(float(observed[1, 4]) * 127.5) / 127.5), 0.0001)
 
 
+    def test_uint8_dosage_transport_marks_missing_calls_255(self):
+        # pgenlib writes -9 for a missing dosage; clipped, it would be code 0.
+        from torchgwas.pgen import PgenGenotype
+        dosages = _FakeDosageReader.dosages[:3]
+        with tempfile.TemporaryDirectory() as tmp:
+            pgen, _, _ = _write_pgen_companions(Path(tmp))
+            with mock.patch("torchgwas.pgen._open_pgen", side_effect=_FakeDosageReader), \
+                    mock.patch.dict(os.environ, {"TORCHGWAS_PGEN_DOSAGE_UINT8": "1"}):
+                source = PgenGenotype(pgen, mode="dosage")
+                self.assertEqual(source.native_missing_value, 255)
+                out = np.empty((3, 4), dtype=source.native_transfer_dtype)
+                with source.native_reader_session() as fill:
+                    fill(0, 3, out)
+        expected = np.rint(np.clip(dosages, 0, 2) * 127.0).astype(np.uint8)
+        expected[dosages == -9] = 255
+        np.testing.assert_array_equal(out, expected)
+        self.assertEqual(int(out[2, 1]), 255)
+
     def test_native_session_fills_owned_buffers_and_preserves_sample_order(self):
+        # Host-decoded selections; TORCHGWAS_PGEN_WHOLE_ROWS=0 keeps them off
+        # the whole-row transport a 3-of-4 selection would otherwise take.
         from torchgwas.pgen import PgenGenotype
         for mode, reader_type, matrix in (("hardcall", _FakePgenReader, HARDCALLS),
                                           ("dosage", _FakeDosageReader, _FakeDosageReader.dosages)):
@@ -771,7 +807,8 @@ class DirectPgenTestCase(unittest.TestCase):
                     return reader
                 with tempfile.TemporaryDirectory() as tmp:
                     pgen, _, _ = _write_pgen_companions(Path(tmp))
-                    with mock.patch("torchgwas.pgen._open_pgen", side_effect=create):
+                    with mock.patch("torchgwas.pgen._open_pgen", side_effect=create), \
+                            mock.patch.dict(os.environ, {"TORCHGWAS_PGEN_WHOLE_ROWS": "0"}):
                         source = PgenGenotype(pgen, mode=mode, selected_sample_ids=selected)
                         out = np.empty((3, 3), dtype=source.native_dtype)
                         with mock.patch.dict(os.environ, {"TORCHGWAS_SCAN_PROFILE": "1"}), source.native_reader_session() as fill:

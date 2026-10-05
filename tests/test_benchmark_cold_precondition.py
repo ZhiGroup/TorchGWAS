@@ -15,7 +15,9 @@ class ColdPreconditionTest(unittest.TestCase):
         for name in ('fixture.pgen', 'fixture.pvar', 'fixture.psam', 'phenotype.npy', 'covariates.npy'):
             (root/name).write_bytes(b'fixture')
         source = Path(__file__).resolve().parents[1]/'benchmarks/direct_calculator_physical_multi.py'
-        tree = ast.parse(source.read_text())
+        if not source.exists():
+            self.skipTest(f'benchmarks/{source.name} is not in this repository')
+        tree =ast.parse(source.read_text())
         function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'cold_inputs')
         operating_system = SimpleNamespace(fsync=Mock(), posix_fadvise=Mock(), POSIX_FADV_DONTNEED=4)
         timer = SimpleNamespace(sleep=Mock())

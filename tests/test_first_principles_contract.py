@@ -3,11 +3,24 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-import direct_parallel_scaling_model as scaling
-import direct_fastgwa_cost_model as fast
+BENCHMARKS = Path(__file__).resolve().parents[1] / 'benchmarks'
+sys.path.insert(0, str(BENCHMARKS))
+# The competitor and scheduler models are benchmark scripts that are not in
+# this repository; their tests skip, the pipeline-model tests still run.
+try:
+    import direct_parallel_scaling_model as scaling
+except ImportError:
+    scaling = None
+try:
+    import direct_fastgwa_cost_model as fast
+except ImportError:
+    fast = None
+needs_scaling = unittest.skipIf(scaling is None, 'benchmarks/direct_parallel_scaling_model.py is not in this repository')
+needs_fast = unittest.skipIf(fast is None, 'benchmarks/direct_fastgwa_cost_model.py is not in this repository')
+needs_plink = unittest.skipUnless((BENCHMARKS / 'direct_plink2_cost_model.py').exists(), 'benchmarks/direct_plink2_cost_model.py is not in this repository')
 from torchgwas.pipeline_model import Workload, InputProfile, Hardware, PipelinePlan, estimate
 
+@needs_scaling
 class SchedulerTests(unittest.TestCase):
     def test_no_unjustified_point_or_upper_bound_under_oversubscription(self):
         for foreign in (1, 100, 10000):
@@ -20,6 +33,7 @@ class SchedulerTests(unittest.TestCase):
         r = scaling.predict_block_seconds(12, foreign_cores=0)
         self.assertAlmostEqual(r['block_seconds'], r['format_serial'] + r['region_overhead'] + r['compute_ideal'])
 
+@needs_fast
 class FastGwaTests(unittest.TestCase):
     def cohort(self):
         return fast.Cohort(10000,35365,4,250,200000)
@@ -109,6 +123,7 @@ class PortabilityTests(unittest.TestCase):
             estimate(case.w,replace(case.p,calibration_context=c),
                      replace(case.h,calibration_context={**c,'machine':'box-b'}),case.plan)
 
+    @needs_fast
     def test_fastgwa_does_not_inherit_a_host_memory_rate(self):
         m=fast.Machine(1e9,1e10,1e11,1e9,48)
         c=fast.Cohort(10000,35365,4,250,200000)
@@ -161,6 +176,7 @@ class ExecutionComponentTests(unittest.TestCase):
         self.assertAlmostEqual(r['setup_sensitivity_seconds'][1]-r['setup_sensitivity_seconds'][0],2)
 
 
+@needs_plink
 class FiniteCpuScheduleTests(unittest.TestCase):
     def test_one_plink_block_must_drain_all_three_phases(self):
         import direct_plink2_cost_model as plink
@@ -179,6 +195,7 @@ class FiniteCpuScheduleTests(unittest.TestCase):
         with self.assertRaises(ValueError):plink.finite_main_calc_schedule(-1,4,2,100)
 
 
+@needs_fast
 class FastInitializationTests(unittest.TestCase):
     def test_preloop_component_replaces_existing_fixed_terms(self):
         c=fast.Cohort(1000,100,2,500,10000,record_mix={0:1000},psam_bytes=800,

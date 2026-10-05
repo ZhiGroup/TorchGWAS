@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import __version__
 from .io import align_table_to_samples, load_array, load_genotype, load_vector
 from .executor_timing import streaming_timing
 from .linear import linear_scan, linear_scan_streaming, linear_scan_streaming_chunks
@@ -175,10 +176,14 @@ def _drop_subjects_missing_phenotypes(phenotype, covariates, genotype, sample_id
         return phenotype, covariates, genotype, sample_ids, 0
     n = int(phenotype.shape[0])
     missing = np.zeros(n, dtype=bool)
-    # Column blocks bound the temporary; a memory-mapped panel is read once.
-    block = max(1, (64 << 20) // max(n, 1))
-    for begin in range(0, int(phenotype.shape[1]), block):
-        missing |= np.isnan(np.asarray(phenotype[:, begin:begin + block])).any(axis=1)
+    if phenotype.ndim == 1:
+        # A single trait may arrive 1-D (np.loadtxt of a one-column file).
+        missing |= np.isnan(np.asarray(phenotype))
+    else:
+        # Column blocks bound the temporary; a memory-mapped panel is read once.
+        block = max(1, (64 << 20) // max(n, 1))
+        for begin in range(0, int(phenotype.shape[1]), block):
+            missing |= np.isnan(np.asarray(phenotype[:, begin:begin + block])).any(axis=1)
     dropped = int(missing.sum())
     if not dropped:
         return phenotype, covariates, genotype, sample_ids, 0
@@ -197,7 +202,7 @@ def _drop_subjects_missing_phenotypes(phenotype, covariates, genotype, sample_id
         genotype = np.asarray(genotype)[kept]
         if sample_ids is not None:
             sample_ids = np.asarray(sample_ids)[kept]
-    if isinstance(phenotype, np.memmap):
+    if isinstance(phenotype, np.memmap) and phenotype.ndim > 1:
         # A mapped panel stays mapped: blocks read only the kept rows.
         from .preprocess import PhenotypeRowView
         phenotype = PhenotypeRowView(phenotype, kept)
@@ -445,9 +450,20 @@ def _trait_blocked_reduced_chunks(scan_once, reduction, n_traits, trait_block,
         def run(device, assigned):
             try:
                 for offset, width in assigned:
-                    for chunk in scan_once(offset, width, device):
-                        _accumulate(accumulated, order, reduction, chunk,
-                                    offset, guard)
+                    # Another device failed and the run will raise: stop
+                    # instead of scanning this device's remaining blocks.
+                    if failures:
+                        return
+                    iterator = scan_once(offset, width, device)
+                    try:
+                        for chunk in iterator:
+                            if failures:
+                                return
+                            _accumulate(accumulated, order, reduction, chunk,
+                                        offset, guard)
+                    finally:
+                        if hasattr(iterator, 'close'):
+                            iterator.close()
             except BaseException as exc:  # noqa: BLE001 - re-raised below
                 with guard:
                     failures.append(exc)
@@ -1855,8 +1871,11 @@ def run_linear_gwas(
             full_binary_df = (sumstats_format == 'binary' and reduction is None
                               and significance is None
                               and p_value_threshold is None and trait_block is None)
+            # Filtered output takes it too: the device computes it at each
+            # pair's own df, which a missing phenotype or call lowers below
+            # the residual df the writer would otherwise assume.
             dense_log10_p = (sumstats_format == 'binary' and reduction is None
-                             and significance is None and p_value_threshold is None)
+                             and significance is None)
             # min-p stages its kept pairs' exact -log10 P and df. Trait
             # blocks merge by that -log10 P, so they carry it in float64
             # (MinPReduction.merge).
@@ -2390,7 +2409,7 @@ def run_linear_gwas(
             _phase_entered, _phase_prep_started, _phase_prep_done,
             write_started, time.perf_counter()),
         "runtime_seconds": elapsed(start),
-        "version": "0.1.0",
+        "version": __version__,
     }
     shared = locals().get('shared_state')
     if shared is not None and shared.get('genotype_cache') is not None:
@@ -2426,7 +2445,7 @@ def run_linear_gwas(
                 from .sumstats_indexed import write_indexed_sumstats
                 written, sumstats_summary = write_indexed_sumstats(
                     out / "sumstats", marker_names, trait_names, genotype_shape[0],
-                    iter([(0, len(marker_names), beta, t_stat, None)]), kind="filtered",
+                    iter([(0, len(marker_names), beta, t_stat, None, logp)]), kind="filtered",
                     df=genotype_shape[0] - covariate_rank_used - 2,
                     p_value_threshold=p_value_threshold,
                     variant_metadata=variant_metadata,fsync=sumstats_fsync,

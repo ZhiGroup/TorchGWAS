@@ -1,5 +1,8 @@
 """Every current device selector API has an independent typed probe."""
+import sys
+from pathlib import Path
 import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
 from torchgwas.device_significance_service import device_selection_host_primitives
 from torchgwas.device_significance_work import device_significant_tensor_work
 

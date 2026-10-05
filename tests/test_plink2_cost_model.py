@@ -28,7 +28,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 def _load():
     path = ROOT / "benchmarks" / "direct_plink2_cost_model.py"
-    spec = importlib.util.spec_from_file_location("plink2_cost_model_under_test", path)
+    if not path.exists():
+        raise unittest.SkipTest(f"benchmarks/{path.name} is not in this repository")
+    spec =importlib.util.spec_from_file_location("plink2_cost_model_under_test", path)
     module = importlib.util.module_from_spec(spec)
     # Register before executing: @dataclass resolves annotations through
     # sys.modules[cls.__module__].

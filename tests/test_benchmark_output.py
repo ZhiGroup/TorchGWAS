@@ -3,8 +3,10 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from benchmarks.benchmark_bed_gpu_pipeline import AsyncNpyWriter
+# benchmarks/benchmark_bed_gpu_pipeline.py is not in this repository.
+AsyncNpyWriter = pytest.importorskip('benchmarks.benchmark_bed_gpu_pipeline').AsyncNpyWriter
 
 
 class TestAsyncNpyWriter(unittest.TestCase):

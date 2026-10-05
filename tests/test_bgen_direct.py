@@ -66,6 +66,23 @@ def test_direct_preserves_probabilities(tmp_path,bits):
     assert source.dosage_scale==1
 
 
+@pytest.mark.parametrize('types',['0 0 0','0 0 0 D','0 0 0 D C P B'])
+def test_sample_file_type_row_is_dropped(tmp_path,types):
+    # The second .sample line holds column types; UK Biobank's reads "0 0 0 D".
+    from torchgwas.bgen import _sample_columns
+    path=tmp_path/'test.bgen'
+    write_bgen(path)
+    names=['ID_1','ID_2','missing','sex','age','height','case'][:len(types.split())]
+    rows=[' '.join([f'f{s}',s,'0']+['1']*(len(names)-3)) for s in 'abcd']
+    sample=tmp_path/'test.sample'
+    sample.write_text('\n'.join([' '.join(names),types,*rows])+'\n')
+    source=BgenGenotype(path,sample,decode_backend='cpu')
+    assert source.sample_ids.tolist()==list('abcd')
+    assert source.family_ids.tolist()==['fa','fb','fc','fd']
+    families,ids=_sample_columns(sample,np.asarray(list('abcd')))
+    assert ids.tolist()==list('abcd') and families.tolist()==['fa','fb','fc','fd']
+
+
 @pytest.mark.parametrize('kind',['phased','bad_checksum'])
 def test_rejects_unsupported_or_corrupt(tmp_path,kind):
     path=tmp_path/'bad.bgen'
