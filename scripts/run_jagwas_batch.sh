@@ -19,8 +19,11 @@
 #                  --jagwas-rcond 0 (rounding cutoff only), --sequential
 #
 # The other inputs default to the 35k fusionN discovery set; override any of
-# them from the environment: GENOTYPE SAMPLE_IDS COVARIATES MAF GENO_CACHE
-# CLUMP_CACHE LD_DIR PY.
+# them from the environment: CHECKOUT PREP DEPS CLUMPING_DIR GENOTYPE
+# SAMPLE_IDS COVARIATES MAF GENO_CACHE CLUMP_CACHE LD_DIR PY.
+# run_jagwas_batch.env beside this script, if present, is sourced first and
+# holds the site's paths (untracked; the environment still wins). Anything
+# left unset falls back to a /path/to placeholder.
 #
 # example:
 #   bash /path/to/TorchGWAS/scripts/run_jagwas_batch.sh \
@@ -28,8 +31,13 @@
 #     /path/to/shared/torchgwas/new_batch/phenos
 set -euo pipefail
 
-CHECKOUT=/path/to/TorchGWAS
-PREP=/path/to/shared/torchgwas/torchgwas_jagwas_nceq_35k_cnnonly
+SITE_ENV="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/run_jagwas_batch.env"
+# shellcheck source=/dev/null
+[[ -f $SITE_ENV ]] && . "$SITE_ENV"
+CHECKOUT=${CHECKOUT:-/path/to/TorchGWAS}
+PREP=${PREP:-/path/to/shared/torchgwas/torchgwas_jagwas_nceq_35k_cnnonly}
+DEPS=${DEPS:-/path/to/deps}
+CLUMPING_DIR=${CLUMPING_DIR:-/path/to/local_clumping}
 PY=${PY:-python}
 GENOTYPE=${GENOTYPE:-/path/to/shared/UKB_bgen/step4_hetqc_fusionN_rsid.bgen}
 SAMPLE_IDS=${SAMPLE_IDS:-$PREP/sample_order_35k_fusionN_eid_eid.npy}
@@ -81,6 +89,7 @@ COMMAND=("$PY" -u "$CHECKOUT/scripts/run_jagwas_clumping.py"
   --genotype "$GENOTYPE" --genotype-format bgen
   --sample-ids "$SAMPLE_IDS" --covariates "$COVARIATES" --maf "$MAF"
   --genotype-cache-dir "$GENO_CACHE" --clump-cache "$CLUMP_CACHE" --ld-dir "$LD_DIR"
+  --clumping-dir "$CLUMPING_DIR"
   --bgen-decode-backend gpu --reader-workers 8 --prefetch-chunks 16 --device "$DEVICE"
   "${GROUP_ARGS[@]}" --output-dir "$OUT" "$@")
 
@@ -89,7 +98,7 @@ if ((DRY_RUN)); then
   printf '%q ' "${COMMAND[@]}"; echo
   exit 0
 fi
-export PYTHONPATH=$CHECKOUT/src:/path/to/deps
+export PYTHONPATH=$CHECKOUT/src:$DEPS
 export PYTHONHASHSEED=0
 cd "$CHECKOUT"
 exec "${COMMAND[@]}"

@@ -24,6 +24,7 @@ competitor_grid/
 .remote
 .rsyncignore
 AGENTS.md
+scripts/run_jagwas_batch.env
 
 # Common TorchGWAS run outputs
 demo_run/
