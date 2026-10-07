@@ -202,22 +202,33 @@ def prepare_inputs_for_prep(
     # is the point: at voxel scale that copy is the whole problem.
     if phenotype_block_size is not None and (isinstance(phenotype_block_size,bool) or not isinstance(phenotype_block_size,int) or phenotype_block_size<1):
         raise ValueError('phenotype_block_size must be a positive integer')
-    phenotype = ensure_2d(np.asarray(phenotype, dtype=dtype if phenotype_block_size is None else None), "phenotype")
+    # A lazy view (drop_subject's kept rows of a memory-mapped panel) stays
+    # lazy: `asarray` would run its __array__, which copies every kept row of
+    # every trait -- 800 GB at 100,000 subjects and 2,000,000 traits. QC and
+    # the scan read it a column block at a time, converting each block.
+    lazy = isinstance(phenotype, (PhenotypeRowView, PhenotypeColumnView)) or (
+        not isinstance(phenotype, np.ndarray) and hasattr(phenotype, '__getitem__')
+        and hasattr(phenotype, 'dtype') and len(getattr(phenotype, 'shape', ())) == 2)
+    if not lazy:
+        phenotype = ensure_2d(np.asarray(phenotype, dtype=dtype if phenotype_block_size is None else None),
+                              "phenotype")
     covariates = None if covariates is None else ensure_2d(np.asarray(covariates, dtype=dtype), "covariates")
 
     if qc_device is not None:
         # Column QC on the scan GPU (bounded blocks), not one CPU core.
         pheno_mask, phenotype_observed_counts, phenotype_missing_cells = _phenotype_qc(
             phenotype, dtype=dtype, device=qc_device)
-    elif phenotype_block_size is None:
+    elif phenotype_block_size is None and not lazy:
         pheno_mask, phenotype_observed_counts = _phenotype_column_mask(phenotype)
         phenotype_missing_cells=int(np.isnan(phenotype).sum())
     else:
+        # Bounded column blocks: the caller's width, else ~512 MiB of float64.
+        block_size = phenotype_block_size or max(1, (512 << 20) // (8 * max(phenotype.shape[0], 1)))
         pheno_mask=np.empty(phenotype.shape[1],dtype=bool)
         phenotype_observed_counts=np.empty(phenotype.shape[1],dtype=np.int64)
         phenotype_missing_cells=0
-        for start in range(0,phenotype.shape[1],phenotype_block_size):
-            end=min(start+phenotype_block_size,phenotype.shape[1])
+        for start in range(0,phenotype.shape[1],block_size):
+            end=min(start+block_size,phenotype.shape[1])
             block=np.asarray(phenotype[:,start:end],dtype=dtype)
             pheno_mask[start:end],phenotype_observed_counts[start:end]=_phenotype_column_mask(block)
             phenotype_missing_cells+=int(np.isnan(block).sum())
@@ -272,7 +283,7 @@ def prepare_inputs_for_prep(
 
     if not pheno_mask.all():
         qc['phenotype_kept_column_indices']=np.flatnonzero(pheno_mask).tolist()
-        phenotype = (phenotype[:, pheno_mask] if phenotype_block_size is None else
+        phenotype = (phenotype[:, pheno_mask] if phenotype_block_size is None and not lazy else
                      PhenotypeColumnView(phenotype,np.flatnonzero(pheno_mask)))
     if phenotype.shape[1] == 0:
         raise ValueError("all phenotype columns were dropped due to zero variance")

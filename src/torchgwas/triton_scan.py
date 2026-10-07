@@ -27,6 +27,7 @@ The contract is scan_gpu's, kernel for kernel:
 from __future__ import annotations
 
 import functools
+import threading
 
 import torch
 
@@ -37,12 +38,26 @@ except ImportError:  # the Torch statistics are the fallback
     triton = None
     tl = None
 
+# One kernel launch at a time across threads (variant shards, phenotype
+# tiles). Triton 3.1 binds a compiled kernel to its C launcher lazily, and on
+# four H100 shards one launch of finish_min_p once went through prepare's
+# launcher ("function takes exactly 19 arguments (23 given)": 9 launch fields
+# plus prepare's 10 arguments, against finish_min_p's 14). The GIL already
+# serialises most of a launch; the lock also covers where Triton releases it.
+_LAUNCH_LOCK = threading.Lock()
+
 # Raw encodings: one byte or float per sample, or two-bit rows.
 INT8, UINT8, FLOAT32, PGEN_2BIT, PLINK_2BIT = range(5)
 # Samples per program step. A power of two, as tl.arange needs; one variant
 # row per program, so a chunk launches `variants` programs per kernel.
 SAMPLE_BLOCK = 1024
 TRAIT_BLOCK = 1024
+# prepare's warps per row. At a 1024-sample block the warp count moves no lane
+# boundary, so every output is bit-identical across it; only speed changes.
+# Packed rows of 22,250 samples, 4,096 per chunk, 16 warps against 4: A100
+# 0.82 -> 0.56 ms, H100 0.30 -> 0.28, RTX 2080 Ti 1.35 -> 1.12. With 512 rows of
+# 400,000 the A100 went the other way (1.16 -> 1.44 ms), so short chunks keep 4.
+PREPARE_WARPS, PREPARE_WARPS_FEW_ROWS, PREPARE_MANY_ROWS = 16, 4, 2048
 
 
 if triton is not None:
@@ -240,12 +255,12 @@ def prepare(raw, scale=1.0, missing_value=None, *, encoding=None, n_samples=None
     ss = torch.empty(rows, dtype=torch.float32, device=device)
     minimum, maximum = torch.empty_like(ss), torch.empty_like(ss)
     present = torch.empty(rows, dtype=torch.int32, device=device)
-    with torch.cuda.device(device):
+    with _LAUNCH_LOCK, torch.cuda.device(device):
         _prepare_kernel[(rows,)](raw, raw.stride(0), samples, float(scale),
                                  float(0 if sentinel is None else sentinel),
                                  centered, ss, minimum, maximum, present,
                                  KIND=kind, HAS_SENTINEL=sentinel is not None, BLOCK=SAMPLE_BLOCK,
-                                 num_warps=4)
+                                 num_warps=PREPARE_WARPS if rows >= PREPARE_MANY_ROWS else PREPARE_WARPS_FEW_ROWS)
     return centered, ss, minimum, maximum, present
 
 
@@ -265,7 +280,7 @@ def finish(products, centered_ss, minimum, maximum, phenotype_ss, present, df_of
     beta = torch.empty((rows, traits), dtype=torch.float32, device=products.device)
     t = torch.empty_like(beta)
     status = torch.empty(rows, dtype=torch.uint8, device=products.device)
-    with torch.cuda.device(products.device):
+    with _LAUNCH_LOCK, torch.cuda.device(products.device):
         _finish_kernel[(rows,)](products, products.stride(0), centered_ss, minimum, maximum, phenotype_ss,
                                 present, float(df_offset), traits, covariates, beta, t, status,
                                 VALIDATE=bool(validate_range), COV_BLOCK=cov_block, BLOCK=block, num_warps=4)
@@ -280,7 +295,7 @@ def finish_min_p(products, centered_ss, minimum, maximum, phenotype_ss, present,
     t = torch.empty_like(beta)
     index = torch.empty((rows, 1), dtype=torch.int32, device=products.device)
     status = torch.empty(rows, dtype=torch.uint8, device=products.device)
-    with torch.cuda.device(products.device):
+    with _LAUNCH_LOCK, torch.cuda.device(products.device):
         _finish_min_p_kernel[(rows,)](products, products.stride(0), centered_ss, minimum, maximum, phenotype_ss,
                                       present, float(df_offset), traits, covariates, beta, t, index, status,
                                       VALIDATE=bool(validate_range), COV_BLOCK=cov_block, BLOCK=block,
@@ -298,7 +313,17 @@ def finish_min_p(products, centered_ss, minimum, maximum, phenotype_ss, present,
 # each holding the GIL through Dynamo's guards: on four 2080 Ti shards that was
 # 40% of all GIL time (benchmarks/synthetic_multigpu_20260928.py). One launch
 # here, on any GPU Triton supports. FP64 throughout, as the stages.
-TAIL_BLOCK = 256
+#
+# One cell per thread (block = 32 x warps): each cell's 40 FP64 iterations
+# already fill a thread's registers. A narrow tail -- min-p's 4,096 winners per
+# chunk -- needs small blocks to reach every SM: the former 256-cell block ran
+# them as 16 programs, 0.28 ms on an A100 against 0.08 at 64 (H100 0.058 ->
+# 0.041, RTX 2080 Ti 0.41 -> 0.20). A dense chunk (4,096 x 512) has programs
+# to spare and takes 8 warps: A100 2.20 -> 1.78 ms, H100 0.68 -> 0.64, 2080 Ti
+# unchanged (FP64-bound at 31 ms). The tail is elementwise, so the outputs are
+# bit-identical across these.
+TAIL_BLOCK, TAIL_WARPS = 256, 8
+TAIL_BLOCK_NARROW, TAIL_WARPS_NARROW, TAIL_WIDE_CELLS = 64, 2, 1 << 20
 TAIL_ITERATIONS = 40
 
 
@@ -389,9 +414,11 @@ def neg_log10_p(t, df, out=None):
     cells = rows * cols
     if cells == 0:
         return out
-    with torch.cuda.device(t.device):
-        _tail_kernel[(triton.cdiv(cells, TAIL_BLOCK),)](
+    block, warps = ((TAIL_BLOCK, TAIL_WARPS) if cells >= TAIL_WIDE_CELLS
+                    else (TAIL_BLOCK_NARROW, TAIL_WARPS_NARROW))
+    with _LAUNCH_LOCK, torch.cuda.device(t.device):
+        _tail_kernel[(triton.cdiv(cells, block),)](
             t, df, out, cells, cols, t.stride(0), t.stride(1), df.stride(0), df.stride(1),
             TINY=1e-300, LGAMMA_HALF=_LGAMMA_HALF, INV_LN10=_INV_LN10,
-            ITERATIONS=TAIL_ITERATIONS, BLOCK=TAIL_BLOCK, num_warps=4)
+            ITERATIONS=TAIL_ITERATIONS, BLOCK=block, num_warps=warps)
     return out

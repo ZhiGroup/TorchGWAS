@@ -36,6 +36,9 @@ are handled by `--missing-phenotype`:
     Triton cannot run.
   - Hard-call PGEN travels to the GPU as packed two-bit rows.
   - `TORCHGWAS_STATS_BACKEND=torch|triton` forces a backend.
+  - `TORCHGWAS_CHUNK_GRAPHS=1` replays each chunk's GPU work as a CUDA graph
+    (PGEN and dosage input, dense output or min-p). It cuts the per-chunk
+    Python work that limits low-trait scans on several GPUs. Off by default.
 
 ## Benchmark
 

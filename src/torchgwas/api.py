@@ -65,14 +65,98 @@ def _available_host_bytes() -> int:
     so the budget is what is free right now on a box that is shared with other
     jobs, not what the machine was built with.
     """
+    available = 0
     try:
         with open("/proc/meminfo", encoding="ascii") as handle:
             for line in handle:
                 if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
+                    available = int(line.split()[1]) * 1024
+                    break
     except OSError:
         pass
-    return 0
+    # A Slurm job (or container) may use only its cgroup's limit, however much
+    # the node has free: on a 2 TB node a 480 GB job planned against
+    # MemAvailable would be killed by the cgroup, not slowed by the kernel.
+    limit = _cgroup_available_bytes()
+    if limit is not None:
+        available = min(available, limit) if available else limit
+    return available
+
+
+def _cgroup_available_bytes(root='/sys/fs/cgroup', membership='/proc/self/cgroup'):
+    """Memory this process's cgroups still allow, or None when none sets a limit.
+
+    The tightest level counts: Slurm limits the job's cgroup, and the step's
+    own cgroup below it may report no limit. Each level allows its limit less
+    its use, plus its inactive page cache, which is reclaimed before the
+    cgroup kills anything.
+    """
+    def read(path):
+        try:
+            return path.read_text().strip()
+        except OSError:
+            return None
+    try:
+        lines = Path(membership).read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        _, controllers, path = line.split(':', 2)
+        if controllers == '':  # cgroup v2
+            top, names = Path(root), ('memory.max', 'memory.current', 'memory.stat')
+        elif 'memory' in controllers.split(','):  # cgroup v1
+            top, names = Path(root) / 'memory', ('memory.limit_in_bytes', 'memory.usage_in_bytes', 'memory.stat')
+        else:
+            continue
+        allowed = None
+        level = top / path.lstrip('/')
+        while True:
+            limit, used, stat = (read(level / name) for name in names)
+            # v2 says "max", v1 a huge number, where a level sets no limit.
+            if limit and used and limit != 'max' and int(limit) < 1 << 60:
+                stats = dict(row.split() for row in (stat or '').splitlines() if len(row.split()) == 2)
+                reclaimable = int(stats.get('inactive_file', stats.get('total_inactive_file', 0)))
+                left = max(0, int(limit) - int(used) + reclaimable)
+                allowed = left if allowed is None else min(allowed, left)
+            if level == top or top not in level.parents:
+                break
+            level = level.parent
+        return allowed
+    return None
+
+
+def _is_lazy_panel(value):
+    """A 2-D array-like read by slicing (h5py or zarr datasets, a generated panel), not an ndarray."""
+    return (not isinstance(value, np.ndarray) and hasattr(value, '__getitem__')
+            and hasattr(value, 'dtype') and len(getattr(value, 'shape', ())) == 2)
+
+
+class _LazyColumns:
+    """Columns `columns` (a step-1 slice) of a lazy panel, read a block at a time and converted to `dtype`.
+
+    A trait tile of a lazy panel: the residualisation reads it in column
+    blocks, as it reads a memory-mapped tile, so the tile is never held whole
+    before its residualised copy. Slicing the panel instead copies the tile:
+    at 100,000 subjects a 272,000-trait tile is 101 GB, per GPU at once.
+    """
+    def __init__(self, values, columns, dtype):
+        start, stop, step = columns.indices(values.shape[1])
+        if step != 1:
+            raise ValueError('a lazy tile is a contiguous range of traits')
+        self.values, self.start = values, start
+        self.shape, self.ndim, self.dtype = (values.shape[0], max(stop - start, 0)), 2, np.dtype(dtype)
+
+    def __getitem__(self, key):
+        rows, columns = key if isinstance(key, tuple) else (key, slice(None))
+        if isinstance(columns, slice):
+            first, stop, step = columns.indices(self.shape[1])
+            columns = slice(self.start + first, self.start + stop, step)
+        else:
+            columns = np.arange(self.shape[1])[columns] + self.start
+        return np.asarray(self.values[rows, columns], dtype=self.dtype)
+
+    def __array__(self, dtype=None, copy=None):
+        return np.asarray(self[:, :], dtype=dtype or self.dtype)
 
 
 def _coerce_array_or_path(value, *, mmap=False):
@@ -82,6 +166,10 @@ def _coerce_array_or_path(value, *, mmap=False):
         if mmap and Path(value).suffix.lower()=='.npy':
             return np.load(value,mmap_mode='r',allow_pickle=False)
         return load_array(value)
+    if mmap and _is_lazy_panel(value):
+        # Where a .npy is memory-mapped, a lazy panel stays lazy: every
+        # consumer reads it a block of columns at a time.
+        return value
     return np.asarray(value)
 
 
@@ -202,8 +290,8 @@ def _drop_subjects_missing_phenotypes(phenotype, covariates, genotype, sample_id
         genotype = np.asarray(genotype)[kept]
         if sample_ids is not None:
             sample_ids = np.asarray(sample_ids)[kept]
-    if isinstance(phenotype, np.memmap) and phenotype.ndim > 1:
-        # A mapped panel stays mapped: blocks read only the kept rows.
+    if (isinstance(phenotype, np.memmap) or _is_lazy_panel(phenotype)) and phenotype.ndim > 1:
+        # A mapped (or lazy) panel stays so: blocks read only the kept rows.
         from .preprocess import PhenotypeRowView
         phenotype = PhenotypeRowView(phenotype, kept)
     else:
@@ -961,6 +1049,14 @@ def run_linear_gwas(
         first, last = _resolve_variant_range(variant_range, int(genotype.shape[1]))
         sizes = sorted(set(int(s) for s in (options.get('chunk_sizes')
                        or ([chunk_size] if chunk_size is not None else DEFAULT_CHUNK_SIZES))))
+        if reduce == 'min-p' and not options.get('chunk_sizes') and chunk_size is None:
+            # min-p writes a row per variant, so the disk-bound loss that keeps
+            # 8192 out of DEFAULT_CHUNK_SIZES (dense output) does not apply, and
+            # at small K its scan is host-bound per chunk. Four H100 shards,
+            # K = 512, 8.1M variants: chunk 4096 4.60-4.80 s, 8192 3.82-3.96 s,
+            # 16384 4.04-4.21 s, autotune limited to 4096 4.70-5.01 s. The
+            # tuner's trials still decide; rings that do not fit are dropped.
+            sizes = sorted(set(sizes) | {8192})
         # A framed source decodes whole frames: default candidates become
         # multiples of its frame when chunks start on a frame boundary.
         frame = getattr(genotype, 'chunk_alignment_variants', None)
@@ -1050,7 +1146,8 @@ def run_linear_gwas(
                                  else None),
                 decode_cpu_per_variant=decode_cpu, gpu_seconds_per_variant=gpu_per_variant,
                 shard_setup_seconds=setup, cpu_cores=cpu_detail.get('affinity'),
-                cpu_load=cpu_detail.get('load_1min'), allow_partitions=unfiltered, output_rates=output_rates,
+                cpu_load=cpu_detail.get('load_on_affinity', cpu_detail.get('load_1min')),
+                allow_partitions=unfiltered, output_rates=output_rates,
                 group_sizes=group_sizes, reduction_width=1 if mode == 'min-p' else None)
             layout['cpus'] = cpu_detail
             sizes = layout.get('chunk_sizes') or sizes  # sizes whose rings do not fit are dropped
@@ -1244,6 +1341,12 @@ def run_linear_gwas(
         raise ValueError('variant_devices requires a streaming genotype source')
     if full_tiled_output and pipeline_profile is not None:
         raise ValueError('The coarse pipeline profile does not model full-output trait tiling')
+    # device='auto' is the default. Resolved here, or neither the automatic
+    # trait blocking below nor the fit preflight runs for a default-device
+    # scan, and a panel that needs blocking is residualised whole: 800 GB of
+    # host memory at 100,000 subjects and 2,000,000 traits.
+    planning_device = (str(choose_device(device)) if str(device) == 'auto' and variant_devices is None
+                       else str(device))
     if trait_block is not None:
         if full_tiled_output and (output_dir is None or sumstats_format!='binary'
                                   or p_value_threshold is not None
@@ -1255,7 +1358,7 @@ def run_linear_gwas(
         if int(trait_block) < 1:
             raise ValueError("trait_block must be positive")
     elif ((reduction is not None or significance is not None)
-          and jagwas is None and str(device).startswith("cuda") and empirical is None):
+          and jagwas is None and planning_device.startswith("cuda") and empirical is None):
         # `significance is not None` matters as much as `reduction`, and
         # leaving it out meant the ONE mode the voxel stress test uses was
         # the one mode that never blocked. `reduce='significant'` builds a
@@ -1282,7 +1385,7 @@ def run_linear_gwas(
             from .pipeline_model import auto_trait_block
 
             if _torch.cuda.is_available():
-                free_bytes, _total = _torch.cuda.mem_get_info(_torch.device(device))
+                free_bytes, _total = _torch.cuda.mem_get_info(_torch.device(planning_device))
                 width = getattr(genotype, "native_row_width", 0)
                 if (getattr(genotype, "native_encoding", None)
                         in {"pgen_2bit", "plink_2bit"} and width):
@@ -1311,7 +1414,8 @@ def run_linear_gwas(
                                      reduction.resolved_width(
                                          int(phenotype.shape[1]))),
                     trait_devices=(len(trait_devices) if trait_devices
-                                   else max(_torch.cuda.device_count(), 1)))
+                                   else max(_torch.cuda.device_count(), 1)),
+                    device_selection=significance is not None)
                 # Largest-that-fits minimises the number of blocks, which is
                 # the wrong objective once the blocks run concurrently: at
                 # 2,085,000 voxels the widest fitting block is 518,821, which
@@ -1364,7 +1468,7 @@ def run_linear_gwas(
     # Only when nothing has already rescued the plan -- a caller-supplied or
     # auto-derived `trait_block` means the traits are being split, which is
     # the fix this would otherwise recommend.
-    if (trait_block is None and str(device).startswith("cuda")
+    if (trait_block is None and planning_device.startswith("cuda")
             and isinstance(genotype, ChunkedGenotype)):
         try:
             import torch as _torch
@@ -1373,7 +1477,7 @@ def run_linear_gwas(
 
             if _torch.cuda.is_available():
                 free_bytes, _total = _torch.cuda.mem_get_info(
-                    _torch.device(device))
+                    _torch.device(planning_device))
                 width = getattr(genotype, "native_row_width", 0)
                 if (getattr(genotype, "native_encoding", None)
                         in {"pgen_2bit", "plink_2bit"} and width):
@@ -1884,11 +1988,17 @@ def run_linear_gwas(
 
             def _scan(trait_slice=None, device=None, *, source=None, workers=None,
                       observed_counts=None, basis=..., shared_loader=None):
-                panel = phenotype if trait_slice is None else phenotype[:, trait_slice]
-                if significance is not None:
-                    # QC can preserve a mmap or lazy column subset. Convert
-                    # only this tile to the actual compute precision.
-                    panel = np.asarray(panel, dtype=np.float32 if resolved_compute_dtype == 'float32' else np.float64)
+                scan_dtype = np.float32 if resolved_compute_dtype == 'float32' else np.float64
+                if trait_slice is not None and _is_lazy_panel(phenotype):
+                    # A lazy panel's tile stays lazy (_LazyColumns): read and
+                    # converted a block of columns at a time.
+                    panel = _LazyColumns(phenotype, trait_slice, scan_dtype)
+                else:
+                    panel = phenotype if trait_slice is None else phenotype[:, trait_slice]
+                    if significance is not None:
+                        # QC can preserve a mmap or lazy column subset. Convert
+                        # only this tile to the actual compute precision.
+                        panel = np.asarray(panel, dtype=scan_dtype)
                 return linear_scan_streaming_chunks(
                     genotype if source is None else source,
                     panel,

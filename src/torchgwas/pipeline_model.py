@@ -268,7 +268,8 @@ def host_pinned_bytes(*, chunk_variants: int, depth: int, n_traits: int,
                       transfer_bytes_per_variant: float,
                       reduction_width: int | None = None,
                       stage_on_host: bool = True,
-                      compute_log10_p: bool = False) -> float:
+                      compute_log10_p: bool = False,
+                      result_ring: bool = True) -> float:
     """Pinned host memory the scan holds, term by term.
 
     The device ring is not the only ring. Every slot is pinned on BOTH sides:
@@ -295,11 +296,13 @@ def host_pinned_bytes(*, chunk_variants: int, depth: int, n_traits: int,
     # df per VARIANT. Reduced: the narrow width carries an extra int32
     # trait-index column, and the whole point of the mode is that `width`
     # replaces `K` here; with -log10 P each kept pair adds it (float32) and
-    # its float32 df.
-    if reduction_width is None:
+    # its float32 df. Significant pairs are selected on the device and cross
+    # in their own small blocks (native_scan: no result ring), so
+    # result_ring=False leaves this term out.
+    if result_ring and reduction_width is None:
         result_bytes_per_test = 12.0 if compute_log10_p else 8.0
         total += depth * chunk * (result_bytes_per_test * n_traits + 5.0)
-    else:
+    elif result_ring:
         kept_bytes = 20.0 if compute_log10_p else 12.0
         total += depth * chunk * (kept_bytes * max(int(reduction_width), 1) + 5.0)
     return total
@@ -1113,7 +1116,8 @@ def auto_trait_block(n_samples: int, n_traits: int, covariate_rank: int,
                      decode_on_gpu: bool = False,
                      host_memory_bytes: int | None = None,
                      reduction_width: int | None = None,
-                     trait_devices: int = 1) -> int:
+                     trait_devices: int = 1,
+                     device_selection: bool = False) -> int:
     """Largest trait block whose rings fit, or all of them if they already do.
 
     The same inversion as `auto_chunk_variants`, on the other axis. At voxel
@@ -1138,6 +1142,12 @@ def auto_trait_block(n_samples: int, n_traits: int, covariate_rank: int,
     not feasible unreduced, and the calculator now says so instead of finding
     out at allocation time.
 
+    The host also holds each block's residualised phenotypes, float32
+    samples x block, for the block's whole scan (preprocess residualises on
+    the device, downloads them, and native_scan uploads them into the
+    design): at 100,000 subjects a 125,000-trait block is 50 GB per GPU.
+    `device_selection` (significant pairs) has no result ring to pin.
+
     Returns `n_traits` when the whole matrix fits, so a small K pays nothing.
     """
     if min(n_samples, n_traits, chunk_variants, depth) <= 0:
@@ -1159,11 +1169,12 @@ def auto_trait_block(n_samples: int, n_traits: int, covariate_rank: int,
         # Each shard pins its own staging and result rings in the one host
         # address space, so the host cost multiplies by the device count
         # exactly where the device cost divides by it.
-        return host_pinned_bytes(
+        return (host_pinned_bytes(
             chunk_variants=chunk_variants, depth=depth, n_traits=block,
             transfer_bytes_per_variant=transfer_bytes_per_variant,
             reduction_width=reduction_width,
-            stage_on_host=not decode_on_gpu) * shards <= host_budget
+            stage_on_host=not decode_on_gpu, result_ring=not device_selection)
+            + 4.0 * n_samples * block) * shards <= host_budget
 
     if fits(n_traits):
         return int(n_traits)

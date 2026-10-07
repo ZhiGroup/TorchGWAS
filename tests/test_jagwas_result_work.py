@@ -41,7 +41,8 @@ def test_exact_finish_returns_index_releases_df_and_invalidates_rows(borrowed):
     buffers[4].copy_(torch.tensor([30.,29.,28.,27.]))
     class Ready:
         def synchronize(self):pass
-    namespace=dict(np=np,result_done=[Ready()],result_buffers=[buffers],borrow_results=borrowed,
+    # A slot's arrays as result_slot carves them for the chunk's 4 rows.
+    namespace=dict(np=np,result_done=[Ready()],result_views=[{4:buffers}],borrow_results=borrowed,
         reduction=JagwasReduction(),compute_p_values=False,profiling=False,return_df=False)
     exec(compile(ast.Module(body=[body],type_ignores=[]),'exact_native_finish','exec'),namespace)
     emitted,missing,invariant,times=namespace['finish'](0,45,49)

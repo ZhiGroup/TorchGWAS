@@ -375,7 +375,7 @@ def _indexed(directory):
     return {key: value[order] for key, value in values.items()}
 
 
-@pytest.mark.parametrize('mode', ['significant', 'min-p', 'tiles', 'jagwas'])
+@pytest.mark.parametrize('mode', ['significant', 'significant_tiles', 'min-p', 'tiles', 'jagwas'])
 def test_a_mapped_panel_is_read_by_rows(tmp_path, monkeypatch, mode):
     from unittest.mock import patch
     from torchgwas import preprocess
@@ -388,6 +388,7 @@ def test_a_mapped_panel_is_read_by_rows(tmp_path, monkeypatch, mode):
     np.save(tmp_path / 'y.npy', phenotype)
     np.save(tmp_path / 'y_kept.npy', phenotype[kept])
     extra = dict(significant=dict(reduce='significant', significance_threshold=0.5),
+                 significant_tiles=dict(reduce='significant', significance_threshold=0.5, trait_block=2),
                  **{'min-p': dict(reduce='min-p')},
                  tiles=dict(trait_block=2, trait_devices=['cpu']), jagwas=dict(reduce='jagwas'))[mode]
     seen = []
@@ -396,7 +397,16 @@ def test_a_mapped_panel_is_read_by_rows(tmp_path, monkeypatch, mode):
     def prepare(genotype, phenotype, *args, **kwargs):
         seen.append(phenotype)
         return original(genotype, phenotype, *args, **kwargs)
-    with patch('torchgwas.api.prepare_inputs_for_prep', side_effect=prepare):
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch('torchgwas.api.prepare_inputs_for_prep', side_effect=prepare))
+        if mode in ('tiles', 'significant_tiles'):
+            # A tiled scan reads one block of traits at a time, so nothing may
+            # copy the whole kept panel: at 100,000 subjects and 2,000,000
+            # traits that is 800 GB (prepare_inputs_for_prep did). Untiled
+            # scans and JAGWAS hold the whole panel by design.
+            stack.enter_context(patch.object(PhenotypeRowView, '__array__',
+                                             side_effect=AssertionError('the whole panel was copied')))
         result = run_linear_gwas(full, tmp_path / 'y.npy', covariates, output_dir=tmp_path / 'dropped',
                                  **load, **options, **COMMON, **extra)
     assert result.run_metadata['dropped_subjects'] == len(MISSING[0])

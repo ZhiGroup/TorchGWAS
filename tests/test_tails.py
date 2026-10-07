@@ -195,10 +195,13 @@ class ScanDeviceTailTestCase(unittest.TestCase):
 
         device = torch.device("cuda", torch.cuda.current_device())
         # The fallback forms, as a device the Triton tail cannot serve gets them.
-        triton_served = tails._TRITON_TAIL.get(device)
+        # prepare_device_tail records the fallback's kind, so that is restored too:
+        # left at 'aoti', a device the Triton tail serves would misreport it.
+        for table in (tails._TRITON_TAIL, tails._KINDS):
+            prior = table.get(device)
+            self.addCleanup(lambda table=table, prior=prior: table.__setitem__(device, prior)
+                            if prior is not None else table.pop(device, None))
         tails._TRITON_TAIL[device] = False
-        self.addCleanup(lambda: tails._TRITON_TAIL.__setitem__(device, triton_served)
-                        if triton_served is not None else tails._TRITON_TAIL.pop(device, None))
         tails.prepare_device_tail(device)
         compiled, starts = tails._STAGES[device]
         if compiled is None:

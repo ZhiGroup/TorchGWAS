@@ -5,6 +5,7 @@ import contextlib
 import math
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -40,6 +41,24 @@ def _scan_streams(device):
         streams = (torch.cuda.Stream(device=index), torch.cuda.Stream(device=index))
         _auxiliary_streams[index] = streams
     return streams
+
+
+# Chunk graphs (TORCHGWAS_CHUNK_GRAPHS): captured on one cached stream per
+# device (a fresh stream per scan would partition the allocator, as above), one
+# capture at a time across the shard threads, in thread-local mode so the other
+# shards' reader threads may keep pinning and synchronizing meanwhile.
+_capture_streams: dict[int, torch.cuda.Stream] = {}
+_GRAPH_CAPTURE_LOCK = threading.Lock()
+# Chunk graphs per GPU, used in turn: one computes while the other's results copy out.
+GRAPH_LANES = 2
+
+
+def _capture_stream(device):
+    index = torch.device(device).index
+    stream = _capture_streams.get(index)
+    if stream is None:
+        stream = _capture_streams[index] = torch.cuda.Stream(device=index)
+    return stream
 
 
 def resolve_reader_workers(source, requested=None, limit=None):
@@ -256,36 +275,187 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     reduction_width = None if reduction is None else reduction.resolved_width(traits)
     # The complete-case pair df crosses to the host only when read there.
     stage_pair_df = complete_case is not None and (return_df or (compute_p_values and log10_p is None))
+    # The staged results, as (per-row shape, dtype), None where absent.
     if significance is not None:
-        make_result = None
+        result_specs = None
     elif reduction is None:
-        def make_result(rows):
-            return ((torch.empty((rows, traits), pin_memory=True) if return_beta else None),
-                    torch.empty((rows, traits), pin_memory=True),
-                    torch.empty(rows, dtype=torch.uint8, pin_memory=True),
-                    # One residual df per variant, not per test.
-                    torch.empty(rows, pin_memory=True),
-                    # float32 -log10 P, computed on the device (log10_p).
-                    *((torch.empty((rows, traits), dtype=logp_dtype, pin_memory=True),) if log10_p is not None else ()),
-                    # Complete-case pair df (missing phenotypes).
-                    *((torch.empty((rows, traits), pin_memory=True),) if stage_pair_df else ()))
+        result_specs = (((traits,), torch.float32) if return_beta else None,
+                        ((traits,), torch.float32),
+                        ((), torch.uint8),
+                        # One residual df per variant, not per test.
+                        ((), torch.float32),
+                        # float32 -log10 P, computed on the device (log10_p).
+                        *((((traits,), logp_dtype),) if log10_p is not None else ()),
+                        # Complete-case pair df (missing phenotypes).
+                        *((((traits,), torch.float32),) if stage_pair_df else ()))
     else:
-        def make_result(rows):
-            if log10_p is None:
-                return reduction.host_buffers(rows, reduction_width)
-            return reduction.host_buffers(rows, reduction_width, log10_p_dtype=logp_dtype)
-    # Pinned on a slot's first chunk and grown once to the capacity, like the
-    # input ring (streaming.PinnedDosageLoader); dense output at K = 512 and
-    # depth 32 pins 537 MB per GPU at chunk 4096.
-    result_buffers = [] if make_result is None else [None] * depth
+        templates = (reduction.host_buffers(1, reduction_width, pin_memory=False) if log10_p is None else
+                     reduction.host_buffers(1, reduction_width, pin_memory=False, log10_p_dtype=logp_dtype))
+        result_specs = tuple((tuple(template.shape[1:]), template.dtype) for template in templates)
+
+    def result_layout(rows):
+        """Each staged array's byte offset for a chunk of `rows`, 64-byte aligned, and the total."""
+        offsets, total = [], 0
+        for spec in result_specs:
+            if spec is None:
+                offsets.append(None)
+                continue
+            offsets.append(total)
+            total += -(-rows * math.prod(spec[0]) * torch.empty((), dtype=spec[1]).element_size() // 64) * 64
+        return offsets, total
+
+    def carve(block, rows):
+        """The staged arrays of a `rows`-variant chunk, laid out back to back in `block` (bytes)."""
+        offsets, _ = result_layout(rows)
+        views = []
+        for spec, offset in zip(result_specs, offsets):
+            if spec is None:
+                views.append(None)
+                continue
+            size = rows * math.prod(spec[0]) * torch.empty((), dtype=spec[1]).element_size()
+            views.append(block[offset:offset + size].view(spec[1]).view((rows,) + spec[0]))
+        return tuple(views)
+
+    # One pinned block per slot, pinned on the slot's first chunk and grown
+    # once to the capacity, like the input ring (streaming.PinnedDosageLoader);
+    # dense output at K = 512 and depth 32 pins 537 MB per GPU at chunk 4096.
+    # A chunk's arrays are carved for its own row count, so they are contiguous
+    # and a chunk graph moves them all with one copy (chunk_graph).
+    result_blocks = [] if result_specs is None else [None] * depth
     result_rows = [0] * depth
+    result_views = [dict() for _ in range(depth)]
 
     def result_slot(slot, rows):
-        """This slot's pinned results. Its previous chunk was resolved before this iteration, so they are free."""
-        if result_buffers[slot] is None or result_rows[slot] < rows:
-            size = rows if result_buffers[slot] is None else chunk_size
-            result_buffers[slot], result_rows[slot] = make_result(size), size
-        return result_buffers[slot]
+        """This slot's pinned results for a `rows`-variant chunk. Its previous chunk was resolved
+        before this iteration, so they are free."""
+        if result_blocks[slot] is None or result_rows[slot] < rows:
+            size = rows if result_blocks[slot] is None else chunk_size
+            result_blocks[slot] = torch.empty(result_layout(size)[1], dtype=torch.uint8, pin_memory=True)
+            result_rows[slot] = size
+            result_views[slot].clear()
+        views = result_views[slot].get(rows)
+        if views is None:
+            views = result_views[slot][rows] = carve(result_blocks[slot], rows)
+        return views
+
+    # Chunk graphs: a chunk's device work -- prepare, GEMM, finish (or min-p's
+    # ranking and tail), packing the results into one buffer -- replays as one
+    # CUDA graph, and its results cross to the host in one copy: three host
+    # calls with the input's device copy, instead of ~25 from Python. With
+    # variant shards those calls queue on the GIL: at K = 512 on four GPUs
+    # each GPU was busy a third of the scan. Two graphs per GPU, used in turn
+    # (GRAPH_LANES), each on its own input and output buffers, so a chunk can
+    # compute while the one before is still copying out; a ring slot is copied
+    # into a lane's input on the device. A graph per slot instead was captured
+    # depth times per GPU, one capture at a time across shards while the rest
+    # of the process held the GIL: four A100 shards at depth 4 spent 1.5 s,
+    # summed over the shards, capturing their 16 slots.
+    # Captured lazily, after one eager chunk has compiled and warmed
+    # everything, for the steady chunk size only: one the chunk before also
+    # had, and under the chunk-size tuner only once it has settled (its trials
+    # stay eager, so they compare like with like). A short last chunk, and
+    # every mode outside native statistics with dense output or fused min-p,
+    # stay eager.
+    graph_subset = (native_statistics and not device_source and significance is None
+                    and complete_case is None and not timed_gpu
+                    and (reduction is None or fused_min_p is not None))
+    graphs_enabled = graph_subset and os.environ.get('TORCHGWAS_CHUNK_GRAPHS', '0') != '0'
+    timings['chunk_graphs'] = graphs_enabled
+    graphs = {}
+    graph_inputs, graph_outputs = [None] * GRAPH_LANES, [None] * GRAPH_LANES
+    lane_done = [torch.cuda.Event() for _ in range(GRAPH_LANES)] if graphs_enabled else []
+    graph_state = dict(enabled=graphs_enabled, warmed=False, previous=None, next_lane=0,
+                       pool=torch.cuda.graph_pool_handle() if graphs_enabled else None)
+    validate_range = getattr(source, 'validate_native_range', False)
+    graph_missing = (getattr(source, 'native_missing_value', None)
+                     if getattr(source, 'allows_direct_native_fill', False) else None)
+
+    def native_compute(genotype_t):
+        """The eager loop's native-statistics work for dense output or fused min-p, as one function."""
+        if packed_missing is not None:
+            genotype_t.bitwise_or_(packed_missing)
+        elif unselected is not None:
+            genotype_t.index_fill_(1, unselected, unselected_value)
+        if native_encoding == 'pgen_2bit':
+            prepared = native_prepare(genotype_t, encoding='pgen_2bit', n_samples=rows)
+        else:
+            scale = (float(source.native_scale)
+                     if genotype_t.dtype == torch.uint8 and native_encoding == 'dosage' else 1.0)
+            prepared = native_prepare(genotype_t, scale, graph_missing)
+        centered, centered_ss, minimum, maximum, present = prepared
+        products = centered @ design
+        variant_df = present.to(torch.float32) + df_offset
+        if fused_min_p is not None:
+            winners = fused_min_p(products, centered_ss, minimum, maximum, phenotype_ss, present,
+                                  df_offset, validate_range)
+            return reduction.from_winners(*winners, variant_df, logp_dtype)
+        beta, t, status = native_finish(products, centered_ss, minimum, maximum, phenotype_ss,
+                                        present, df_offset, validate_range)
+        staged = (beta if return_beta else None, t, status, variant_df)
+        return staged + ((_device_log10_p(t, variant_df, logp_dtype),) if log10_p is not None else ())
+
+    def chunk_graph(count):
+        """(lane, graph, payload bytes) for a steady-size chunk, or None to run it eagerly."""
+        steady, graph_state['previous'] = count == graph_state['previous'], count
+        if not (steady and graph_state['enabled'] and graph_state['warmed']):
+            return None
+        # Under the chunk-size tuner only once it has settled; any other
+        # observer (a measurement window) keeps the eager chunks it measures.
+        state = 'committed' if chunk_observer is None else getattr(chunk_observer, 'state', None)
+        if state not in ('committed', 'fixed', 'skipped'):
+            return None
+        lane = graph_state['next_lane']
+        captured = graphs.get((lane, count))
+        if captured is None:
+            captured = capture(lane, count)
+            if captured is None:
+                return None
+        graph_state['next_lane'] = (lane + 1) % GRAPH_LANES
+        return (lane,) + captured
+
+    def capture(lane, count):
+        capture_started = time.perf_counter()
+        try:
+            if graph_outputs[lane] is None:
+                # Beside one chunk's intermediates, which the graph pool holds
+                # again (the eager chunk's stay cached): leave room for both.
+                need = chunk_size * (rows * 4 + design.shape[1] * 4 + traits * 16 + 64)
+                if 2 * need > torch.cuda.mem_get_info(device)[0]:
+                    raise MemoryError(f'{2 * need / 2**30:.1f} GiB free needed for chunk graphs')
+                # Read and written on the compute stream only, so allocated there.
+                graph_inputs[lane] = torch.empty((chunk_size, row_width), dtype=transfer_dtype, device=device)
+                graph_outputs[lane] = torch.empty(result_layout(chunk_size)[1], dtype=torch.uint8, device=device)
+            side = _capture_stream(device)
+            side.wait_stream(compute_stream)
+            graph = torch.cuda.CUDAGraph()
+            with _GRAPH_CAPTURE_LOCK, torch.cuda.stream(side):
+                timings['chunk_graph_lock_wait_seconds'] = (timings.get('chunk_graph_lock_wait_seconds', 0.0)
+                                                            + time.perf_counter() - capture_started)
+                # cuBLAS keeps a workspace per (handle, stream): create this
+                # stream's outside the capture, not inside the graph's pool.
+                torch.mm(design[:16], design[:16].T)
+                graph.capture_begin(pool=graph_state['pool'], capture_error_mode='thread_local')
+                try:
+                    outputs = native_compute(graph_inputs[lane][:count])
+                    for packed, value in zip(carve(graph_outputs[lane], count), outputs):
+                        if packed is not None:
+                            packed.copy_(value)
+                finally:
+                    graph.capture_end()
+            compute_stream.wait_stream(side)
+        except Exception as error:  # noqa: BLE001 - the eager path remains
+            timings['chunk_graphs'] = graph_state['enabled'] = False
+            timings['chunk_graph_error'] = f'{type(error).__name__}: {error}'[:500]
+            graphs.clear()
+            return None
+        # The outputs' memory stays the graph's (its private pool); the
+        # packed buffer is what the host copies.
+        payload = result_layout(count)[1]
+        graphs[lane, count] = (graph, payload)
+        timings['chunk_graphs_captured'] = len(graphs)
+        timings['chunk_graph_capture_seconds'] = (timings.get('chunk_graph_capture_seconds', 0.0)
+                                                  + time.perf_counter() - capture_started)
+        return graphs[lane, count]
     pending = deque()
     release_pool = None if device_source else ThreadPoolExecutor(
         max_workers=1, thread_name_prefix='torchgwas-copy-release')
@@ -357,10 +527,11 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         count = end - start
         # The loop yields this slot before reusing it. Borrowed views are valid
         # until the caller requests another chunk; owned results may be kept.
+        views = result_views[slot][count]  # carved for `count` rows (result_slot)
         if borrow_results:
-            staged = [None if value is None else value[:count].numpy() for value in result_buffers[slot]]
+            staged = [None if value is None else value[:count].numpy() for value in views]
         else:
-            staged = [None if value is None else value[:count].numpy().copy() for value in result_buffers[slot]]
+            staged = [None if value is None else value[:count].numpy().copy() for value in views]
         logp = None
         pair_df = None
         if reduction is None:
@@ -497,6 +668,29 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                         device_buffers[slot][:end-start].copy_(host, non_blocking=True)
                         copy_done[slot].record(copy_stream)
                 compute_stream.wait_event(copy_done[slot])
+                graph = (chunk_graph(end - start)
+                         if graph_state['enabled'] and (delivery is None or not delivery.record_cuda) else None)
+                if graph is not None:
+                    lane, compute_graph, payload = graph
+                    # The lane's packed results are rewritten: the copy-out of
+                    # its previous chunk must be done first.
+                    compute_stream.wait_event(lane_done[lane])
+                    graph_inputs[lane][:end - start].copy_(device_buffers[slot][:end - start])
+                    compute_graph.replay()
+                    compute_done[slot].record(compute_stream)
+                    result_slot(slot, end - start)  # sizes the block, carves the arrays finish reads
+                    block = result_blocks[slot]
+                    with torch.cuda.stream(result_stream):
+                        result_stream.wait_event(compute_done[slot])
+                        block[:payload].copy_(graph_outputs[lane][:payload], non_blocking=True)
+                        result_done[slot].record(result_stream)
+                        lane_done[lane].record(result_stream)
+                    timings['result_payload_bytes'] += payload
+                    timings['chunk_graph_replays'] = timings.get('chunk_graph_replays', 0) + 1
+                    release_futures[slot] = release_pool.submit(release_after_copy, slot, buffer_index)
+                    future = pool.submit(finish, slot, start, end, delivery)
+                    pending.append(future if chunk_observer is None else (future, delivery))
+                    continue
                 if profiling or (delivery is not None and delivery.record_cuda):
                     conversion_start[slot].record(compute_stream)
                 genotype_t = device_buffers[slot][:end-start]
@@ -607,6 +801,8 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                 release_futures[slot] = release_pool.submit(release_after_copy, slot, buffer_index)
             future = pool.submit(finish, slot, start, end, delivery)
             pending.append(future if chunk_observer is None else (future, delivery))
+            # One eager chunk has compiled the kernels and probed the tail.
+            graph_state['warmed'] = graph_state['enabled']
         while pending_selection:
             yield from select(pending_selection.popleft())
         while pending:
@@ -647,9 +843,13 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
         # frame holding references. See the repeat-scan item; the remedy is on
         # the allocation-pattern side, not here.
         cleanup(pending.clear)
+        graphs.clear()
+        graph_inputs[:] = graph_outputs[:] = [None] * GRAPH_LANES
         release_futures[:] = [None] * len(release_futures)
         del device_buffers[:]
-        del result_buffers[:]
+        for views in result_views:
+            views.clear()
+        del result_blocks[:]
         if cleanup_errors and not primary_error:
             raise cleanup_errors[0]
 

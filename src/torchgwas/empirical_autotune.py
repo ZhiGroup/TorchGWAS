@@ -384,8 +384,19 @@ def usable_cpus(sample_seconds=0.25):
         load = os.getloadavg()[0]
     except (AttributeError, OSError):
         load = None
-    return max(1, int(idle)), dict(affinity=len(allowed), idle_cores=round(idle, 2),
-                                   load_1min=None if load is None else round(load, 2))
+    # The contention the planner prices (cpu_load): the node's load average,
+    # unless this process may use only some of the node's CPUs. A Slurm job's
+    # cgroup reserves its cores, so other jobs' load runs elsewhere and only
+    # what is busy on these CPUs competes; that is measured above. A cluster
+    # job on 16 of 48 cores, load 24-26 from other jobs: priced against our 16 it gave
+    # each reader 46% of a core and 14 readers per GPU at depth 28, and min-p
+    # at K = 512 on two H100s ran 5.6-5.75 s against 4.62 at 8 readers, depth 8.
+    node = os.cpu_count() or len(allowed)
+    load_on_affinity = (load if load is None or len(allowed) >= node
+                        else min(load, len(allowed) - idle))
+    return max(1, int(idle)), dict(affinity=len(allowed), idle_cores=round(idle, 2), cpu_count=node,
+                                   load_1min=None if load is None else round(load, 2),
+                                   load_on_affinity=None if load_on_affinity is None else round(load_on_affinity, 2))
 
 
 def measured_gemm_rate(device, dtype, size=2048, repeats=3):
@@ -910,10 +921,11 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
                                  covariate_rank=covariate_rank,
                                  transfer_bytes_per_variant=transfer_bytes_per_variant) > 0.85*device_free_bytes:
                 return False
-            return not host_free_bytes or host_pinned_bytes(
+            return not host_free_bytes or (host_pinned_bytes(
                 chunk_variants=chunk, depth=depth, n_traits=need,
                 transfer_bytes_per_variant=transfer_bytes_per_variant,
-                reduction_width=reduction_width)*shards <= 0.85*host_free_bytes
+                reduction_width=reduction_width, result_ring=mode != 'significant')
+                + 4.0 * n_samples * need)*shards <= 0.85*host_free_bytes
         while kept and not fits(kept[-1]):
             dropped.append(kept.pop())
         if not kept:
@@ -1012,7 +1024,8 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
                            chunk_variants=capacity, depth=depth,
                            transfer_bytes_per_variant=transfer_bytes_per_variant,
                            device_memory_bytes=int(device_free_bytes), host_memory_bytes=host_free_bytes or None,
-                           reduction_width=reduction_width, trait_devices=len(devices))
+                           reduction_width=reduction_width, trait_devices=len(devices),
+                           device_selection=mode == 'significant')
     result = dict(trait_block=None, trait_devices=None, variant_devices=None, device=devices[0],
                   fit_traits=int(fit), devices_considered=list(devices), chunk_sizes=kept,
                   chunk_sizes_dropped=sorted(dropped))
@@ -1120,8 +1133,10 @@ def plan_layout(*, mode, n_samples, n_traits, covariate_rank, n_variants, device
                                    covariate_rank=covariate_rank, transfer_bytes_per_variant=transfer_bytes_per_variant)
         if mode == 'jagwas':
             device += jagwas_factor_bytes(n_traits, group_sizes)
+        # Pinned rings plus the block's residualised phenotypes (auto_trait_block).
         host = host_pinned_bytes(chunk_variants=chunk, depth=slots, n_traits=need,
-                                 transfer_bytes_per_variant=transfer_bytes_per_variant, reduction_width=reduction_width)
+                                 transfer_bytes_per_variant=transfer_bytes_per_variant, reduction_width=reduction_width,
+                                 result_ring=mode != 'significant') + 4.0 * n_samples * need
         return device <= 0.85 * device_free_bytes and (not host_free_bytes or host * used <= 0.85 * host_free_bytes)
 
     # Double-buffered ring: a slot per reader being filled and as many filled

@@ -513,6 +513,30 @@ def test_readers_follow_measured_decode_demand():
                            gpu_seconds_per_variant=0.74e-6) == 16
     # No measurement: 4.
     assert readers_per_gpu(2, cpus=16) == 4 and readers_per_gpu(2, cpus=1) == 4
+    # Min-p K = 512, two H100s, a 16-core Slurm job on a 48-core cluster node: decode 3.1 us, GPU
+    # 0.69 us. Priced against the node's load (25) each reader got 46% of a core: 14 per GPU, slower
+    # than 8 (5.6-5.75 s against 4.62). The load on the job's own cores is about its own thread.
+    assert readers_per_gpu(2, cpus=16, cpu_cores=16, cpu_load=25., decode_cpu_per_variant=3.1e-6,
+                           gpu_seconds_per_variant=0.69e-6) == 14
+    assert readers_per_gpu(2, cpus=16, cpu_cores=16, cpu_load=1.2, decode_cpu_per_variant=3.1e-6,
+                           gpu_seconds_per_variant=0.69e-6) == 8
+
+
+def test_cpu_load_is_the_load_on_this_process_cpus(monkeypatch):
+    import os
+    from torchgwas import empirical_autotune
+    monkeypatch.setattr(os, 'getloadavg', lambda: (50.0, 50.0, 50.0))
+    # The whole node: its load average.
+    monkeypatch.setattr(os, 'sched_getaffinity', lambda pid: set(range(8)))
+    monkeypatch.setattr(os, 'cpu_count', lambda: 8)
+    _, detail = empirical_autotune.usable_cpus(sample_seconds=0.01)
+    assert detail['load_on_affinity'] == detail['load_1min'] == 50.0
+    # Two of 64 CPUs (a Slurm cgroup): only what is busy on those two, at most two.
+    monkeypatch.setattr(os, 'sched_getaffinity', lambda pid: {0, 1})
+    monkeypatch.setattr(os, 'cpu_count', lambda: 64)
+    _, detail = empirical_autotune.usable_cpus(sample_seconds=0.01)
+    assert detail['load_1min'] == 50.0 and detail['cpu_count'] == 64
+    assert 0.0 <= detail['load_on_affinity'] <= 2.0
 
 
 def test_readers_and_depth_follow_the_gpus_in_use():
