@@ -13,13 +13,20 @@ instead.
 
 Missing phenotype values (NaN, or values masked by `--phenotype-outlier-sd`)
 are handled by `--missing-phenotype`:
-- `drop_subject` (default): a sample missing any trait is left out of every
-  trait, so each statistic is ordinary least squares on the kept samples.
+- `exact` (default, except for JAGWAS): each trait is tested on its own
+  observed samples, as plink2's `--glm` does per phenotype. Not available for
+  JAGWAS.
+- `drop_subject` (default for JAGWAS): a sample missing any trait is left out
+  of every trait, so each statistic is ordinary least squares on the kept
+  samples.
 - For grouped JAGWAS each group drops only the subjects its own traits miss.
 - `impute`: the earlier convention, with the trait mean and the trait's own
   degrees of freedom.
-- `exact`: each trait is tested on its own observed samples, as plink2's
-  `--glm` does per phenotype. Not available for JAGWAS.
+
+`--phenotype-outlier-sd K` masks values more than K standard deviations from
+their covariate-adjusted trait, measured on the trait's observed values. Under
+`drop_subject` (so JAGWAS by default) the sample's whole row is masked;
+otherwise just the value.
 
 ## Features
 

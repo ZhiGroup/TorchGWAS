@@ -707,6 +707,8 @@ def standardize_genotype(genotype_chunk: np.ndarray) -> np.ndarray:
 def mask_phenotype_outliers(phenotype, covariates, threshold, *, whole_rows):
     """Set phenotype values beyond `threshold` SD of their covariate-residualised,
     standardised trait to missing; return the masked FP64 copy and the affected rows.
+    A trait with missing values is residualised and standardised on its
+    observed values only.
 
     whole_rows (JAGWAS): a sample with any such value loses its whole panel row.
     On near-collinear imaging panels a few samples, extreme in many traits at
@@ -723,7 +725,10 @@ def mask_phenotype_outliers(phenotype, covariates, threshold, *, whole_rows):
     one_trait = values.ndim == 1
     if one_trait:
         values = values[:, None]
-    standardized, _ = residualize_and_standardize(values, covariates)
+    # Each trait residualised and scaled on its own observed values. Mean-filled
+    # missing cells would shrink the SD by sqrt(observed / samples): at half
+    # missing a 4 SD cutoff masked about 60 times the values it should.
+    standardized, _ = residualize_and_standardize(values, covariates, missing="complete_case")
     extreme = np.abs(standardized) > threshold
     rows = extreme.any(axis=1)
     if whole_rows:

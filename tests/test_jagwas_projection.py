@@ -527,6 +527,28 @@ def test_phenotype_outliers_mask_whole_rows_for_jagwas_and_values_otherwise():
         mask_phenotype_outliers(phenotype, covariates, 0.0, whole_rows=True)
 
 
+def test_phenotype_outliers_are_measured_on_each_traits_observed_values():
+    """A trait with missing values: the SD is its observed residuals', not shrunk by mean-filled cells."""
+    from torchgwas.preprocess import mask_phenotype_outliers
+    rng = np.random.default_rng(11)
+    n, threshold = 4000, 3.0
+    covariates = rng.standard_normal((n, 2))
+    phenotype = covariates @ [[0.5, -0.2, 0.1], [0.3, 0.4, -0.6]] + rng.standard_normal((n, 3))
+    for trait, fraction in enumerate((0.0, 0.2, 0.5)):
+        phenotype[rng.random(n) < fraction, trait] = np.nan
+    masked, rows = mask_phenotype_outliers(phenotype, covariates, threshold, whole_rows=False)
+    want = np.zeros(phenotype.shape, dtype=bool)
+    for trait in range(3):
+        keep = ~np.isnan(phenotype[:, trait])
+        design = np.column_stack([np.ones(keep.sum()), covariates[keep]])
+        coef = np.linalg.lstsq(design, phenotype[keep, trait], rcond=None)[0]
+        resid = phenotype[keep, trait] - design @ coef
+        want[np.flatnonzero(keep), trait] = np.abs(resid / resid.std()) > threshold
+    assert want.sum(0).min() > 0
+    np.testing.assert_array_equal(np.isnan(masked) & ~np.isnan(phenotype), want)
+    np.testing.assert_array_equal(rows, want.any(axis=1))
+
+
 def test_api_phenotype_outlier_rows_are_recorded(tmp_path, monkeypatch):
     from test_jagwas_variant_devices import fixture, rows
     from torchgwas.api import run_linear_gwas

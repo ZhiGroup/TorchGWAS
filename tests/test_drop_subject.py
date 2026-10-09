@@ -1,5 +1,8 @@
 """missing_phenotype='drop_subject': a run is the run on inputs without those samples.
 
+It is the default for JAGWAS only; elsewhere the default is 'exact' (each
+trait on its own observed samples), so these tests ask for the drop.
+
 A sample with any missing (or outlier-masked) phenotype value leaves the
 analysis for every trait, so each backend must give what it gives when the
 genotype, phenotype and covariate files simply do not contain that sample.
@@ -100,6 +103,8 @@ def _tolerance(options):
 
 
 COMMON = dict(chunk_size=4, reader_workers=2, prefetch_chunks=2, sumstats_block_bytes=64)
+# The default is 'exact' except for JAGWAS; these tests ask for the drop.
+DROP = dict(missing_phenotype='drop_subject')
 
 
 @pytest.mark.parametrize('fmt', ['pgen', 'bed'])
@@ -112,9 +117,10 @@ def test_dropping_subjects_matches_inputs_without_them(tmp_path, monkeypatch, fm
     kept = np.setdiff1d(np.arange(N), MISSING[0])
     full, load = _genotype(tmp_path, 'full', fmt, calls, None)
     subset, _ = _genotype(tmp_path, 'subset', fmt, calls[kept], kept)
-    result = run_linear_gwas(full, phenotype, covariates, output_dir=tmp_path / 'dropped', **load, **options, **COMMON)
+    result = run_linear_gwas(full, phenotype, covariates, output_dir=tmp_path / 'dropped', **load, **options,
+                             **COMMON, **DROP)
     run_linear_gwas(subset, phenotype[kept], covariates[kept], output_dir=tmp_path / 'reference',
-                    **load, **options, **COMMON)
+                    **load, **options, **COMMON, **DROP)
     assert result.run_metadata['dropped_subjects'] == len(MISSING[0])
     assert result.run_metadata['missing_phenotype'] == 'drop_subject'
     _assert_same_output(tmp_path / 'dropped', tmp_path / 'reference', *_tolerance(options))
@@ -124,25 +130,28 @@ def test_in_memory_arrays_drop_subjects(tmp_path):
     calls, covariates, phenotype = _panel(missing_calls=False)
     kept = np.setdiff1d(np.arange(N), MISSING[0])
     genotype = _dosage(calls)
-    options = dict(device='cpu', compute_dtype='float64', chunk_size=4)
+    options = dict(device='cpu', compute_dtype='float64', chunk_size=4, **DROP)
     dropped = run_linear_gwas(genotype, phenotype, covariates, output_dir=tmp_path / 'dropped', **options)
     run_linear_gwas(genotype[kept], phenotype[kept], covariates[kept], output_dir=tmp_path / 'reference', **options)
     assert dropped.run_metadata['dropped_subjects'] == len(MISSING[0])
     _assert_same_output(tmp_path / 'dropped', tmp_path / 'reference', 1e-10, 1e-10)
 
 
+@pytest.mark.parametrize('policy', ['drop_subject', None])
 @pytest.mark.parametrize('outlier_sd', [None, 4.0])
-def test_a_one_dimensional_trait_drops_like_one_column(tmp_path, outlier_sd):
-    # np.loadtxt returns a one-column phenotype file 1-D; the default policy
-    # must treat it as the single column it is.
+def test_a_one_dimensional_trait_drops_like_one_column(tmp_path, outlier_sd, policy):
+    # np.loadtxt returns a one-column phenotype file 1-D; each policy must
+    # treat it as the single column it is.
     calls, covariates, phenotype = _panel(missing_calls=False)
     trait = np.nan_to_num(phenotype[:, 1])
     trait[[2, 40]] = np.nan
     trait[30] = 40.0
-    options = dict(device='cpu', compute_dtype='float64', chunk_size=4, phenotype_outlier_sd=outlier_sd)
+    options = dict(device='cpu', compute_dtype='float64', chunk_size=4, phenotype_outlier_sd=outlier_sd,
+                   missing_phenotype=policy)
     flat = run_linear_gwas(_dosage(calls), trait, covariates, output_dir=tmp_path / 'flat', **options)
     column = run_linear_gwas(_dosage(calls), trait[:, None], covariates, output_dir=tmp_path / 'column', **options)
-    assert flat.run_metadata['dropped_subjects'] == column.run_metadata['dropped_subjects'] == 2 + (outlier_sd is not None)
+    dropped = 2 + (outlier_sd is not None) if policy == 'drop_subject' else 0
+    assert flat.run_metadata['dropped_subjects'] == column.run_metadata['dropped_subjects'] == dropped
     _assert_same_output(tmp_path / 'flat', tmp_path / 'column', 0, 0)
 
 
@@ -188,11 +197,48 @@ def test_outlier_rows_leave_every_trait(tmp_path, monkeypatch):
     full, load = _genotype(tmp_path, 'full', 'pgen', calls, None)
     subset, _ = _genotype(tmp_path, 'subset', 'pgen', calls[kept], kept)
     result = run_linear_gwas(full, phenotype, covariates, phenotype_outlier_sd=4.0,
-                             output_dir=tmp_path / 'dropped', **load, **options, **COMMON)
+                             output_dir=tmp_path / 'dropped', **load, **options, **COMMON, **DROP)
     run_linear_gwas(subset, phenotype[kept], covariates[kept], output_dir=tmp_path / 'reference',
-                    **load, **options, **COMMON)
+                    **load, **options, **COMMON, **DROP)
     assert result.run_metadata['dropped_subjects'] == int(rows.sum())
     _assert_same_output(tmp_path / 'dropped', tmp_path / 'reference', 1e-10, 1e-10)
+
+
+def test_the_default_tests_each_trait_on_its_own_subjects(tmp_path):
+    calls, covariates, phenotype = _panel(missing_calls=False)
+    options = dict(device='cpu', compute_dtype='float64', chunk_size=4)
+    default = run_linear_gwas(_dosage(calls), phenotype, covariates, output_dir=tmp_path / 'default', **options)
+    run_linear_gwas(_dosage(calls), phenotype, covariates, missing_phenotype='exact',
+                    output_dir=tmp_path / 'exact', **options)
+    assert default.run_metadata['missing_phenotype'] == 'exact'
+    assert default.run_metadata['dropped_subjects'] == 0
+    _assert_same_output(tmp_path / 'default', tmp_path / 'exact', 0, 0)
+
+
+def test_an_outlier_masks_only_its_value_by_default(tmp_path):
+    calls, covariates, phenotype = _panel(missing_calls=False)
+    phenotype = np.nan_to_num(phenotype)
+    phenotype[[5, 30], [1, 2]] = 40.0
+    masked, rows = mask_phenotype_outliers(phenotype, covariates, 4.0, whole_rows=False)
+    assert np.isnan(masked).sum() == 2 and np.isnan(masked[[5, 30], [1, 2]]).all()
+    options = dict(device='cpu', compute_dtype='float64', chunk_size=4)
+    result = run_linear_gwas(_dosage(calls), phenotype, covariates, phenotype_outlier_sd=4.0,
+                             output_dir=tmp_path / 'default', **options)
+    run_linear_gwas(_dosage(calls), masked, covariates, missing_phenotype='exact',
+                    output_dir=tmp_path / 'reference', **options)
+    assert result.run_metadata['dropped_subjects'] == 0
+    assert result.run_metadata['phenotype_outlier_rows'] == int(rows.sum()) == 2
+    _assert_same_output(tmp_path / 'default', tmp_path / 'reference', 0, 0)
+
+
+def test_jagwas_defaults_to_dropping_subjects(tmp_path, monkeypatch):
+    options = _backend(monkeypatch, 'cpu')
+    calls, covariates, phenotype = _panel(missing_calls=False)
+    full, load = _genotype(tmp_path, 'full', 'pgen', calls, None)
+    result = run_linear_gwas(full, phenotype, covariates, reduce='jagwas', output_dir=tmp_path / 'jagwas',
+                             **load, **options, **COMMON)
+    assert result.run_metadata['missing_phenotype'] == 'drop_subject'
+    assert result.run_metadata['dropped_subjects'] == len(MISSING[0])
 
 
 def test_complete_panel_is_untouched(tmp_path):
@@ -341,10 +387,10 @@ def test_uint8_dosage_rows_mask_the_dropped_subjects_on_torch(tmp_path, monkeypa
     subset = _write_pgen(tmp_path / 'subset.pgen', calls[kept], kept)
     load = dict(genotype_format='pgen', pgen_mode='dosage')
     result = run_linear_gwas(full, phenotype, covariates, output_dir=tmp_path / 'dropped',
-                             **load, **options, **COMMON)
+                             **load, **options, **COMMON, **DROP)
     assert result.run_metadata['dropped_subjects'] == len(MISSING[0])
     run_linear_gwas(subset, phenotype[kept], covariates[kept], output_dir=tmp_path / 'reference',
-                    **load, **options, **COMMON)
+                    **load, **options, **COMMON, **DROP)
     _assert_same_output(tmp_path / 'dropped', tmp_path / 'reference', 3e-5, 3e-6)
 
 
@@ -408,12 +454,12 @@ def test_a_mapped_panel_is_read_by_rows(tmp_path, monkeypatch, mode):
             stack.enter_context(patch.object(PhenotypeRowView, '__array__',
                                              side_effect=AssertionError('the whole panel was copied')))
         result = run_linear_gwas(full, tmp_path / 'y.npy', covariates, output_dir=tmp_path / 'dropped',
-                                 **load, **options, **COMMON, **extra)
+                                 **load, **options, **COMMON, **DROP, **extra)
     assert result.run_metadata['dropped_subjects'] == len(MISSING[0])
     if mode != 'min-p':  # min-p reads the panel into memory, so it is copied
         assert seen and isinstance(seen[0], (PhenotypeRowView, PhenotypeColumnView)), type(seen[0])
     run_linear_gwas(subset, tmp_path / 'y_kept.npy', covariates[kept], output_dir=tmp_path / 'reference',
-                    **load, **options, **COMMON, **extra)
+                    **load, **options, **COMMON, **DROP, **extra)
     if mode == 'tiles':
         _assert_same_output(tmp_path / 'dropped', tmp_path / 'reference', 1e-10, 1e-10)
         return

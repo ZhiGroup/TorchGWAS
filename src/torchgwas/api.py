@@ -815,17 +815,18 @@ def run_linear_gwas(
     # covariate-residualised trait before the scan (preprocess.
     # mask_phenotype_outliers). Under missing_phenotype='drop_subject' (and
     # always for reduce='jagwas') the sample's whole panel row is masked;
-    # under 'impute' per-trait scans mask the value.
+    # otherwise just the value.
     phenotype_outlier_sd: float | None = None,
     # How a missing (NaN or outlier-masked) phenotype value is handled.
     # 'drop_subject': a sample missing any trait leaves the analysis for every
     # trait, so each statistic is exact OLS on the kept samples (the run equals
     # one on inputs with those samples removed). 'impute': the release
     # convention -- the trait mean, t times sqrt(trait_df / df), pair df
-    # variant_df x trait_df / df. 'exact' (opt-in): each trait is tested on its
-    # own observed samples, complete-case OLS at each pair's own df
+    # variant_df x trait_df / df. 'exact': each trait is tested on its own
+    # observed samples, complete-case OLS at each pair's own df
     # (complete_case.py); not for JAGWAS, which needs one sample set.
-    missing_phenotype: str = "drop_subject",
+    # None (the default): 'drop_subject' for reduce='jagwas', 'exact' otherwise.
+    missing_phenotype: str | None = None,
 ) -> GWASResult:
     """Run associations, optionally saving bounded early productive measurements.
 
@@ -905,6 +906,10 @@ def run_linear_gwas(
                                   output_dir=output_dir, options=locals())
     if sumstats_format not in {"binary", "none"}:
         raise ValueError("sumstats_format must be 'binary' or 'none'; TSV output has been removed")
+    if missing_phenotype is None:
+        # JAGWAS's joint test needs one sample set, so a sample missing any
+        # trait leaves it; every other mode tests each trait on its own samples.
+        missing_phenotype = "drop_subject" if reduce == "jagwas" else "exact"
     if missing_phenotype not in ("drop_subject", "impute", "exact"):
         raise ValueError("missing_phenotype must be 'drop_subject', 'impute' or 'exact'")
     if missing_phenotype == "exact" and reduce == "jagwas":
