@@ -175,6 +175,60 @@ class PhenotypeRowView:
         return np.asarray(self.values[self.rows],dtype=dtype)
 
 
+class PhenotypeMaskView:
+    """A memory-mapped or lazy panel with its outlier cells read as NaN (mask_phenotype_outliers).
+
+    The masked cells are kept by column (column_starts into cell_rows, as a
+    CSC matrix), plus whole rows for JAGWAS, and applied to each block a
+    consumer reads, so a voxel-scale panel is never copied whole: its 56
+    million masked cells are 0.4 GB, the panel 267 GB.
+    """
+    def __init__(self,values,column_starts,cell_rows,masked_rows=None,row_index=None):
+        self.values,self.column_starts,self.cell_rows=values,column_starts,cell_rows
+        self.masked_rows,self.row_index=masked_rows,row_index
+        rows=values.shape[0] if row_index is None else len(row_index)
+        self.shape=(rows,values.shape[1])
+        self.ndim=2
+        self.dtype=np.result_type(np.dtype(values.dtype),np.float32)
+
+    def __getitem__(self,key):
+        if not isinstance(key,tuple):
+            # A row selection stays lazy (PhenotypeColumnView indexes rows first).
+            rows=np.arange(self.shape[0])[key]
+            return PhenotypeMaskView(self.values,self.column_starts,self.cell_rows,self.masked_rows,
+                                     rows if self.row_index is None else self.row_index[rows])
+        rows,columns=key
+        rows=slice(None) if rows is Ellipsis else rows
+        squeeze=[isinstance(index,(int,np.integer)) for index in (rows,columns)]
+        rows,columns=([index] if scalar else np.ravel(index) if isinstance(index,np.ndarray) else index
+                      for index,scalar in zip((rows,columns),squeeze))
+        chosen=np.arange(self.values.shape[1])[columns]
+        selected=np.arange(self.values.shape[0]) if self.row_index is None else self.row_index
+        selected=selected[rows]
+        # Columns first: a slice of a memmap is a view, so only these rows of these columns are read.
+        block=self.values[:,columns] if isinstance(columns,slice) else self.values[:,chosen]
+        out=np.array(np.asarray(block)[selected],dtype=self.dtype)
+        counts=self.column_starts[chosen+1]-self.column_starts[chosen]
+        if counts.sum():
+            ends=np.cumsum(counts)
+            cells=np.arange(ends[-1])-np.repeat(ends-counts,counts)+np.repeat(self.column_starts[chosen],counts)
+            position=np.full(self.values.shape[0],-1,dtype=np.int64)
+            position[selected]=np.arange(len(selected))
+            at=position[self.cell_rows[cells]]
+            keep=at>=0
+            out[at[keep],np.repeat(np.arange(len(chosen)),counts)[keep]]=np.nan
+        if self.masked_rows is not None:
+            out[self.masked_rows[selected]]=np.nan
+        if squeeze[1]:
+            out=out[:,0]
+        return out[0] if squeeze[0] else out
+
+    def __array__(self,dtype=None,copy=None):
+        if copy is False:
+            raise ValueError('Masked phenotype values require a copy')
+        return np.asarray(self[:,:],dtype=dtype)
+
+
 def prepare_inputs_for_prep(
     genotype,
     phenotype: np.ndarray,
@@ -705,11 +759,15 @@ def standardize_genotype(genotype_chunk: np.ndarray) -> np.ndarray:
     return centered / std
 
 
-def mask_phenotype_outliers(phenotype, covariates, threshold, *, whole_rows):
+def mask_phenotype_outliers(phenotype, covariates, threshold, *, whole_rows, block=None):
     """Set phenotype values beyond `threshold` SD of their covariate-residualised,
     standardised trait to missing; return the masked FP64 copy and the affected rows.
     A trait with missing values is residualised and standardised on its
-    observed values only.
+    observed values only. With nothing to mask the panel comes back as it
+    was, so a clean run is the run without masking.
+
+    A memory-mapped or lazy panel is read `block` traits at a time (at most
+    MASK_BLOCK_BYTES of FP64) and comes back as a PhenotypeMaskView.
 
     whole_rows (JAGWAS): a sample with any such value loses its whole panel row.
     On near-collinear imaging panels a few samples, extreme in many traits at
@@ -721,20 +779,72 @@ def mask_phenotype_outliers(phenotype, covariates, threshold, *, whole_rows):
     """
     if not (threshold > 0 and np.isfinite(threshold)):
         raise ValueError("phenotype_outlier_sd must be a positive number")
+    # A memory-mapped or lazy (2-D, read by slicing) panel is masked on read, not copied.
+    basis = None if covariates is None or np.shape(covariates)[1] == 0 else _covariate_basis(covariates)
+    if len(getattr(phenotype, 'shape', ())) == 2 and (isinstance(phenotype, np.memmap)
+                                                     or not isinstance(phenotype, np.ndarray)):
+        return _mask_panel_outliers(phenotype, covariates, basis, threshold, whole_rows, block)
     values = np.array(phenotype, dtype=np.float64)
     # A single trait may arrive 1-D; mask it as one column and return it 1-D.
     one_trait = values.ndim == 1
     if one_trait:
         values = values[:, None]
-    # Each trait residualised and scaled on its own observed values. Mean-filled
-    # missing cells would shrink the SD by sqrt(observed / samples): at half
-    # missing a 4 SD cutoff masked about 60 times the values it should.
-    standardized, _ = residualize_and_standardize(values, covariates, missing="complete_case")
-    extreme = np.abs(standardized) > threshold
+    extreme = _extreme_cells(values, covariates, basis, threshold)
     rows = extreme.any(axis=1)
+    if not rows.any():
+        return phenotype, rows
     if whole_rows:
         values[rows] = np.nan
     else:
         values[extreme] = np.nan
     return (values[:, 0] if one_trait else values), rows
+
+
+def _extreme_cells(values, covariates, basis, threshold):
+    """(samples, traits) bool: the FP64 values beyond `threshold` SD of their covariate-residualised trait."""
+    # Each trait residualised and scaled on its own observed values. Mean-filled
+    # missing cells would shrink the SD by sqrt(observed / samples): at half
+    # missing a 4 SD cutoff masked about 60 times the values it should.
+    standardized, _ = residualize_and_standardize(values, covariates, missing="complete_case",
+                                                  _prevalidated_covariate_basis=basis)
+    extreme = np.abs(standardized) > threshold
+    # A trait QC drops (constant, or under two observed values) has residuals
+    # of rounding noise: their z is meaningless, and under JAGWAS's whole-row
+    # masking a constant trait once masked every sample.
+    keep, _ = _phenotype_column_mask(values)
+    extreme[:, ~keep] = False
+    return extreme
+
+
+# FP64 bytes of one column block while a mapped panel's outliers are found.
+MASK_BLOCK_BYTES = 256 << 20
+
+
+def _mask_panel_outliers(phenotype, covariates, basis, threshold, whole_rows, block=None):
+    """mask_phenotype_outliers for a memory-mapped or lazy panel: a PhenotypeMaskView, not a copy.
+
+    The extreme cells are found a block of columns at a time (each trait is
+    residualised on its own observed values, so blocks are independent) and
+    masked as the scan reads them. A FP64 copy of a 33,417 x 2M voxel panel
+    would be 535 GB.
+    """
+    n, k = (int(size) for size in phenotype.shape)
+    width = max(1, MASK_BLOCK_BYTES // (8 * max(n, 1)))
+    width = width if block is None else max(1, min(width, int(block)))
+    counts = np.zeros(k, dtype=np.int64)
+    cell_rows, rows = [], np.zeros(n, dtype=bool)
+    for start in range(0, k, width):
+        values = np.asarray(phenotype[:, start:start + width], dtype=np.float64)
+        extreme = _extreme_cells(values, covariates, basis, threshold)
+        rows |= extreme.any(axis=1)
+        column, row = np.nonzero(extreme.T)
+        counts[start:start + values.shape[1]] = np.bincount(column, minlength=values.shape[1])
+        cell_rows.append(row.astype(np.int64))
+    if not rows.any():
+        return phenotype, rows
+    starts = np.concatenate([[0], np.cumsum(counts)])
+    cells = np.concatenate(cell_rows) if cell_rows else np.empty(0, dtype=np.int64)
+    if whole_rows:
+        return PhenotypeMaskView(phenotype, np.zeros(k + 1, dtype=np.int64), cells[:0], masked_rows=rows), rows
+    return PhenotypeMaskView(phenotype, starts, cells), rows
 

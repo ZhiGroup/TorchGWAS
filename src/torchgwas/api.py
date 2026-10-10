@@ -811,12 +811,12 @@ def run_linear_gwas(
     # a dict with rcond or min_residual, or a bare rcond; jagwas_rcond and
     # jagwas_min_residual apply to groups without their own.
     jagwas_groups=None,
-    # Opt-in: mask phenotype values beyond this many SD of their
-    # covariate-residualised trait before the scan (preprocess.
-    # mask_phenotype_outliers). Under missing_phenotype='drop_subject' (and
-    # always for reduce='jagwas') the sample's whole panel row is masked;
+    # Mask phenotype values beyond this many SD of their covariate-residualised
+    # trait before the scan (preprocess.mask_phenotype_outliers); 5 by
+    # default, None or 0 turns it off. Under missing_phenotype='drop_subject'
+    # (and always for reduce='jagwas') the sample's whole panel row is masked;
     # otherwise just the value.
-    phenotype_outlier_sd: float | None = None,
+    phenotype_outlier_sd: float | None = 5.0,
     # How a missing (NaN or outlier-masked) phenotype value is handled.
     # 'drop_subject': a sample missing any trait leaves the analysis for every
     # trait, so each statistic is exact OLS on the kept samples (the run equals
@@ -1047,11 +1047,15 @@ def run_linear_gwas(
     # joint test keeps every subject its own traits observe.
     grouped_drop = missing_phenotype == "drop_subject" and reduce == "jagwas" and jagwas_groups is not None
     outlier_rows = None
+    if phenotype_outlier_sd is not None and float(phenotype_outlier_sd) == 0:
+        phenotype_outlier_sd = None                 # 0 turns the default masking off
     if phenotype_outlier_sd is not None:
         from .preprocess import mask_phenotype_outliers
         phenotype, outlier_rows = mask_phenotype_outliers(
             phenotype, None if covariates is None else np.asarray(covariates), float(phenotype_outlier_sd),
-            whole_rows=not grouped_drop and (reduce == "jagwas" or missing_phenotype == "drop_subject"))
+            whole_rows=not grouped_drop and (reduce == "jagwas" or missing_phenotype == "drop_subject"),
+            # A mapped panel is read no wider than QC will read it.
+            block=autotuner.qc_trait_block if autotuner is not None else trait_block)
     dropped_subjects = 0
     dropped_by_group = None
     # What the scans do with a missing value: none remains after a drop.

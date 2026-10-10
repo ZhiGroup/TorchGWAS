@@ -23,10 +23,12 @@ are handled by `--missing-phenotype`:
 - `impute`: the earlier convention, with the trait mean and the trait's own
   degrees of freedom.
 
-`--phenotype-outlier-sd K` masks values more than K standard deviations from
-their covariate-adjusted trait, measured on the trait's observed values. Under
+Phenotype values more than 5 standard deviations from their covariate-adjusted
+trait are masked by default, measured on the trait's observed values.
+`--phenotype-outlier-sd K` sets the cutoff, and `0` turns masking off. Under
 `drop_subject` (so JAGWAS by default) the sample's whole row is masked;
-otherwise just the value.
+otherwise just the value. A memory-mapped panel is masked as it is read, not
+copied.
 
 ## Features
 

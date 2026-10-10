@@ -129,11 +129,11 @@ def _build_parser() -> argparse.ArgumentParser:
              "with the trait's own df",
     )
     linear.add_argument(
-        "--phenotype-outlier-sd", type=float, default=None,
+        "--phenotype-outlier-sd", type=float, default=5.0,
         help="mask phenotype values beyond this many SD of their "
              "covariate-residualised trait, measured on its observed values "
              "(the whole sample under --missing-phenotype drop_subject or "
-             "--reduce jagwas, else just the value)",
+             "--reduce jagwas, else just the value); default 5, 0 turns it off",
     )
     linear.add_argument(
         "--significance-threshold", type=float, default=None,

@@ -525,6 +525,10 @@ def test_phenotype_outliers_mask_whole_rows_for_jagwas_and_values_otherwise():
     assert np.isnan(values_masked).sum() == 1 and np.isnan(values_masked[7, 1])
     with pytest.raises(ValueError):
         mask_phenotype_outliers(phenotype, covariates, 0.0, whole_rows=True)
+    # A constant trait (QC drops it) has residuals of rounding noise and is never masked.
+    constant = np.column_stack([phenotype, np.ones(400), np.r_[np.ones(399), np.nan]])
+    masked, rows = mask_phenotype_outliers(constant, covariates, 5.0, whole_rows=True)
+    assert np.flatnonzero(rows).tolist() == [7]
 
 
 def test_phenotype_outliers_are_measured_on_each_traits_observed_values():
@@ -562,6 +566,81 @@ def test_api_phenotype_outlier_rows_are_recorded(tmp_path, monkeypatch):
     assert result.run_metadata['phenotype_outlier_rows'] == 1 and result.run_metadata['phenotype_outlier_sd'] == 5.0
     manifest, values = rows(tmp_path / 'out')
     assert manifest['df'] == 6 and len(values) > 0
+
+
+def test_outliers_are_masked_at_5_sd_by_default_and_0_turns_it_off(tmp_path, monkeypatch):
+    from test_jagwas_variant_devices import fixture
+    from torchgwas.api import run_linear_gwas
+    monkeypatch.setenv('TORCHGWAS_PGEN_BACKEND', 'native')
+    path, _, y, c = fixture(tmp_path, 'pgen', missing=False)
+    extreme = np.array(y, dtype=np.float64)
+    extreme[3, 2] = 1e3
+    options = dict(genotype_format='pgen', compute_dtype='float32', chunk_size=8, reader_workers=2,
+                   reduce='jagwas', sumstats_queue_depth=1, device='cpu')
+    default = run_linear_gwas(path, extreme, c, output_dir=tmp_path / 'default', **options)
+    assert default.run_metadata['phenotype_outlier_sd'] == 5.0 and default.run_metadata['phenotype_outlier_rows'] == 1
+    off = run_linear_gwas(path, extreme, c, output_dir=tmp_path / 'off', phenotype_outlier_sd=0, **options)
+    assert off.run_metadata['phenotype_outlier_sd'] is None and off.run_metadata['phenotype_outlier_rows'] is None
+
+
+@pytest.mark.parametrize('whole_rows', [False, True])
+def test_a_mapped_panel_is_masked_on_read_as_a_copy_would_be(tmp_path, monkeypatch, whole_rows):
+    # Three column blocks; every way the scan and QC read a panel.
+    from torchgwas import preprocess
+    from torchgwas.preprocess import (PhenotypeColumnView, PhenotypeMaskView, PhenotypeRowView,
+                                      mask_phenotype_outliers)
+    rng = np.random.default_rng(7)
+    n, k = 300, 50
+    covariates = rng.standard_normal((n, 2))
+    panel = (rng.standard_normal((n, k)) + covariates[:, :1]).astype(np.float32)
+    panel[rng.random(panel.shape) < 0.03] = np.nan
+    for row, column in ((4, 2), (17, 20), (17, 21), (250, 49), (100, 33)):
+        panel[row, column] = 30.0
+    np.save(tmp_path / 'panel.npy', panel)
+    mapped = np.load(tmp_path / 'panel.npy', mmap_mode='r')
+    monkeypatch.setattr(preprocess, 'MASK_BLOCK_BYTES', 8 * n * 20)
+    want, want_rows = mask_phenotype_outliers(np.array(panel), covariates, 4.0, whole_rows=whole_rows)
+    view, rows = mask_phenotype_outliers(mapped, covariates, 4.0, whole_rows=whole_rows)
+    assert isinstance(view, PhenotypeMaskView) and view.shape == (n, k)
+    np.testing.assert_array_equal(rows, want_rows)
+    assert rows[[4, 17, 250, 100]].all()
+    np.testing.assert_array_equal(np.asarray(view), want)
+    picked, columns = np.array([3, 4, 17, 299]), np.array([2, 20, 21, 33, 49])
+    np.testing.assert_array_equal(view[:, 15:35], want[:, 15:35])
+    np.testing.assert_array_equal(view[picked, 10:40], want[picked, 10:40])
+    np.testing.assert_array_equal(view[np.ix_(picked, columns)], want[np.ix_(picked, columns)])
+    np.testing.assert_array_equal(view[10:20][..., columns], want[10:20][:, columns])
+    np.testing.assert_array_equal(view[:, 21], want[:, 21])
+    assert np.asarray(view[:0]).shape == (0, k) and np.isnan(view[17, 20])
+    np.testing.assert_array_equal(PhenotypeColumnView(view, columns)[:, 1:4], want[:, columns[1:4]])
+    np.testing.assert_array_equal(PhenotypeRowView(view, picked)[:, 18:24], want[picked, 18:24])
+
+
+def test_a_mapped_panel_path_scans_as_the_premasked_panel(tmp_path, monkeypatch):
+    from test_jagwas_variant_devices import fixture
+    from torchgwas.api import run_linear_gwas
+    from torchgwas.preprocess import mask_phenotype_outliers
+    from torchgwas.sumstats_indexed import open_indexed_sumstats
+    monkeypatch.setenv('TORCHGWAS_PGEN_BACKEND', 'native')
+    path, _, y, c = fixture(tmp_path, 'pgen', missing=False)
+    extreme = np.array(y, dtype=np.float32)
+    extreme[3, 2], extreme[11, 0] = 1e3, -1e3
+    np.save(tmp_path / 'panel.npy', extreme)
+    options = dict(genotype_format='pgen', compute_dtype='float32', chunk_size=8, reader_workers=2,
+                   reduce='significant', significance_threshold=1.0, sumstats_queue_depth=1, device='cpu')
+    run_linear_gwas(path, str(tmp_path / 'panel.npy'), c, output_dir=tmp_path / 'mapped', **options)
+    masked, _ = mask_phenotype_outliers(extreme, c, 5.0, whole_rows=False)
+    run_linear_gwas(path, masked.astype(np.float32), c, output_dir=tmp_path / 'copy',
+                    phenotype_outlier_sd=None, **options)
+    found = {}
+    for name in ('mapped', 'copy'):
+        _, parts = open_indexed_sumstats(tmp_path / name / 'sumstats')
+        parts = list(parts)
+        found[name] = {key: np.concatenate([part[key] for part in parts]) for key in parts[0]}
+    for key in ('variant_index', 'trait_index', 'df'):
+        np.testing.assert_array_equal(found['mapped'][key], found['copy'][key], err_msg=key)
+    np.testing.assert_allclose(found['mapped']['t_stat'], found['copy']['t_stat'], rtol=1e-5)
+    assert (found['mapped']['df'] < found['mapped']['df'].max()).any()     # the masked cells' traits lost a sample
 
 
 

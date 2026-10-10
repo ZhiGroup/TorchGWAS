@@ -49,8 +49,11 @@ def test_full_output_computes_basis_once_and_all_workers_share_it(tmp_path,axis,
     rng=np.random.default_rng(1952);n,m,k=97,19,7
     bed=_write_bed(tmp_path/'input',rng.integers(0,3,size=(n,m)).astype(float))
     y=rng.normal(size=(n,k)).astype(np.float32);c=rng.normal(size=(n,3)).astype(np.float32)
+    # Outlier masking (on by default) is a pre-pass with its own basis; this
+    # counts the scan's, which its tile and shard workers must share.
     kwargs=dict(device=devices[0],compute_dtype='float32',chunk_size=4,reader_workers=4,
-        prefetch_chunks=4,sumstats_block_bytes=64,sumstats_queue_depth=1,sumstats_fsync=True)
+        prefetch_chunks=4,sumstats_block_bytes=64,sumstats_queue_depth=1,sumstats_fsync=True,
+        phenotype_outlier_sd=None)
     run_linear_gwas(PlinkBedGenotype(bed),y,c,output_dir=tmp_path/'reference',**kwargs)
     passed=[];original=linear.residualize_and_standardize
     def observe(*args,**kwargs):
