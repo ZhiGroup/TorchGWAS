@@ -82,6 +82,65 @@ def test_the_plan_groups_patterns_and_counts_the_subset_rank():
     np.testing.assert_array_equal(imputed[-1].traits, plan.traits)
 
 
+def _pattern_reference(observed, q):
+    """The plan pattern by pattern: each trait's missing rows, each pattern's own eigendecomposition."""
+    basis = complete_case.complete_case_basis(observed.shape[0], q)
+    gram = basis.T @ basis
+    traits = np.flatnonzero(~observed.all(axis=0))
+    index, rows, of_trait, inverse, rank = {}, [], [], [], []
+    for trait in traits:
+        missing = np.flatnonzero(~observed[:, trait])
+        if missing.tobytes() not in index:
+            index[missing.tobytes()] = len(rows)
+            rows.append(missing)
+            values, vectors = np.linalg.eigh(gram - basis[missing].T @ basis[missing])
+            keep = values > 1e-9 * max(values.max(), 1e-300)
+            inverse.append((vectors[:, keep] / values[keep]) @ vectors[:, keep].T)
+            rank.append(int(keep.sum()))
+        of_trait.append(index[missing.tobytes()])
+    return traits, rows, np.array(of_trait), np.array(inverse), np.array(rank)
+
+
+@pytest.mark.parametrize('cells', [complete_case.DOWNDATE_CELLS, 7])
+def test_the_batched_plan_matches_a_pattern_by_pattern_reference(monkeypatch, cells):
+    # 7 cells a batch: most patterns share batches, the 150-row one has its own.
+    monkeypatch.setattr(complete_case, 'DOWNDATE_CELLS', cells)
+    calls, y, covariates = _panel()
+    y = np.column_stack([y, y[:, [6, 3]]])                 # more traits sharing patterns
+    from torchgwas.preprocess import _covariate_basis
+    q = _covariate_basis(covariates)
+    observed = ~np.isnan(y)
+    plan = complete_case.CompleteCasePlan(observed, q)
+    traits, rows, of_trait, inverse, rank = _pattern_reference(observed, q)
+    np.testing.assert_array_equal(plan.traits, traits)
+    np.testing.assert_array_equal(plan.pattern_of_trait, of_trait)
+    assert len(plan.rows) == len(rows) and all(np.array_equal(a, b) for a, b in zip(plan.rows, rows))
+    np.testing.assert_allclose(plan.inverse, inverse, rtol=1e-9, atol=1e-12)
+    np.testing.assert_array_equal(plan.subset_rank, rank)
+    np.testing.assert_array_equal(plan.observed_counts, [observed.shape[0] - len(r) for r in rows])
+    # The panel read a few columns at a time gives the same plan; a complete one none.
+    panel = complete_case.CompleteCasePlan.from_panel(y, q, block=3)
+    np.testing.assert_array_equal(panel.pattern_of_trait, plan.pattern_of_trait)
+    np.testing.assert_array_equal(panel.inverse, plan.inverse)
+    assert complete_case.CompleteCasePlan.from_panel(np.nan_to_num(y), q) is None
+    # A block of traits residualized at once is each trait residualized alone.
+    block = plan.residualize_block(y[:, plan.traits], plan.traits)
+    for column, trait in enumerate(plan.traits):
+        np.testing.assert_allclose(block[:, column], plan.residualize(y[:, trait], trait), rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize('trait_block', [1, 3, 4096])
+def test_residualizing_in_blocks_is_trait_by_trait(trait_block):
+    calls, y, covariates = _panel()
+    got, q, plan = residualize_and_standardize(y, covariates, missing='complete_case', return_plan=True,
+                                               trait_block=trait_block)
+    for trait in plan.traits:
+        np.testing.assert_allclose(got[:, trait], plan.residualize(y[:, trait], trait), rtol=1e-10, atol=1e-12)
+    complete = np.setdiff1d(np.arange(y.shape[1]), plan.traits)
+    want = residualize_and_standardize(y[:, complete], covariates)[0]
+    np.testing.assert_allclose(got[:, complete], want, rtol=1e-10, atol=1e-12)
+
+
 def test_small_blocks_and_split_patterns_give_the_same_answer(monkeypatch):
     calls, y, covariates = _panel()
     _, want, _, _ = linear_scan(calls, y, covariates, device='cpu', missing_phenotype='exact', compute_dtype='float64')
@@ -107,6 +166,97 @@ def test_missing_calls_leave_the_pair_with_its_own_count():
     np.testing.assert_array_equal(pair_df.numpy(), both - subset_rank[None, :] - 1)
     np.testing.assert_array_equal(variant_df.numpy(), (~np.isnan(calls)).sum(0) - rank - 2)
     assert np.isfinite(t.numpy()).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('missing', ['exact', 'impute'])
+@pytest.mark.parametrize('stats', ['native', 'torch'])
+def test_significant_pairs_select_on_the_device_at_each_pairs_df(tmp_path, monkeypatch, stats, missing):
+    # Missing-phenotype pairs leave the device already selected, each at its
+    # own df (whole numbers under 'exact', fractional under 'impute'): the
+    # same pairs, t and df as the host selector, and under 'exact' the reference.
+    from torchgwas.api import run_linear_gwas
+    from torchgwas.sumstats_indexed import open_indexed_sumstats
+    from test_pgen_native_reader import write_pgen
+    calls, y, covariates = _panel(n=203, m=37)
+    want_t, want_df = _reference(calls, y, covariates)
+    n, m = calls.shape
+    path = tmp_path / 'input.pgen'
+    written = calls.T.astype(np.uint8)
+    if missing == 'impute':
+        # Missing calls give each variant its own df, so 'impute' pair df turn fractional.
+        written[np.random.default_rng(8).random(written.shape) < 0.03] = 3
+    write_pgen(path, written)
+    path.with_suffix('.pvar').write_text('#CHROM\tPOS\tID\tREF\tALT\n' + ''.join(f'1\t{i+1}\tv{i}\tA\tC\n' for i in range(m)))
+    path.with_suffix('.psam').write_text('#IID\n' + ''.join(f's{i}\n' for i in range(n)))
+    monkeypatch.setenv('TORCHGWAS_PGEN_BACKEND', 'native')
+    monkeypatch.setenv('TORCHGWAS_NATIVE_STATS', '1' if stats == 'native' else '0')
+    threshold = 0.2
+    found, calls = {}, []
+    selector = complete_case.device_significant_pairs_by_pair_df
+
+    def spy(*args, **kwargs):
+        calls.append(backend)
+        yield from selector(*args, **kwargs)
+    monkeypatch.setattr(complete_case, 'device_significant_pairs_by_pair_df', spy)
+    for backend in ('device', 'host'):
+        monkeypatch.setenv('TORCHGWAS_SIGNIFICANCE_BACKEND', backend)
+        result = run_linear_gwas(path, y.astype(np.float32), covariates.astype(np.float32),
+                                 output_dir=tmp_path / backend, missing_phenotype=missing, reduce='significant',
+                                 significance_threshold=threshold, genotype_format='pgen', pgen_mode='hardcall',
+                                 device='cuda:0', compute_dtype='float32', chunk_size=8, reader_workers=2,
+                                 prefetch_chunks=2, sumstats_queue_depth=1)
+        _, parts = open_indexed_sumstats(tmp_path / backend / 'sumstats')
+        parts = list(parts)
+        found[backend] = {key: np.concatenate([part[key] for part in parts]) for key in parts[0]}
+    assert calls and set(calls) == {'device'}       # the device selected; the host run did not
+    device, host = found['device'], found['host']
+    for key in ('variant_index', 'trait_index', 'df'):
+        np.testing.assert_array_equal(device[key], host[key], err_msg=key)
+    np.testing.assert_allclose(device['t_stat'], host['t_stat'], rtol=1e-6, atol=1e-6)
+    if missing == 'impute':
+        assert (device['df'] != np.floor(device['df'])).any()   # fractional df were selected
+        return
+    # The reference's passing pairs, away from the threshold's float32 edge.
+    p = 2 * special.stdtr(want_df, -np.abs(want_t))
+    v, k = device['variant_index'], device['trait_index']
+    np.testing.assert_array_equal(device['df'], want_df[v, k])
+    np.testing.assert_allclose(device['t_stat'], want_t[v, k], rtol=2e-4, atol=2e-4)
+    clear = (p < threshold * 0.99) & np.isfinite(p)
+    assert clear.sum() > 10 and set(zip(*np.nonzero(clear))) <= set(zip(v.tolist(), k.tolist()))
+    assert not (p[v, k] > threshold * 1.01).any()
+
+
+@pytest.mark.parametrize('device', ['cpu'] + (['cuda:0'] if torch.cuda.is_available() else []))
+def test_fractional_pair_df_select_exactly_at_the_threshold(device):
+    # |t| just either side of each pair's own critical value, at fractional
+    # and whole-number df: the selection is the FP64 two-sided p <= threshold.
+    from scipy import special as sp
+    from torchgwas.reduce import SignificantPairs, device_significance_critical
+    threshold, n = 1e-6, 400
+    rng = np.random.default_rng(3)
+    df = np.round(rng.uniform(50, 390, size=(64, 32)), 0)
+    df[:, ::2] = rng.uniform(50, 390, size=(64, 16))              # half the columns fractional
+    critical = np.abs(sp.stdtrit(df, threshold / 2))
+    t = critical * (1 + rng.choice([-1e-5, 1e-5, -0.2, 0.2], size=df.shape)) * rng.choice([-1, 1], size=df.shape)
+    t = t.astype(np.float32)
+    want = 2 * sp.stdtr(df, -np.abs(t.astype(np.float64))) <= threshold
+    if device == 'cpu':
+        got_critical = SignificantPairs(threshold).critical_abs_t(df, 32)
+        np.testing.assert_allclose(got_critical, critical, rtol=1e-12)
+        return
+    table = device_significance_critical(SignificantPairs(threshold), n, 32, device)
+    tt = torch.as_tensor(t, device=device)
+    chunks = list(complete_case.device_significant_pairs_by_pair_df(
+        tt, tt, torch.zeros(64, dtype=torch.int8, device=device), torch.as_tensor(df, dtype=torch.float32, device=device),
+        table, threshold=threshold))
+    got = np.zeros(df.shape, dtype=bool)
+    for chunk in chunks:
+        got[chunk[2], chunk[3]] = True                            # rows are absolute (start=0)
+    df32 = df.astype(np.float32).astype(np.float64)               # the df the device saw
+    want = 2 * sp.stdtr(df32, -np.abs(t.astype(np.float64))) <= threshold
+    np.testing.assert_array_equal(got, want)
+    assert want.any() and not want.all()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason='second CUDA device required')

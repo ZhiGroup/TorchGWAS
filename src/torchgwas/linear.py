@@ -1547,8 +1547,11 @@ def linear_scan_streaming_chunks(
                                     variant_range=variant_range,
                                     reduction=reduction, reader_worker_limit=_reader_worker_limit,
                                     borrow_results=borrow_results, return_df=return_df,
-                                    significance=(significance if significance is not None and not phenotype_has_missing and
-                                        (_significance_backend or os.environ.get('TORCHGWAS_SIGNIFICANCE_BACKEND')
+                                    # Missing phenotypes select on the device too, at each pair's df
+                                    # (complete_case.device_significant_pairs_by_pair_df).
+                                    significance=(significance if significance is not None
+                                        and (not phenotype_has_missing or complete_case is not None)
+                                        and (_significance_backend or os.environ.get('TORCHGWAS_SIGNIFICANCE_BACKEND')
                                          or _default_significance_backend(significance, significance_n_traits or pheno_proc.shape[1]))=='device'
                                         else None),
                                     significance_n_traits=significance_n_traits,

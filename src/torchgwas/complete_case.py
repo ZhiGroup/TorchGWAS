@@ -42,12 +42,28 @@ import numpy as np
 BLOCK_CELLS = 1 << 14
 # Patterns per device group (its (chunk, patterns, rank) FP64 state).
 PATTERN_BLOCK = 256
+# Missing cells per batch of patterns whose Z_M^T Z_M are summed at once
+# (cells x rank^2 FP64: 440 MB at rank 29).
+DOWNDATE_CELLS = 1 << 16
+# Traits per column block when a panel is read for its missing cells.
+PANEL_BLOCK = 4096
 
 
 def complete_case_basis(n_samples, q_matrix):
     """Z = [1/sqrt(n), Q]: the scan's covariate design, orthonormal (Q is centred)."""
     one = np.full((int(n_samples), 1), 1.0 / np.sqrt(n_samples))
     return one if q_matrix is None else np.column_stack([one, np.asarray(q_matrix, dtype=np.float64)])
+
+
+def _missing_cells(missing_of_block, n_traits, block):
+    """Every missing cell, by trait then row: missing_of_block(first, last) -> (samples, last - first) bool."""
+    traits, rows = [np.empty(0, dtype=np.int64)], [np.empty(0, dtype=np.int64)]
+    for first in range(0, n_traits, max(1, int(block))):
+        last = min(n_traits, first + max(1, int(block)))
+        trait, row = np.nonzero(np.ascontiguousarray(missing_of_block(first, last).T))
+        traits.append(trait.astype(np.int64) + first)
+        rows.append(row.astype(np.int64))
+    return np.concatenate(traits), np.concatenate(rows)
 
 
 class CompleteCasePlan:
@@ -58,37 +74,70 @@ class CompleteCasePlan:
         if observed.ndim != 2:
             raise ValueError('observed must be (samples, traits)')
         n, k = observed.shape
+        self._build(n, k, *_missing_cells(lambda a, b: ~observed[:, a:b], k, PANEL_BLOCK), q_matrix)
+
+    def _build(self, n, k, cell_traits, cell_rows, q_matrix):
+        """The plan from its missing cells, sorted by trait then row."""
         self.n_samples, self.n_traits = n, k
         self.basis = complete_case_basis(n, q_matrix)
         rank = self.basis.shape[1]
-        self.traits = np.flatnonzero(~observed.all(axis=0)).astype(np.int64)
+        self.traits, starts, counts = np.unique(cell_traits, return_index=True, return_counts=True)
+        self.traits = self.traits.astype(np.int64)
         index, rows = {}, []
         self.pattern_of_trait = np.empty(self.traits.size, dtype=np.int64)
-        for position, trait in enumerate(self.traits):
-            missing = np.flatnonzero(~observed[:, trait])
+        for position, (start, count) in enumerate(zip(starts.tolist(), counts.tolist())):
+            missing = cell_rows[start:start + count]
             key = missing.tobytes()
-            if key not in index:
-                index[key] = len(rows)
+            pattern = index.get(key)
+            if pattern is None:
+                pattern = index[key] = len(rows)
                 rows.append(missing)
-            self.pattern_of_trait[position] = index[key]
+            self.pattern_of_trait[position] = pattern
         self.rows = rows
-        self.inverse, self.subset_rank = [], []
+        sizes = np.array([len(missing) for missing in rows], dtype=np.int64)
+        offsets = np.concatenate([[0], np.cumsum(sizes)])
+        flat = np.concatenate(rows) if rows else np.empty(0, dtype=np.int64)
+        self.inverse = np.empty((len(rows), rank, rank), dtype=np.float64)
+        self.subset_rank = np.empty(len(rows), dtype=np.int64)
         # Z^T Z itself, not I: a float32 basis is orthonormal only to ~1e-7,
         # which would lift a subset's null direction above the rank cut.
         gram = self.basis.T @ self.basis
-        for missing in rows:
-            zm = self.basis[missing]
-            values, vectors = np.linalg.eigh(gram - zm.T @ zm)
+        first = 0
+        while first < len(rows):
+            # Patterns [first, last): at most DOWNDATE_CELLS cells, or one larger pattern.
+            last = int(np.searchsorted(offsets, offsets[first] + DOWNDATE_CELLS, side='right')) - 1
+            last = min(len(rows), max(first + 1, last))
+            zm = self.basis[flat[offsets[first]:offsets[last]]]
+            downdate = np.add.reduceat(zm[:, :, None] * zm[:, None, :], offsets[first:last] - offsets[first], axis=0)
+            values, vectors = np.linalg.eigh(gram[None] - downdate)
             # A covariate constant on the subset leaves Z_S rank-deficient;
             # its df then counts the rank Z_S actually has.
-            keep = values > 1e-9 * max(values.max(), 1e-300)
-            self.inverse.append((vectors[:, keep] / values[keep]) @ vectors[:, keep].T)
-            self.subset_rank.append(int(keep.sum()))
-        self.subset_rank = np.asarray(self.subset_rank, dtype=np.int64)
-        self.observed_counts = n - np.array([len(missing) for missing in rows], dtype=np.int64)
+            keep = values > 1e-9 * np.maximum(values.max(axis=-1, keepdims=True), 1e-300)
+            scale = np.where(keep, 1.0 / np.where(keep, values, 1.0), 0.0)
+            self.inverse[first:last] = (vectors * scale[:, None, :]) @ vectors.transpose(0, 2, 1)
+            self.subset_rank[first:last] = keep.sum(axis=-1)
+            first = last
+        self.observed_counts = n - sizes
         # Where each sample's column sits in the scan's calls (None: in order).
         self._positions = None
         self._device = {}
+
+    @classmethod
+    def from_panel(cls, phenotype, q_matrix, block=PANEL_BLOCK):
+        """The plan for a raw panel (NaN missing), read a column block at a time, or None when it is complete.
+
+        phenotype: an array or anything sliced as phenotype[:, first:last]
+        (a memory-mapped panel or its views), so no samples x traits mask is
+        held at once.
+        """
+        n, k = phenotype.shape
+        traits, rows = _missing_cells(
+            lambda a, b: np.isnan(np.asarray(phenotype[:, a:b], dtype=np.float64)), k, block)
+        if not traits.size:
+            return None
+        plan = cls.__new__(cls)
+        plan._build(n, k, traits, rows, q_matrix)
+        return plan
 
     def at_positions(self, positions):
         """This plan for calls laid out as whole rows: sample i's column is positions[i]."""
@@ -101,8 +150,7 @@ class CompleteCasePlan:
     @classmethod
     def from_phenotype(cls, phenotype, q_matrix):
         """The plan for a raw panel (NaN missing), or None when it is complete."""
-        observed = ~np.isnan(np.asarray(phenotype, dtype=np.float64))
-        return None if observed.all() else cls(observed, q_matrix)
+        return cls.from_panel(np.asarray(phenotype, dtype=np.float64), q_matrix)
 
     def residualize(self, values, trait):
         """Trait `trait`'s complete-case residuals: its own observed rows, zero elsewhere, unit variance there."""
@@ -122,6 +170,28 @@ class CompleteCasePlan:
         scale = resid.std()
         out[keep] = resid / (scale if scale > 0 else 1.0)
         return out
+
+    def residualize_block(self, values, traits):
+        """residualize for several of the plan's traits at once: values (samples, len(traits)), raw.
+
+        Two products of the block's size and one small solve per trait, where
+        residualize column by column copied the basis rows of each trait's
+        subset (125 ms a trait at 33,417 samples and rank 29).
+        """
+        values = np.asarray(values, dtype=np.float64)
+        traits = np.asarray(traits, dtype=np.int64)
+        patterns = self.pattern_of_trait[np.searchsorted(self.traits, traits)]
+        observed = np.ones(values.shape, dtype=bool)
+        sizes = self.observed_counts[patterns]
+        if traits.size:
+            observed[np.concatenate([self.rows[p] for p in patterns]),
+                     np.repeat(np.arange(traits.size), self.n_samples - sizes)] = False
+        y = np.where(observed, values, 0.0)
+        coef = np.einsum('jrs,sj->rj', self.inverse[patterns], self.basis.T @ y)
+        resid = (y - self.basis @ coef) * observed
+        deviation = (resid - resid.sum(axis=0) / sizes) * observed
+        scale = np.sqrt((deviation * deviation).sum(axis=0) / sizes)
+        return resid / np.where(scale > 0, scale, 1.0)
 
     # -- the device side ----------------------------------------------------
 
@@ -257,6 +327,85 @@ class CompleteCasePlan:
         pair_df = variant_df.to(torch.float32)[:, None].expand(chunk, self.n_traits).clone()
         pair_df.index_copy_(1, traits, df.to(torch.float32))
         return pair_df
+
+
+def device_significant_pairs_by_pair_df(beta, t, status, pair_df, critical, *, start=0, threshold=None):
+    """reduce.device_significant_pairs with a df per (variant, trait) pair, as missing phenotypes give.
+
+    pair_df (rows, traits) float32; critical is reduce.device_significance_critical's
+    FP32 lookup by whole-number df. A pair passes when t is finite, its p is
+    at most `threshold`, df > 0 and its variant is valid (status 0).
+
+    - Whole-number df (complete-case OLS, CompleteCasePlan.correct): |t| >=
+      critical[df], exactly.
+    - Fractional df ('impute', ImputedPlan: variant_df x trait_df / df) sits
+      between two whole ones, and the critical |t| falls as df grows, so
+      |t| >= critical[floor] passes and |t| < critical[ceil] fails for certain.
+      Only the pairs in between take the exact tail on the device
+      (tails.neg_log10_p_device, FP64) against -log10 threshold.
+
+    Yields the same seven-field chunks, each pair with its own df, so only
+    passing pairs leave the device -- not the dense beta, t and df the host
+    selector needs (11 GB per 2,048 x 446,000 chunk). Kept out of reduce.py,
+    whose source the device-selection census hashes.
+    """
+    import math
+
+    import torch
+
+    from .host_significance import predicate_block_shape
+    from .reduce import _owned_pairs
+    from .selection_geometry import DEVICE_SELECTION_MAX_CELLS, device_selection_shape
+    from .tails import neg_log10_p_device
+    if (t.dtype != torch.float32 or beta.dtype != torch.float32 or pair_df.dtype != torch.float32
+            or critical.dtype != torch.float32):
+        raise ValueError('Device significance requires native FP32 statistics and df')
+    rows, traits = t.shape
+    if traits < 1 or beta.shape != t.shape or pair_df.shape != t.shape or status.shape != (rows,):
+        raise ValueError('Invalid significance input shapes')
+    valid_row = status == 0
+    # One sync per chunk: complete-case df are whole numbers, and then no block looks further.
+    any_fractional = bool(((pair_df != pair_df.floor()) & torch.isfinite(pair_df)).any())
+    width, height, _ = device_selection_shape(rows, traits, DEVICE_SELECTION_MAX_CELLS)
+    for first in range(0, rows, height):
+        last = min(rows, first + height)
+        for left in range(0, traits, width):
+            right = min(traits, left + width)
+            keep = t.new_empty((last - first, right - left), dtype=torch.bool)
+            predicate_height, predicate_width, _ = predicate_block_shape(last - first, right - left)
+            for top in range(0, last - first, predicate_height):
+                bottom = min(last - first, top + predicate_height)
+                for column in range(0, right - left, predicate_width):
+                    stop = min(right - left, column + predicate_width)
+                    df = pair_df[first + top:first + bottom, left + column:left + stop]
+                    usable = valid_row[first + top:first + bottom, None] & (df > 0) & torch.isfinite(df)
+                    whole = df.floor()
+                    sure = torch.where(usable, critical[whole.to(torch.int64).clamp(0, len(critical) - 1)], torch.inf)
+                    magnitude = t[first + top:first + bottom, left + column:left + stop].abs()
+                    mask = keep[top:bottom, column:stop]
+                    torch.ge(magnitude, sure, out=mask)
+                    mask &= magnitude < torch.inf
+                    fractional = usable & (df != whole) if any_fractional else None
+                    if fractional is not None and bool(fractional.any()):
+                        floor = critical[df.ceil().to(torch.int64).clamp(0, len(critical) - 1)]
+                        between = fractional & (magnitude >= floor) & (magnitude < sure)
+                        if bool(between.any()):
+                            if threshold is None:
+                                raise ValueError('fractional pair df need the p threshold')
+                            where = between.nonzero(as_tuple=True)
+                            exact = torch.empty((where[0].numel(), 1), dtype=torch.float64, device=t.device)
+                            neg_log10_p_device(magnitude[where].reshape(-1, 1), df[where].reshape(-1, 1), out=exact)
+                            mask[where] = exact.reshape(-1) >= -math.log10(threshold)
+            ri, ti = keep.nonzero().unbind(1)
+            if not ri.numel():
+                yield (start + first, start + last, np.empty(0, np.int64), np.empty(0, np.int64),
+                       np.empty(0, np.float32), np.empty(0, np.float32), np.empty(0, np.float32))
+                continue
+            packed = torch.stack((ri.to(torch.int32), ti.to(torch.int32),
+                                  beta[first:last, left:right][ri, ti].view(torch.int32),
+                                  t[first:last, left:right][ri, ti].view(torch.int32),
+                                  pair_df[first:last, left:right][ri, ti].view(torch.int32))).cpu().numpy()
+            yield (start + first, start + last, *_owned_pairs(packed, start + first, left))
 
 
 class ImputedPlan:

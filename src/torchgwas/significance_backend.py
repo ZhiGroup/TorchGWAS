@@ -5,8 +5,11 @@ packed as 32-bit values). Host selection copies the dense beta and t (8 bytes
 per cell) and filters them on one core: 12.6 ms per 1024 x 8192 chunk on the
 H100 host, against a 10.7 ms GPU chunk. Device selection transfers less while
 the passing fraction -- about the p threshold under the null -- stays below
-8/20. An explicit TORCHGWAS_SIGNIFICANCE_BACKEND overrides the choice, and a
-panel with missing phenotypes always selects on the host.
+8/20. An explicit TORCHGWAS_SIGNIFICANCE_BACKEND overrides the choice. A panel
+with missing phenotypes selects on the device at each pair's df
+(complete_case.device_significant_pairs_by_pair_df): whole-number df by the
+critical-|t| table, fractional ('impute') df by the exact device tail for the
+pairs between two whole-number cutoffs.
 
 Kept apart from reduce.device_significant_pairs, whose source the recorded
 kernel census fingerprints.

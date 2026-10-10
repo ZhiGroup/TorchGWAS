@@ -1573,7 +1573,9 @@ def run_linear_gwas(
             # Blocked QC preserves source precision and lazy column subsets.
             # The joint preprocessing and factor must use the scan precision.
             phenotype = np.asarray(phenotype, dtype=np.float32 if resolved_compute_dtype == 'float32' else np.float64)
-        if significance is not None and not qc['phenotype_missing_cells']:
+        if significance is not None:
+            # Complete-case pair df are whole numbers too; fractional ('impute')
+            # df keep SciPy's path inside critical_abs_t.
             significance.prepare_integer_df(int(phenotype.shape[0]), int(phenotype.shape[1]))
         if autotuner is not None:
             settings, audit, autotune_basis = autotuner.select(genotype, phenotype, covariates, qc,

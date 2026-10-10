@@ -568,14 +568,14 @@ def residualize_and_standardize(
             # on its own rows -- per trait, so it is what a run of its group
             # alone would give.
             from .complete_case import CompleteCasePlan
-            observed = np.ones(phenotype.shape, dtype=bool)
-            for start in range(0, phenotype.shape[1], max(1, int(trait_block))):
-                stop = min(start + max(1, int(trait_block)), phenotype.shape[1])
-                observed[:, start:stop] = ~np.isnan(np.asarray(phenotype[:, start:stop], dtype=np.float64))
-            plan = CompleteCasePlan(observed, group_q)
-            for trait in plan.traits:
-                values = np.array(phenotype[:, int(trait)], dtype=np.float64)
-                out[:, int(trait)] = plan.residualize(values, int(trait)).astype(out.dtype, copy=False)
+            plan = CompleteCasePlan.from_panel(phenotype, group_q, block=trait_block)
+            step = max(1, int(trait_block))
+            for start in range(0, phenotype.shape[1], step):
+                first, last = np.searchsorted(plan.traits, [start, start + step])
+                traits = plan.traits[first:last]
+                if traits.size:
+                    values = np.asarray(phenotype[:, start:start + step])[:, traits - start].astype(np.float64)
+                    out[:, traits] = plan.residualize_block(values, traits).astype(out.dtype, copy=False)
         elif return_plan and missing == "impute" and np.any(counts != phenotype.shape[0]):
             from .complete_case import ImputedPlan
             plan = ImputedPlan(counts, 0 if group_q is None else group_q.shape[1], phenotype.shape[0])
@@ -655,16 +655,18 @@ def residualize_and_standardize(
     if missing == "complete_case" and has_missing:
         from .complete_case import CompleteCasePlan
         # Before the loop: with inplace=True it overwrites the raw values.
-        observed = np.ones(phenotype.shape, dtype=bool)
-        for start in range(0, phenotype.shape[1], max(1, int(trait_block))):
-            stop = min(start + max(1, int(trait_block)), phenotype.shape[1])
-            observed[:, start:stop] = ~np.isnan(np.asarray(phenotype[:, start:stop], dtype=np.float64))
-        plan = CompleteCasePlan(observed, q_matrix)
-        raw_missing = {int(trait): np.array(phenotype[:, trait], dtype=np.float64) for trait in plan.traits}
+        plan = CompleteCasePlan.from_panel(phenotype, q_matrix, block=trait_block)
     out = phenotype if inplace else np.empty(phenotype.shape, dtype=resolved)
     step = max(1, int(trait_block))
     for start in range(0, phenotype.shape[1], step):
         stop = min(start + step, phenotype.shape[1])
+        missing_here = None
+        if plan is not None:
+            # The block's traits with missing values, raw and FP64, before
+            # anything (inplace=True) overwrites them.
+            first, last = np.searchsorted(plan.traits, [start, stop])
+            missing_here = plan.traits[first:last]
+            raw = np.asarray(phenotype[:, start:stop])[:, missing_here - start].astype(np.float64)
         # One working copy of the BLOCK, in the working precision; every step
         # after this stays inside it, so the transient is a block and not a
         # copy of the matrix.
@@ -683,10 +685,9 @@ def residualize_and_standardize(
         std = work.std(axis=0, keepdims=True)
         std[std == 0] = 1.0
         work /= std
+        if missing_here is not None and missing_here.size:
+            work[:, missing_here - start] = plan.residualize_block(raw, missing_here).astype(work.dtype, copy=False)
         out[:, start:stop] = work
-    if plan is not None:
-        for trait, values in raw_missing.items():
-            out[:, trait] = plan.residualize(values, trait).astype(out.dtype, copy=False)
     if return_plan and plan is None and missing == "impute" and has_missing:
         from .complete_case import ImputedPlan
         plan = ImputedPlan(phenotype_observed_counts, 0 if q_matrix is None else q_matrix.shape[1],

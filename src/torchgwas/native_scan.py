@@ -148,8 +148,10 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
     if significance is not None and reduction is not None:
         raise ValueError('Significance and joint reduction are mutually exclusive')
     if significance is not None:
+        from .complete_case import device_significant_pairs_by_pair_df
         from .reduce import device_significance_critical, device_significant_pairs
         critical=device_significance_critical(significance,n,significance_n_traits or traits,device)
+        threshold=significance.resolved_threshold(significance_n_traits or traits)
         timings['result_selection']='device_significant'
         timings['result_payload_bytes']=0
     depth = max(2, int(prefetch_chunks or 3))
@@ -495,8 +497,13 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
             source._last_scan_exclusion_counts['invariant'] += int((status_host == 2).sum())
             timings['result_payload_bytes'] += status_host.nbytes
             # Gather before yielding: the stream context must not stay active
-            # while the consumer runs.
-            blocks = list(device_significant_pairs(beta, t, status, variant_df, critical, start=start))
+            # while the consumer runs. Complete-case statistics carry a df per
+            # pair (rows x traits), the others one per variant.
+            if variant_df.dim() == 1:
+                blocks = list(device_significant_pairs(beta, t, status, variant_df, critical, start=start))
+            else:
+                blocks = list(device_significant_pairs_by_pair_df(beta, t, status, variant_df, critical, start=start,
+                                                                  threshold=threshold))
         del beta, t, status, variant_df
         for selected in blocks:
             timings['result_payload_bytes'] += sum(a.nbytes for a in selected[2:])
@@ -758,10 +765,12 @@ def dosage_cuda_iterator(source, phenotype, q_matrix, chunk_size, device,
                 if not device_source:
                     release_futures[slot] = release_pool.submit(release_after_copy, slot, buffer_index)
                 compute_done[slot].record(compute_stream)
-                for tensor in (beta, t, status, variant_df):
+                # Complete-case pairs are selected at their own df.
+                selection_df = variant_df if pair_df is None else pair_df
+                for tensor in (beta, t, status, selection_df):
                     tensor.record_stream(select_stream)  # read there, allocated here
-                pending_selection.append((slot, start, end, beta, t, status, variant_df, delivery))
-                del beta, t, status, variant_df
+                pending_selection.append((slot, start, end, beta, t, status, selection_df, delivery))
+                del beta, t, status, variant_df, selection_df, pair_df
                 while len(pending_selection) > selection_lag:
                     yield from select(pending_selection.popleft())
                 continue
