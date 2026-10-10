@@ -42,8 +42,8 @@ import numpy as np
 BLOCK_CELLS = 1 << 14
 # Patterns per device group (its (chunk, patterns, rank) FP64 state).
 PATTERN_BLOCK = 256
-# Missing cells per batch of patterns whose Z_M^T Z_M are summed at once
-# (cells x rank^2 FP64: 440 MB at rank 29).
+# Missing cells per batch of same-size patterns whose Z_M^T Z_M are formed at
+# once (cells x rank FP64: 15 MB at rank 29).
 DOWNDATE_CELLS = 1 << 16
 # Traits per column block when a panel is read for its missing cells.
 PANEL_BLOCK = 4096
@@ -95,28 +95,29 @@ class CompleteCasePlan:
             self.pattern_of_trait[position] = pattern
         self.rows = rows
         sizes = np.array([len(missing) for missing in rows], dtype=np.int64)
-        offsets = np.concatenate([[0], np.cumsum(sizes)])
-        flat = np.concatenate(rows) if rows else np.empty(0, dtype=np.int64)
         self.inverse = np.empty((len(rows), rank, rank), dtype=np.float64)
         self.subset_rank = np.empty(len(rows), dtype=np.int64)
         # Z^T Z itself, not I: a float32 basis is orthonormal only to ~1e-7,
         # which would lift a subset's null direction above the rank cut.
         gram = self.basis.T @ self.basis
-        first = 0
-        while first < len(rows):
-            # Patterns [first, last): at most DOWNDATE_CELLS cells, or one larger pattern.
-            last = int(np.searchsorted(offsets, offsets[first] + DOWNDATE_CELLS, side='right')) - 1
-            last = min(len(rows), max(first + 1, last))
-            zm = self.basis[flat[offsets[first]:offsets[last]]]
-            downdate = np.add.reduceat(zm[:, :, None] * zm[:, None, :], offsets[first:last] - offsets[first], axis=0)
-            values, vectors = np.linalg.eigh(gram[None] - downdate)
-            # A covariate constant on the subset leaves Z_S rank-deficient;
-            # its df then counts the rank Z_S actually has.
-            keep = values > 1e-9 * np.maximum(values.max(axis=-1, keepdims=True), 1e-300)
-            scale = np.where(keep, 1.0 / np.where(keep, values, 1.0), 0.0)
-            self.inverse[first:last] = (vectors * scale[:, None, :]) @ vectors.transpose(0, 2, 1)
-            self.subset_rank[first:last] = keep.sum(axis=-1)
-            first = last
+        # Patterns of one size at a time, at most DOWNDATE_CELLS cells (or one
+        # larger pattern) per batch: Z_M^T Z_M as a batched product over
+        # (patterns, size, rank). The outer products summed by np.add.reduceat
+        # before were a (cells, rank, rank) temporary, 10 GB in all for 50,000
+        # traits at rank 30, and freshly faulted pages made that 183 s.
+        for size in np.unique(sizes).tolist():
+            members = np.flatnonzero(sizes == size)
+            batch = max(1, DOWNDATE_CELLS // max(size, 1))
+            for start in range(0, members.size, batch):
+                group = members[start:start + batch]
+                zm = self.basis[np.stack([rows[p] for p in group])]
+                values, vectors = np.linalg.eigh(gram[None] - zm.transpose(0, 2, 1) @ zm)
+                # A covariate constant on the subset leaves Z_S rank-deficient;
+                # its df then counts the rank Z_S actually has.
+                keep = values > 1e-9 * np.maximum(values.max(axis=-1, keepdims=True), 1e-300)
+                scale = np.where(keep, 1.0 / np.where(keep, values, 1.0), 0.0)
+                self.inverse[group] = (vectors * scale[:, None, :]) @ vectors.transpose(0, 2, 1)
+                self.subset_rank[group] = keep.sum(axis=-1)
         self.observed_counts = n - sizes
         # Where each sample's column sits in the scan's calls (None: in order).
         self._positions = None
@@ -253,6 +254,63 @@ class CompleteCasePlan:
         self._device[device] = state
         return state
 
+    def _kernel_state(self, device):
+        """The patterns' missing samples as flat device arrays for triton_scan.complete_case_terms."""
+        import torch
+        key = ('kernel', device)
+        state = self._device.get(key)
+        if state is not None:
+            return state
+        rank = self.basis.shape[1]
+        rank_block = max(16, 1 << (rank - 1).bit_length())
+        sizes = np.array([len(missing) for missing in self.rows], dtype=np.int64)
+        flat = np.concatenate(self.rows) if self.rows else np.empty(0, dtype=np.int64)
+        basis = np.zeros((self.n_samples, rank_block), dtype=np.float32)
+        basis[:, :rank] = self.basis
+        positions = flat if self._positions is None else self._positions[flat]
+        state = dict(
+            offsets=torch.as_tensor(np.concatenate([[0], np.cumsum(sizes)]), device=device),
+            positions=torch.as_tensor(positions.astype(np.int32), device=device),
+            samples=torch.as_tensor(flat.astype(np.int32), device=device),
+            basis=torch.as_tensor(basis, device=device),
+            inverse=torch.as_tensor(np.ascontiguousarray(self.inverse), device=device),
+            counts=torch.as_tensor(self.observed_counts, dtype=torch.float64, device=device),
+            subset_rank=torch.as_tensor(self.subset_rank, dtype=torch.float64, device=device),
+            traits=torch.as_tensor(self.traits, device=device),
+            pattern_of_trait=torch.as_tensor(self.pattern_of_trait, device=device))
+        self._device[key] = state
+        return state
+
+    def _kernel_terms(self, centered, sum_squares, projections, missing_total, calls_observed):
+        """(chunk, patterns) residual sums and df from one kernel launch, or None for the Torch path."""
+        import torch
+        choice = _kernel_choice(centered)
+        if choice is None:
+            return None
+        from . import triton_scan
+        state = self._kernel_state(centered.device)
+        observed_t = None
+        if calls_observed is not None:
+            columns = torch.arange(centered.shape[1], device=centered.device)
+            observed_t = calls_observed(columns).t().contiguous().view(torch.uint8)
+        try:
+            rss, df = triton_scan.complete_case_terms(
+                centered.t().contiguous(), observed_t, state['offsets'], state['positions'], state['samples'],
+                state['basis'], state['inverse'], state['counts'], state['subset_rank'],
+                projections.contiguous(), sum_squares.contiguous(), missing_total.contiguous())
+        except Exception as error:  # noqa: BLE001 - a kernel that cannot run leaves the Torch path
+            if choice == 'triton':
+                raise
+            import warnings
+            index = centered.device.index
+            KERNEL_UNAVAILABLE[index] = f'{type(error).__name__}: {error}'[:2000]
+            warnings.warn(f'complete-case kernel unavailable on cuda:{index}, using Torch: '
+                          f'{KERNEL_UNAVAILABLE[index][:200]}', RuntimeWarning, stacklevel=3)
+            return None
+        # (patterns, chunk) rows gathered by trait, then read as (chunk, traits).
+        which = state['pattern_of_trait']
+        return rss.index_select(0, which).t(), df.index_select(0, which).t()
+
     def correct(self, centered, sum_squares, projections, products, phenotype_ss, variant_df,
                 beta, t, *, calls_observed=None, missing_products=None):
         """Replace the missing traits' beta and t with complete-case OLS; return the (chunk, K) pair df.
@@ -267,7 +325,46 @@ class CompleteCasePlan:
         beta and t (chunk, K) are updated in place. missing_products
         (chunk, J), the products of the plan's traits alone, may stand in for
         products.
+
+        The per-pattern terms take one Triton launch on a CUDA FP32 scan
+        (triton_scan.complete_case_terms) and about 20 Torch calls per group
+        of patterns otherwise; TORCHGWAS_COMPLETE_CASE_KERNEL=torch|triton
+        forces one.
         """
+        import torch
+        device = centered.device
+        chunk = centered.shape[0]
+        rank = self.basis.shape[1]
+        sum_squares = sum_squares.double()
+        projections = projections.double()
+        # Calls missing anywhere in the variant: n less its observed calls.
+        missing_total = self.n_samples - variant_df.double() - rank - 1
+        terms = self._kernel_terms(centered, sum_squares, projections, missing_total, calls_observed)
+        if terms is None:
+            terms = self._group_terms(centered, sum_squares, projections, missing_total, calls_observed)
+        rss, df = terms
+        traits = self._device.get(('traits', device))
+        if traits is None:
+            traits = self._device[('traits', device)] = torch.as_tensor(self.traits, device=device)
+        gy =(products.index_select(1, traits) if missing_products is None else missing_products).double()
+        ss = phenotype_ss.double().index_select(0, traits)[None, :]
+        valid = (rss > 1e-10 * sum_squares[:, None].clamp_min(1e-300)) & (df > 0)
+        safe_rss = torch.where(valid, rss, torch.ones_like(rss))
+        safe_df = torch.where(valid, df, torch.ones_like(df))
+        kept_beta = gy / safe_rss
+        residual = (ss - gy * gy / safe_rss).clamp_min(1e-12)
+        kept_t = kept_beta / torch.sqrt(residual / safe_df / safe_rss)
+        # masked_fill, not torch.where against a NaN made with torch.tensor:
+        # that tensor's copy to the device waited for the whole correction.
+        invalid = ~valid
+        beta.index_copy_(1, traits, kept_beta.masked_fill_(invalid, float('nan')).to(beta.dtype))
+        t.index_copy_(1, traits, kept_t.masked_fill_(invalid, float('nan')).to(t.dtype))
+        pair_df = variant_df.to(torch.float32)[:, None].expand(chunk, self.n_traits).clone()
+        pair_df.index_copy_(1, traits, df.to(torch.float32))
+        return pair_df
+
+    def _group_terms(self, centered, sum_squares, projections, missing_total, calls_observed):
+        """(chunk, traits) residual sums and df, a group of patterns at a time (Torch)."""
         import torch
         device = centered.device
         state = self._state(device)
@@ -276,10 +373,7 @@ class CompleteCasePlan:
         patterns = len(self.rows)
         rss = torch.empty((chunk, patterns), dtype=torch.float64, device=device)
         df = torch.empty((chunk, patterns), dtype=torch.float64, device=device)
-        sum_squares = sum_squares.double()
-        projections = projections.double()
-        # Calls missing anywhere in the variant: n less its observed calls.
-        missing_total = (self.n_samples - variant_df.double() - rank - 1)[:, None]
+        missing_total = missing_total[:, None]
         for group in state['groups']:
             count = group['patterns'].numel()
             s2 = torch.zeros((chunk, count), dtype=torch.float64, device=device)
@@ -311,22 +405,29 @@ class CompleteCasePlan:
             rss.index_copy_(1, group['patterns'], sum_squares[:, None] - s2 - quadratic)
             df.index_copy_(1, group['patterns'], samples - group['subset_rank'][None, :] - 1.0)
         which = state['pattern_of_trait']
-        rss, df = rss[:, which], df[:, which]
-        traits = state['traits']
-        gy = (products.index_select(1, traits) if missing_products is None else missing_products).double()
-        ss = phenotype_ss.double().index_select(0, traits)[None, :]
-        valid = (rss > 1e-10 * sum_squares[:, None].clamp_min(1e-300)) & (df > 0)
-        safe_rss = torch.where(valid, rss, torch.ones_like(rss))
-        safe_df = torch.where(valid, df, torch.ones_like(df))
-        kept_beta = gy / safe_rss
-        residual = (ss - gy * gy / safe_rss).clamp_min(1e-12)
-        kept_t = kept_beta / torch.sqrt(residual / safe_df / safe_rss)
-        nan = torch.tensor(float('nan'), dtype=torch.float64, device=device)
-        beta.index_copy_(1, traits, torch.where(valid, kept_beta, nan).to(beta.dtype))
-        t.index_copy_(1, traits, torch.where(valid, kept_t, nan).to(t.dtype))
-        pair_df = variant_df.to(torch.float32)[:, None].expand(chunk, self.n_traits).clone()
-        pair_df.index_copy_(1, traits, df.to(torch.float32))
-        return pair_df
+        return rss[:, which], df[:, which]
+
+
+# Why the complete-case kernel could not run on a device, by index (the Torch path ran instead).
+KERNEL_UNAVAILABLE = {}
+
+
+def _kernel_choice(centered):
+    """'auto' or 'triton' when correct() should try the Triton kernel for these calls, else None."""
+    import os
+    choice = os.environ.get('TORCHGWAS_COMPLETE_CASE_KERNEL', 'auto')
+    if choice not in ('auto', 'triton', 'torch'):
+        raise ValueError('TORCHGWAS_COMPLETE_CASE_KERNEL must be auto, triton or torch')
+    if choice == 'torch' or (choice == 'auto' and os.environ.get('TORCHGWAS_STATS_BACKEND') == 'torch'):
+        return None
+    import torch
+    usable = centered.is_cuda and centered.dtype == torch.float32
+    if usable and choice == 'auto':
+        from . import triton_scan
+        usable = centered.device.index not in KERNEL_UNAVAILABLE and triton_scan.available(centered.device)
+    if not usable and choice == 'triton':
+        raise ValueError('the complete-case kernel needs CUDA FP32 calls and Triton')
+    return choice if usable else None
 
 
 def device_significant_pairs_by_pair_df(beta, t, status, pair_df, critical, *, start=0, threshold=None):

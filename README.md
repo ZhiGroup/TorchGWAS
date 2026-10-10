@@ -46,6 +46,17 @@ otherwise just the value.
   - `TORCHGWAS_CHUNK_GRAPHS=1` replays each chunk's GPU work as a CUDA graph
     (PGEN and dosage input, dense output or min-p). It cuts the per-chunk
     Python work that limits low-trait scans on several GPUs. Off by default.
+  - With missing phenotypes, the complete-case correction is one kernel launch
+    per chunk. `TORCHGWAS_COMPLETE_CASE_KERNEL=torch` uses PyTorch operations.
+- Several GPUs on one trait axis (`--trait-devices`).
+  - By default each GPU is a thread of one process, sharing one genotype decoder.
+  - `--trait-workers process` runs one process per GPU instead, each on a
+    contiguous range of the traits, and merges their output into the same store.
+  - Processes avoid the threads waiting on each other's Python (the GIL). A
+    7-GPU voxel scan took 25.8 s as threads and 19.3 s as one process per GPU.
+  - Each process decodes the genotypes itself, so processes suit GPU-bound
+    scans with many traits per GPU.
+  - It needs a genotype file path and `--missing-phenotype exact` or `impute`.
 
 ## Benchmark
 

@@ -422,3 +422,110 @@ def neg_log10_p(t, df, out=None):
             TINY=1e-300, LGAMMA_HALF=_LGAMMA_HALF, INV_LN10=_INV_LN10,
             ITERATIONS=TAIL_ITERATIONS, BLOCK=block, num_warps=warps)
     return out
+
+
+# -- complete-case downdates ---------------------------------------------------
+#
+# CompleteCasePlan.correct's per-pattern terms -- each pattern's residual sum
+# g^T P_S g and df for every variant of the chunk -- as one launch. The Torch
+# version gathers each group of patterns' missing calls into a (variants x
+# cells) tensor and makes about 20 calls per group: with a pattern per voxel
+# (250,000 patterns, ~1,000 groups at the default group sizes) that is 20,000
+# launches per chunk, issued under the GIL, which is what made one thread per
+# GPU contend. Here a program takes one pattern and a block of variants and
+# walks the pattern's missing samples; the calls are read transposed, so a
+# block of variants at one sample is one contiguous load, and programs of a
+# variant block run together and share it in L2.
+#
+# FP32 products of at most CC_CELLS calls each (no TF32: input_precision
+# 'ieee'), summed in FP64, as the Torch version's FP32 bmm per segment summed
+# in FP64. The quadratic form u^T (Z_S^T Z_S)^+ u is FP64.
+CC_VARIANTS, CC_CELLS, CC_WARPS = 64, 32, 4
+
+
+if triton is not None:
+    @triton.jit
+    def _complete_case_kernel(calls_ptr, observed_ptr, variants, offsets_ptr, positions_ptr, samples_ptr,
+                              basis_ptr, inverse_ptr, counts_ptr, subset_rank_ptr,
+                              projections_ptr, ss_ptr, missing_ptr, rss_ptr, df_ptr,
+                              HAS_CALLS: tl.constexpr, RANK: tl.constexpr, RANK_BLOCK: tl.constexpr,
+                              BLOCK_V: tl.constexpr, BLOCK_W: tl.constexpr):
+        pattern = tl.program_id(0).to(tl.int64)
+        v = tl.program_id(1) * BLOCK_V + tl.arange(0, BLOCK_V)
+        in_chunk = v < variants
+        r = tl.arange(0, RANK_BLOCK)
+        w = tl.arange(0, BLOCK_W)
+        first = tl.load(offsets_ptr + pattern)
+        last = tl.load(offsets_ptr + pattern + 1)
+        s2 = tl.zeros([BLOCK_V], tl.float64)
+        u = tl.zeros([BLOCK_V, RANK_BLOCK], tl.float64)
+        absent = tl.zeros([BLOCK_V], tl.int32)
+        for start in range(first, last, BLOCK_W):
+            cell = start + w
+            in_cells = cell < last
+            position = tl.load(positions_ptr + cell, mask=in_cells, other=0).to(tl.int64)
+            sample = tl.load(samples_ptr + cell, mask=in_cells, other=0).to(tl.int64)
+            both = in_cells[:, None] & in_chunk[None, :]
+            # (cells, variants): the transposed calls, one row per sample.
+            g = tl.load(calls_ptr + position[:, None] * variants + v[None, :], mask=both, other=0.0)
+            s2 += tl.sum(g * g, axis=0).to(tl.float64)
+            z = tl.load(basis_ptr + sample[:, None] * RANK_BLOCK + r[None, :], mask=in_cells[:, None], other=0.0)
+            u += tl.dot(tl.trans(g), z, input_precision='ieee').to(tl.float64)
+            if HAS_CALLS:
+                seen = tl.load(observed_ptr + position[:, None] * variants + v[None, :], mask=both, other=1)
+                absent += tl.sum((seen == 0).to(tl.int32), axis=0)
+        u = tl.load(projections_ptr + v[:, None] * RANK + r[None, :],
+                    mask=in_chunk[:, None] & (r[None, :] < RANK), other=0.0) - u
+        # u (Z_S^T Z_S)^+, a column of u at a time (the pattern's RANK x RANK inverse, FP64).
+        product = tl.zeros([BLOCK_V, RANK_BLOCK], tl.float64)
+        inverse = inverse_ptr + pattern * RANK * RANK
+        for s in tl.static_range(RANK):
+            column = tl.sum(tl.where(r[None, :] == s, u, 0.0), axis=1)
+            row = tl.load(inverse + s * RANK + r, mask=r < RANK, other=0.0)
+            product += column[:, None] * row[None, :]
+        quadratic = tl.sum(u * product, axis=1)
+        rss = tl.load(ss_ptr + v, mask=in_chunk, other=0.0) - s2 - quadratic
+        samples = tl.load(counts_ptr + pattern) + tl.zeros([BLOCK_V], tl.float64)
+        if HAS_CALLS:
+            # Observed calls in S: the subset less the calls missing there.
+            samples -= tl.load(missing_ptr + v, mask=in_chunk, other=0.0) - absent.to(tl.float64)
+        df = samples - tl.load(subset_rank_ptr + pattern) - 1.0
+        tl.store(rss_ptr + pattern * variants + v, rss, mask=in_chunk)
+        tl.store(df_ptr + pattern * variants + v, df, mask=in_chunk)
+
+
+def complete_case_terms(calls_t, observed_t, offsets, positions, samples, basis, inverse, counts, subset_rank,
+                        projections, sum_squares, missing_total):
+    """Every pattern's (residual sum, df) for a chunk: two (patterns, variants) FP64 tensors.
+
+    calls_t (columns, variants) FP32, the chunk's centred calls transposed
+    (a missing call zero); observed_t (columns, variants) uint8, 1 where the
+    call is observed, or None when every call is. Pattern p's missing samples
+    are cells offsets[p]:offsets[p + 1] of positions (their columns in
+    calls_t) and samples (their rows of basis). basis (samples, rank_block)
+    FP32, zero beyond the rank; inverse (patterns, rank, rank), counts and
+    subset_rank (patterns,), FP64. projections (variants, rank), sum_squares
+    and missing_total (variants,), FP64.
+    """
+    for tensor, name in ((calls_t, 'calls_t'), (offsets, 'offsets'), (positions, 'positions'),
+                         (samples, 'samples'), (basis, 'basis'), (inverse, 'inverse'), (counts, 'counts'),
+                         (subset_rank, 'subset_rank'), (projections, 'projections'),
+                         (sum_squares, 'sum_squares'), (missing_total, 'missing_total')):
+        _check(tensor, name)
+    if observed_t is not None:
+        _check(observed_t, 'observed_t')
+    if calls_t.dtype != torch.float32 or basis.dtype != torch.float32:
+        raise ValueError('complete-case terms take FP32 calls and basis')
+    variants = calls_t.shape[1]
+    patterns, rank = inverse.shape[0], inverse.shape[1]
+    rss = torch.empty((patterns, variants), dtype=torch.float64, device=calls_t.device)
+    df = torch.empty_like(rss)
+    if patterns == 0 or variants == 0:
+        return rss, df
+    with _LAUNCH_LOCK, torch.cuda.device(calls_t.device):
+        _complete_case_kernel[(patterns, triton.cdiv(variants, CC_VARIANTS))](
+            calls_t, calls_t if observed_t is None else observed_t, variants, offsets, positions, samples,
+            basis, inverse, counts, subset_rank, projections, sum_squares, missing_total, rss, df,
+            HAS_CALLS=observed_t is not None, RANK=rank, RANK_BLOCK=basis.shape[1],
+            BLOCK_V=CC_VARIANTS, BLOCK_W=CC_CELLS, num_warps=CC_WARPS)
+    return rss, df

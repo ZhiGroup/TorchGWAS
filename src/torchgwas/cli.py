@@ -151,6 +151,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help='devices for disjoint variant ranges with independent durable writers')
     linear.add_argument('--trait-devices',nargs='+',default=None,
                         help='explicit devices for independent trait tiles, e.g. cuda:0 cuda:1')
+    linear.add_argument('--trait-workers',choices=['thread','process'],default='thread',
+                        help='run --trait-devices as threads of this process (default) or one process per '
+                             'device on a contiguous range of the traits, which avoids the threads waiting '
+                             'on each other under the GIL with many GPUs')
     linear.add_argument(
         "--sumstats-format",
         default="binary",
@@ -458,6 +462,7 @@ def _run_linear(args) -> int:
         phenotype_outlier_sd=args.phenotype_outlier_sd,
         trait_block=args.trait_block,
         trait_devices=args.trait_devices,
+        trait_workers=args.trait_workers,
         variant_devices=args.variant_devices,
         sumstats_format=args.sumstats_format,
         sumstats_block_bytes=args.sumstats_block_bytes,

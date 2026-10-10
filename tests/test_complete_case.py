@@ -168,6 +168,68 @@ def test_missing_calls_leave_the_pair_with_its_own_count():
     assert np.isfinite(t.numpy()).all()
 
 
+def _correct_inputs(plan, raw, pheno):
+    """correct()'s inputs from (variants, columns) float calls, NaN missing: centred, a missing call zero."""
+    observed = ~torch.isnan(raw)
+    mean = torch.where(observed, raw, 0.).sum(1, keepdim=True) / observed.sum(1, keepdim=True)
+    centered = torch.where(observed, raw - mean, 0.)
+    columns = np.arange(plan.n_samples) if plan._positions is None else plan._positions
+    basis = torch.as_tensor(plan.basis, dtype=torch.float32, device=raw.device)
+    y = torch.as_tensor(pheno, dtype=torch.float32, device=raw.device)
+    in_order = centered[:, torch.as_tensor(columns, device=raw.device)]
+    return dict(centered=centered, sum_squares=(centered * centered).sum(1), projections=in_order @ basis,
+                products=in_order @ y, phenotype_ss=(y * y).sum(0),
+                variant_df=observed.sum(1).float() - plan.basis.shape[1] - 1,
+                calls_observed=complete_case.call_mask(raw))
+
+
+def _run_correct(monkeypatch, choice, plan, inputs):
+    monkeypatch.setenv('TORCHGWAS_COMPLETE_CASE_KERNEL', choice)
+    beta = torch.zeros_like(inputs['products'])
+    t = torch.zeros_like(beta)
+    pair_df = plan.correct(inputs['centered'], inputs['sum_squares'], inputs['projections'], inputs['products'],
+                           inputs['phenotype_ss'], inputs['variant_df'], beta, t,
+                           calls_observed=inputs['calls_observed'])
+    return beta.cpu().numpy(), t.cpu().numpy(), pair_df.cpu().numpy()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('extra_covariates', [0, 20])
+def test_the_kernel_gives_the_grouped_torch_terms(monkeypatch, extra_covariates):
+    # One launch for every pattern against ~20 Torch calls per group: shared
+    # patterns, a 150-row pattern (several cell steps), a covariate constant on
+    # a subset, missing calls, 150 variants (a partial variant block), and a
+    # rank of 4 or 24 (a 16- or 32-wide basis).
+    from torchgwas import triton_scan
+    rng = np.random.default_rng(5)
+    calls, y, covariates = _panel(n=300, m=150)
+    covariates = np.column_stack([covariates, rng.normal(size=(300, extra_covariates))])
+    y = np.column_stack([y, y[:, [6, 3]]])
+    calls[rng.random(calls.shape) < 0.03] = np.nan
+    pheno, q, plan = residualize_and_standardize(y, covariates, missing='complete_case', return_plan=True)
+    raw = torch.as_tensor(calls.T, dtype=torch.float32, device='cuda:0')
+    inputs = _correct_inputs(plan, raw, pheno)
+    want = _run_correct(monkeypatch, 'torch', plan, inputs)
+    launches = []
+    monkeypatch.setattr(triton_scan, 'complete_case_terms',
+                        lambda *a, _terms=triton_scan.complete_case_terms: launches.append(1) or _terms(*a))
+    got = _run_correct(monkeypatch, 'auto', plan, inputs)
+    assert launches == [1]                                         # the default takes the kernel
+    np.testing.assert_array_equal(got[2], want[2])                 # whole-number df, exactly
+    assert np.isfinite(want[1]).all() and (want[1][:, plan.traits] != 0).all()
+    for a, b in zip(got[:2], want[:2]):
+        np.testing.assert_allclose(a, b, rtol=2e-5, atol=1e-6)
+    # Calls laid out in another column order (at_positions) give the same answer.
+    order = rng.permutation(300)
+    placed = plan.at_positions(order)
+    moved = torch.empty_like(raw)
+    moved[:, torch.as_tensor(order, device='cuda:0')] = raw
+    got_placed = _run_correct(monkeypatch, 'triton', placed, _correct_inputs(placed, moved, pheno))
+    np.testing.assert_array_equal(got_placed[2], got[2])
+    for a, b in zip(got_placed[:2], got[:2]):
+        np.testing.assert_allclose(a, b, rtol=2e-5, atol=1e-6)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize('missing', ['exact', 'impute'])
 @pytest.mark.parametrize('stats', ['native', 'torch'])

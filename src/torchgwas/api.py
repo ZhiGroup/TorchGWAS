@@ -827,6 +827,18 @@ def run_linear_gwas(
     # (complete_case.py); not for JAGWAS, which needs one sample set.
     # None (the default): 'drop_subject' for reduce='jagwas', 'exact' otherwise.
     missing_phenotype: str | None = None,
+    # How trait_devices run their phenotype tiles. 'thread': one thread per
+    # device in this process, sharing one genotype decoder. 'process': one
+    # child process per device, each scanning a contiguous range of the
+    # traits, merged into the same store (trait_processes.py); with many GPUs
+    # it avoids the threads waiting on each other's Python (the GIL).
+    trait_workers: str = 'thread',
+    # Internal, set by trait_processes for its children: the phenotype columns
+    # [first, last) this run scans, and a callback taking the QC-kept trait
+    # count and returning the count over every partition (for the Bonferroni
+    # threshold of reduce='significant').
+    _phenotype_columns: tuple[int, int] | None = None,
+    _significance_traits=None,
 ) -> GWASResult:
     """Run associations, optionally saving bounded early productive measurements.
 
@@ -847,7 +859,18 @@ def run_linear_gwas(
     warmup_fraction, trial_fraction, repeats, min_gain, max_utilization,
     min_free_bytes, tuner, probe_chunks, split and start_chunk (the tuner's
     first size; default the largest candidate whose rings fit).
+
+    trait_workers='process' with two or more trait_devices runs one child
+    process per device on a contiguous range of the traits and merges their
+    stores (trait_processes.py): full output, reduce='significant' or
+    'min-p', missing_phenotype 'exact' or 'impute', a genotype file path.
     """
+    if trait_workers not in ('thread', 'process'):
+        raise ValueError("trait_workers must be 'thread' or 'process'")
+    if trait_workers == 'process' and trait_devices is not None and len(trait_devices) > 1:
+        arguments = dict(locals())
+        from .trait_processes import run_trait_processes
+        return run_trait_processes(arguments)
     _api_entered=time.perf_counter()
     if isinstance(reduce, str) and reduce.replace("_", "-").lower() == "min-p":
         reduce = "min-p"
@@ -1005,7 +1028,13 @@ def run_linear_gwas(
             phenotype_table, sample_ids=np.asarray(sample_ids, dtype=object), value_columns=trait_columns, sample_id_column=sample_id_column
         )
     else:
-        phenotype = _coerce_array_or_path(phenotype, mmap=reduce in ("significant", "jagwas") or ((trait_block is not None or variant_devices is not None) and reduce is None))
+        mapped = reduce in ("significant", "jagwas") or ((trait_block is not None or variant_devices is not None) and reduce is None)
+        phenotype = _coerce_array_or_path(phenotype, mmap=mapped or _phenotype_columns is not None)
+        if _phenotype_columns is not None:
+            # A trait process's columns, read from the shared panel.
+            first, last = (int(value) for value in _phenotype_columns)
+            phenotype = (_LazyColumns(phenotype, slice(first, last), phenotype.dtype) if _is_lazy_panel(phenotype)
+                         else phenotype[:, first:last] if mapped else np.ascontiguousarray(phenotype[:, first:last]))
     if covariates_table is not None:
         if sample_ids is None:
             raise ValueError("tabular covariate input requires genotype sample IDs")
@@ -1565,6 +1594,11 @@ def run_linear_gwas(
                        and _os_env.environ.get('TORCHGWAS_PHENOTYPE_QC', 'device') == 'device' else None),
         )
         _phase_prep_done = time.perf_counter()
+        if _significance_traits is not None and significance is not None and significance.threshold is None:
+            # A trait process: Bonferroni over the kept traits of every
+            # partition, fixed before anything reads the threshold.
+            significance.threshold = significance.resolved_threshold(
+                int(_significance_traits(int(phenotype.shape[1]))))
         if jagwas is not None:
             # Missing values are mean-imputed like full output's; JAGWAS then
             # takes the imputed panel's t with the common df (linear.py).
@@ -2494,6 +2528,7 @@ def run_linear_gwas(
                             or significant_variant_output or minp_variant_output else None),
         "trait_devices": (None if not trait_devices
                           else [str(d) for d in trait_devices]),
+        "trait_workers": trait_workers,
         "genotype_shape": genotype_shape,
         "phenotype_shape": list(phenotype.shape),
         "covariate_shape": None if covariates is None else list(covariates.shape),
