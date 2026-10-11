@@ -51,14 +51,17 @@ copied.
   - With missing phenotypes, the complete-case correction is one kernel launch
     per chunk. `TORCHGWAS_COMPLETE_CASE_KERNEL=torch` uses PyTorch operations.
 - Several GPUs on one trait axis (`--trait-devices`).
-  - By default each GPU is a thread of one process, sharing one genotype decoder.
-  - `--trait-workers process` runs one process per GPU instead, each on a
-    contiguous range of the traits, and merges their output into the same store.
-  - Processes avoid the threads waiting on each other's Python (the GIL). A
-    7-GPU voxel scan took 25.8 s as threads and 19.3 s as one process per GPU.
-  - Each process decodes the genotypes itself, so processes suit GPU-bound
-    scans with many traits per GPU.
-  - It needs a genotype file path and `--missing-phenotype exact` or `impute`.
+  - Threads: each GPU is a thread of one process, sharing one genotype decoder.
+  - Processes: one process per GPU, each on a contiguous range of the traits,
+    with their output merged into the same store.
+  - Processes avoid the threads waiting on each other's Python (the GIL). On
+    seven H100 GPUs a voxel scan (7 x 5,000 traits, 204,800 variants) took
+    23.6 s as threads and 17.5 s as processes.
+  - Each process decodes the genotypes itself.
+  - Processes need a genotype file path and `--missing-phenotype exact` or
+    `impute`, without `--p-value-threshold` or `--autotune`.
+  - `--trait-workers auto` (the default) takes processes from four GPUs when the
+    run allows them, and threads otherwise. `thread` and `process` force one.
 
 ## Benchmark
 

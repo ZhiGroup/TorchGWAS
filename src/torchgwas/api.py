@@ -831,8 +831,10 @@ def run_linear_gwas(
     # device in this process, sharing one genotype decoder. 'process': one
     # child process per device, each scanning a contiguous range of the
     # traits, merged into the same store (trait_processes.py); with many GPUs
-    # it avoids the threads waiting on each other's Python (the GIL).
-    trait_workers: str = 'thread',
+    # it avoids the threads waiting on each other's Python (the GIL). 'auto'
+    # (the default): processes from four trait devices when the run allows
+    # them (trait_processes.process_problems), threads otherwise.
+    trait_workers: str = 'auto',
     # Internal, set by trait_processes for its children: the phenotype columns
     # [first, last) this run scans, and a callback taking the QC-kept trait
     # count and returning the count over every partition (for the Bonferroni
@@ -864,13 +866,16 @@ def run_linear_gwas(
     process per device on a contiguous range of the traits and merges their
     stores (trait_processes.py): full output, reduce='significant' or
     'min-p', missing_phenotype 'exact' or 'impute', a genotype file path.
+    The default, 'auto', does so from four trait_devices when the run allows.
     """
-    if trait_workers not in ('thread', 'process'):
-        raise ValueError("trait_workers must be 'thread' or 'process'")
-    if trait_workers == 'process' and trait_devices is not None and len(trait_devices) > 1:
+    if trait_workers not in ('auto', 'thread', 'process'):
+        raise ValueError("trait_workers must be 'auto', 'thread' or 'process'")
+    if trait_workers != 'thread' and trait_devices is not None and len(trait_devices) > 1:
         arguments = dict(locals())
-        from .trait_processes import run_trait_processes
-        return run_trait_processes(arguments)
+        from .trait_processes import resolve_trait_workers, run_trait_processes
+        if resolve_trait_workers(arguments) == 'process':
+            return run_trait_processes(arguments)
+    trait_workers = 'thread'                        # what this process runs, for run.json
     _api_entered=time.perf_counter()
     if isinstance(reduce, str) and reduce.replace("_", "-").lower() == "min-p":
         reduce = "min-p"

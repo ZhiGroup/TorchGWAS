@@ -143,12 +143,36 @@ def test_a_failed_child_stops_the_run_with_its_log(tmp_path):
     (dict(reduce='jagwas'), 'jagwas'),
     (dict(output_dir=None), 'output_dir'),
     (dict(variant_devices=['cuda:2']), 'variant_devices'),
+    (dict(p_value_threshold=1e-3), 'p_value_threshold'),
 ])
 def test_unsupported_runs_are_refused(tmp_path, extra, message):
     arguments = dict(output_dir=tmp_path / 'out', trait_devices=['cuda:0', 'cuda:1'], trait_workers='process')
     arguments.update(extra)
     with pytest.raises(ValueError, match=message):
         run_linear_gwas(tmp_path / 'input.pgen', np.zeros((4, 2)), None, **arguments)
+
+
+def test_auto_takes_processes_from_four_devices_when_the_run_allows(tmp_path):
+    import inspect
+    defaults = {name: parameter.default for name, parameter in inspect.signature(run_linear_gwas).parameters.items()
+                if parameter.default is not inspect.Parameter.empty}
+    assert defaults['trait_workers'] == 'auto'
+
+    def resolved(devices, **extra):
+        arguments = dict(defaults, genotype=tmp_path / 'input.pgen', phenotype=np.zeros((4, 8)),
+                         output_dir=tmp_path / 'out', trait_devices=devices)
+        arguments.update(extra)
+        return trait_processes.resolve_trait_workers(arguments)
+    four = [f'cuda:{i}' for i in range(4)]
+    assert resolved(four) == 'process'
+    assert resolved(four, reduce='significant') == resolved(four, reduce='min-p') == 'process'
+    assert resolved(four[:3]) == 'thread'                                      # under four devices
+    for extra in (dict(missing_phenotype='drop_subject'), dict(reduce='jagwas'), dict(autotune=True),
+                  dict(p_value_threshold=1e-3), dict(output_dir=None), dict(trait_workers='thread')):
+        assert resolved(four, **extra) == 'thread', extra
+    assert resolved(['cpu:0', 'cpu:1', 'cpu:2', 'cpu:3']) == 'thread'
+    assert resolved(four[:2], trait_workers='process') == 'process'            # forced
+    assert resolved(None) == resolved(four[:1], trait_workers='process') == 'thread'
 
 
 def test_each_child_sees_its_own_card_as_cuda0(monkeypatch):

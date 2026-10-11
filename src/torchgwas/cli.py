@@ -151,10 +151,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         help='devices for disjoint variant ranges with independent durable writers')
     linear.add_argument('--trait-devices',nargs='+',default=None,
                         help='explicit devices for independent trait tiles, e.g. cuda:0 cuda:1')
-    linear.add_argument('--trait-workers',choices=['thread','process'],default='thread',
-                        help='run --trait-devices as threads of this process (default) or one process per '
-                             'device on a contiguous range of the traits, which avoids the threads waiting '
-                             'on each other under the GIL with many GPUs')
+    linear.add_argument('--trait-workers',choices=['auto','thread','process'],default='auto',
+                        help='run --trait-devices as threads of this process or one process per device on '
+                             'a contiguous range of the traits, which avoids the threads waiting on each '
+                             'other under the GIL with many GPUs; auto (default) takes processes from 4 '
+                             'devices when the run allows them')
     linear.add_argument(
         "--sumstats-format",
         default="binary",

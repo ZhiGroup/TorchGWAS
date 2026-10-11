@@ -49,10 +49,25 @@ import numpy as np
 WORK_DIRECTORY = '.trait_processes'
 # Rows per part when min-p winners are written back.
 MERGED_PART_ROWS = 1 << 20
-# Arguments a process run cannot pass on to its children.
+# Arguments a process run cannot pass on to its children (p_value_threshold and
+# autotune are untested across processes).
 UNSUPPORTED = ('variant_devices', 'autotune_profile', 'autotune_config', 'initial_calibration',
                'pipeline_profile', '_internal_reduction', 'jagwas_groups', 'jagwas_rcond',
-               'jagwas_min_residual')
+               'jagwas_min_residual', 'p_value_threshold', 'autotune')
+# trait_workers='auto' takes processes from this many trait devices. Seven
+# H100s, 7 x 5,000 voxels: scan 23.6 s as threads, 17.5 s as processes
+# (2026-10-10); two GPUs showed no GIL contention.
+AUTO_PROCESS_DEVICES = 4
+
+
+def resolve_trait_workers(arguments):
+    """'process' or 'thread' for run_linear_gwas's trait_workers ('auto', 'thread' or 'process')."""
+    requested, devices = arguments['trait_workers'], arguments['trait_devices']
+    if requested == 'thread' or devices is None or len(devices) < 2:
+        return 'thread'
+    if requested == 'process':
+        return 'process'
+    return 'process' if len(devices) >= AUTO_PROCESS_DEVICES and not process_problems(arguments) else 'thread'
 
 
 def run_trait_processes(arguments):
@@ -94,36 +109,45 @@ def run_trait_processes(arguments):
     return GWASResult(table=[], run_metadata=merged['run'], qc_summary=merged['qc'])
 
 
-def _validate(arguments):
+def process_problems(arguments):
+    """Why this run cannot take one process per trait device; empty when it can."""
+    problems = []
     devices = arguments['trait_devices']
-    if not isinstance(devices, (list, tuple)) or len(devices) < 2:
-        raise ValueError("trait_workers='process' needs two or more trait_devices")
-    devices = [str(device) for device in devices]
-    if len(set(devices)) != len(devices) or not all(d.startswith('cuda') for d in devices):
-        raise ValueError("trait_workers='process' needs distinct CUDA trait_devices")
+    names = [str(device) for device in devices] if isinstance(devices, (list, tuple)) else []
+    if len(names) < 2:
+        problems.append("trait_workers='process' needs two or more trait_devices")
+    elif len(set(names)) != len(names) or not all(name.startswith('cuda') for name in names):
+        problems.append("trait_workers='process' needs distinct CUDA trait_devices")
     if arguments['output_dir'] is None or arguments['sumstats_format'] != 'binary':
-        raise ValueError("trait_workers='process' writes a binary store: output_dir and sumstats_format='binary'")
+        problems.append("trait_workers='process' writes a binary store: output_dir and sumstats_format='binary'")
     reduce = arguments['reduce']
     if isinstance(reduce, str) and reduce.replace('_', '-').lower() == 'min-p':
-        reduce = arguments['reduce'] = 'min-p'
+        reduce = 'min-p'
     if reduce not in (None, 'significant', 'min-p'):
-        raise ValueError(f"trait_workers='process' supports full output, reduce='significant' and "
-                         f"reduce='min-p', not reduce={reduce!r}")
-    missing = arguments['missing_phenotype']
-    if missing not in (None, 'exact', 'impute'):
-        raise ValueError("trait_workers='process' needs missing_phenotype 'exact' or 'impute': under "
-                         "'drop_subject' a sample missing any trait leaves every partition")
+        problems.append(f"trait_workers='process' supports full output, reduce='significant' and "
+                        f"reduce='min-p', not reduce={reduce!r}")
+    if arguments['missing_phenotype'] not in (None, 'exact', 'impute'):
+        problems.append("trait_workers='process' needs missing_phenotype 'exact' or 'impute': under "
+                        "'drop_subject' a sample missing any trait leaves every partition")
     for name in UNSUPPORTED:
-        if arguments.get(name) is not None:
-            raise ValueError(f"trait_workers='process' does not support {name}")
+        if arguments.get(name) not in (None, False):
+            problems.append(f"trait_workers='process' does not support {name}")
     if 'devices' in (arguments.get('autotune_options') or {}):
-        raise ValueError("trait_workers='process' takes its devices from trait_devices, not autotune_options")
+        problems.append("trait_workers='process' takes its devices from trait_devices, not autotune_options")
     if not isinstance(arguments['genotype'], (str, Path)):
-        raise ValueError("trait_workers='process' needs the genotype as a file path")
-    phenotype = arguments['phenotype']
-    if arguments['phenotype_table'] is None and not isinstance(phenotype, (str, Path, np.ndarray)):
-        raise ValueError("trait_workers='process' needs the phenotype as a path, an array or phenotype_table")
-    return devices
+        problems.append("trait_workers='process' needs the genotype as a file path")
+    if arguments['phenotype_table'] is None and not isinstance(arguments['phenotype'], (str, Path, np.ndarray)):
+        problems.append("trait_workers='process' needs the phenotype as a path, an array or phenotype_table")
+    return problems
+
+
+def _validate(arguments):
+    problems = process_problems(arguments)
+    if problems:
+        raise ValueError(problems[0])
+    if isinstance(arguments['reduce'], str) and arguments['reduce'].replace('_', '-').lower() == 'min-p':
+        arguments['reduce'] = 'min-p'
+    return [str(device) for device in arguments['trait_devices']]
 
 
 def _trait_columns(arguments, work):
