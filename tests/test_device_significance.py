@@ -160,7 +160,9 @@ def test_real_native_multigpu_significance_tiles_isolate_qc_and_share_setup(tmp_
     source = PgenGenotype(path, mode='hardcall', reader_workers=3)
     y = rng.normal(size=(n, k)).astype(np.float32)
     cov = rng.normal(size=(n, 2)).astype(np.float32)
-    opts = dict(device='cuda:1', compute_dtype='float32', chunk_size=7,
+    # Outlier masking (on by default) is a pre-pass with its own covariate
+    # basis; the count below is the scan's, shared by its tiles.
+    opts = dict(device='cuda:1', compute_dtype='float32', chunk_size=7, phenotype_outlier_sd=None,
                 reader_workers=3, prefetch_chunks=2, variant_range=(3, 62), sumstats_queue_depth=1)
     full = run_linear_gwas(source, y, cov, output_dir=tmp_path/'full', **opts)
     beta, t, _logp, _ = open_binary_sumstats(tmp_path/'full/sumstats')
